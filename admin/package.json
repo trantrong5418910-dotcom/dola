@@ -15,7 +15,7 @@
     "reset-db": "node server/db.js --reset",
     "smoke": "node test/smoke.js",
     "test:maintenance": "node test/maintenance.mjs",
-    "test:native-probe": "node --test test/native-capability.mjs test/native-probe-job.mjs test/proxy-assign.mjs",
+    "test:native-probe": "node --test test/native-capability.mjs test/native-probe-job.mjs test/proxy-assign.mjs test/reference-images.mjs test/reference-image-pool.mjs",
     "test:proxy-batch": "node --test test/assign-proxies-script.mjs",
     "test:concurrency": "node --test test/generation-concurrency.mjs test/generator-isolated.mjs",
     "test:google-login": "node --test test/google-login.mjs test/google-login-cache.mjs test/google-login-restore.mjs",
@@ -23,9 +23,9 @@
     "audit-ui": "node scripts/audit-table-width.mjs"
   },
   "dependencies": {
-    "better-sqlite3": "^11.7.0",
-    "express": "^4.21.2",
-    "undici": "^8.10.2"
+    "better-sqlite3": "^11.10.0",
+    "express": "^4.22.3",
+    "undici": "^6.28.1"
   },
   "devDependencies": {
     "@element-plus/icons-vue": "^2.3.1",

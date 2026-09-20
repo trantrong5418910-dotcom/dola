@@ -1,11 +1,22 @@
 # 交接文档 · dola 视频生成平台（给 Codex）
 
+## 2026-09-20 增补：参考图上传 P0 闭环（就绪门禁）
+
+- 新增 `admin/server/dola/reference-images.js`：与用户端 dola-api 对齐的校验（最多 9 张、JPEG/PNG、合计 20MiB、请求估算 22MiB）。
+- 新增 `admin/server/dola/reference-image-store.js`：文件落到 `admin/server/data/reference-uploads/<taskId>/`，防路径穿越；任务终态与取消会清理；提供孤儿目录清扫。
+- `dola_videos` 增加 `has_reference_images` / `reference_image_count`（不存 base64）。
+- 网关 `/api/gateway/health` 增加 `referenceImagesReady` + `referenceImages` 计数摘要（镜像原生时长号池门禁：`reference_image_state=available` + 代理 + 已核验且唯一出口 + 非冷却）；不泄露标签/Cookie/代理/IP。
+- `POST /api/gateway/gen` 在扣积分前校验参考图；号池未就绪返回 409；任务落库后写临时文件，扣费失败/取消会清理。
+- 浏览器提交在填写提示词前：`prepareReferenceImageComposer` → Playwright `setInputFiles`；缺少控件或挂载失败会失败并走原有退款路径；有参考图时不再拦截 `resourceType=image` 以便预览证据。
+- 用户端 `referenceImagesSupported` 改为读取网关 `referenceImagesReady`（约 15s 刷新）；未就绪拒绝参考图且不扣积分。
+- **隔离验证**：校验/存储/健康门禁/转发。**未做**：真实付费 Dola 账号的端到端参考图出片（需授权号池探测为 available 后再验）。
+
 ## 2026-09-20 增补：参考图能力先进入只读探测阶段
 
 - 后台账号表新增 `reference_image_state / reference_image_at / reference_image_note`，刷新 Cookie、切换代理或 Google 会话更新时会清空旧结论。
 - 账号池新增“批量探测参考图”和单账号“检查参考图上传”；探测只打开真实视频创作面板，认定条件是页面明确暴露图片类型的 `input[type=file]`，不会选择文件、填写提示词、点击发送或消耗额度。
-- 网络、登录、代理或页面控件不明确时只写 `unknown`；没有明确图片控件时不把加号按钮/拖拽区域猜成已支持。当前用户端 `referenceImagesSupported` 仍保持关闭，尚未打通真实上传和任务提交。
-- 本轮新增只读探测隔离测试并通过，后台前端构建通过，后台已重启完成三列迁移。下一步必须基于真实账号探测到的 DOM 证据，再实现文件上传、网关传输和任务落库；不能凭猜测拼 Dola 私有上传接口。
+- 网络、登录、代理或页面控件不明确时只写 `unknown`；没有明确图片控件时不把加号按钮/拖拽区域猜成已支持。
+- 只读探测仍是号池 `reference_image_state` 的唯一写入来源；上传闭环已接在就绪门禁之后，仍不得猜测 Dola 私有上传 API。
 
 ## 2026-09-20 增补：专家模式开放原生 15 秒
 

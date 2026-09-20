@@ -79,8 +79,8 @@ export function createGateway({ url = '', key = '', timeout = 15000, createTimeo
      * 用户名下的任务要靠这个令牌来区分。
      */
     generation: {
-      create: ({ token, prompt, ratio, mode, seconds, forceSeconds, accountId }) =>
-        call('/api/gateway/gen', { token, prompt, ratio, mode, seconds, forceSeconds, accountId }, createTimeout, true),
+      create: ({ token, prompt, ratio, mode, seconds, forceSeconds, accountId, images }) =>
+        call('/api/gateway/gen', { token, prompt, ratio, mode, seconds, forceSeconds, accountId, images }, createTimeout, true),
       status: ({ token, taskId }) =>
         call(`/api/gateway/gen/${encodeURIComponent(taskId)}?token=${encodeURIComponent(token)}`),
       list: ({ token, limit = 20 }) =>

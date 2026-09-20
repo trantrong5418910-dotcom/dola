@@ -95,9 +95,11 @@ async function refreshGatewayHealth() {
   if (!PER_USER_PROVIDER || !GATEWAY.enabled) return null;
   try {
     gatewayHealth = await GATEWAY.health();
+    syncAdminDolaCapabilityFlags();
     return gatewayHealth;
   } catch {
     gatewayHealth = null;
+    syncAdminDolaCapabilityFlags();
     return null;
   }
 }
@@ -108,6 +110,19 @@ function adminDolaFixedSecondsReady() {
 
 function adminDolaExpertSecondsReady() {
   return PER_USER_PROVIDER && gatewayHealth?.expertSecondsReady === true;
+}
+
+function adminDolaReferenceImagesReady() {
+  return PER_USER_PROVIDER && gatewayHealth?.referenceImagesReady === true;
+}
+
+function syncAdminDolaCapabilityFlags() {
+  if (!PER_USER_PROVIDER) return;
+  const ready = adminDolaReferenceImagesReady();
+  if (platform?.p) platform.p.referenceImagesReady = ready;
+  for (const client of userClients.values()) {
+    if (client?.p) client.p.referenceImagesReady = ready;
+  }
 }
 
 async function loginPlatform() {
@@ -159,6 +174,12 @@ async function loginPlatform() {
 }
 await loginPlatform();
 
+// Keep capability gates fresh so the create UI flips without restart once
+// the admin pool finishes a reference-image probe.
+if (PER_USER_PROVIDER) {
+  setInterval(() => { void refreshGatewayHealth(); }, 15_000).unref?.();
+}
+
 // ---------------- 按用户取生成客户端 ----------------
 
 /** key = 用户令牌；值 = 已绑定该令牌的 VideoClient */
@@ -191,6 +212,7 @@ async function clientFor(me) {
   if (cached) return cached;
   const c = createClient({ provider: PROVIDER, providerOptions: { gateway: GATEWAY } });
   await c.login(key);              // 顺带校验一次令牌
+  if (c?.p) c.p.referenceImagesReady = adminDolaReferenceImagesReady();
   userClients.set(key, c);
   // 别让缓存无限长（令牌轮换 / 用户很多时）
   if (userClients.size > 200) {
@@ -321,7 +343,9 @@ const server = http.createServer(async (req, res) => {
         /** 后台生成队列状态，供前端显示排队与可用并发；失败时为 null，不使用旧缓存。 */
         generation: PER_USER_PROVIDER ? (gatewayHealth?.generation || null) : null,
         promptMax: PROVIDER === 'dola-api' ? 3_000 : 12_000,
-        referenceImagesSupported: !PER_USER_PROVIDER,
+        referenceImagesSupported: PER_USER_PROVIDER
+          ? adminDolaReferenceImagesReady()
+          : true,
         gateway: GATEWAY.enabled ? { url: GATEWAY.base } : null,
       });
       return;
@@ -475,8 +499,15 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       if (PER_USER_PROVIDER && body.images?.length) {
-        json(res, 400, { ok: false, code: 'REFERENCE_IMAGES_UNSUPPORTED', message: '当前后台暂不支持参考图片，请使用纯文本提示词；任务未提交、未扣积分' });
-        return;
+        await refreshGatewayHealth();
+        if (!adminDolaReferenceImagesReady()) {
+          json(res, 409, {
+            ok: false,
+            code: 'REFERENCE_IMAGES_UNSUPPORTED',
+            message: '当前没有已确认支持参考图且代理隔离的可用账号，任务未提交、未扣积分',
+          });
+          return;
+        }
       }
       const client = await clientFor(me);
 

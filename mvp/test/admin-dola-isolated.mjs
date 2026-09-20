@@ -92,18 +92,44 @@ test('10s and 20s stay open, while expert mode adds native 15s', async (t) => {
 });
 
 test('unsupported references are rejected before gateway create', async (t) => {
-  const f = await fixture(t);
+  const f = await fixture(t); // duration gate open, imagesGate still closed
+  assert.equal((await request(f, '/api/health')).body.referenceImagesSupported, false);
   const rejected = await create(f, { images: [{ name: 'synthetic.png', dataBase64: 'c3ludGhldGlj' }] });
-  assert.equal(rejected.status, 400);
+  assert.equal(rejected.status, 409);
   assert.equal(rejected.body.code, 'REFERENCE_IMAGES_UNSUPPORTED');
   assert.equal((await create(f, { images: {} })).status, 400);
   assert.equal(f.state.creates, 0);
-  const p = new AdminDolaProvider({ gateway: f.gateway });
-  await p.login(USER_A);
-  await assert.rejects(p.createTask({ prompt: 'synthetic', seconds: 15 }), /专家模式/);
-  await p.createTask({ prompt: 'synthetic', seconds: 15, mode: 'expert' });
-  await assert.rejects(p.createTask({ prompt: 'synthetic', images: ['synthetic'] }), { code: 'REFERENCE_IMAGES_UNSUPPORTED' });
+  const provider = new AdminDolaProvider({ gateway: f.gateway });
+  await provider.login(USER_A);
+  await assert.rejects(provider.createTask({ prompt: 'synthetic', seconds: 15 }), /专家模式/);
+  await provider.createTask({ prompt: 'synthetic', seconds: 15, mode: 'expert' });
+  await assert.rejects(provider.createTask({ prompt: 'synthetic', images: ['synthetic'] }), { code: 'REFERENCE_IMAGES_UNSUPPORTED' });
   assert.equal(f.state.creates, 1);
+});
+
+test('when referenceImagesReady, images are forwarded and charged only after gateway accepts', async (t) => {
+  const f = await fixture(t, { imagesGate: true });
+  assert.equal((await request(f, '/api/health')).body.referenceImagesSupported, true);
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
+  const created = await create(f, {
+    images: [{ name: 'synthetic.png', dataBase64: png.toString('base64') }],
+  });
+  assert.equal(created.status, 202);
+  assert.equal(f.state.creates, 1);
+  assert.equal(f.state.lastCreate.images?.length, 1);
+  assert.equal(f.state.lastCreate.images[0].name, 'synthetic.png');
+  assert.ok(f.state.lastCreate.images[0].dataBase64);
+
+  const provider = new AdminDolaProvider({ gateway: f.gateway });
+  provider.referenceImagesReady = true;
+  await provider.login(USER_A);
+  await provider.createTask({
+    prompt: 'synthetic with image',
+    seconds: 10,
+    images: [{ name: 'via-provider.png', data: png }],
+  });
+  assert.equal(f.state.creates, 2);
+  assert.equal(f.state.lastCreate.images?.[0]?.name, 'via-provider.png');
 });
 
 test('HTTP success: create -> poll -> public list/status -> archive media/download', async (t) => {

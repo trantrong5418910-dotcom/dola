@@ -28,7 +28,8 @@ import { startSocksBridge } from './socks-bridge.js';
 import { parseVideoQuotaReceipt } from './account-observations.js';
 import { settleFailedVideoRefund } from './generation-billing.js';
 import { installVideoRequestAdapter } from './generation-request.js';
-import { prepareNativeVideoComposer } from './native-capability.js';
+import { prepareNativeVideoComposer, prepareReferenceImageComposer } from './native-capability.js';
+import { listReferenceImages, cleanupReferenceImages } from './reference-image-store.js';
 import {
   normalizeVideoDuration, requireGenerationProxy, hasLiveSession,
   isNativeThirtySecondRequest, isNativeVideoRequest, isActiveGenerationStatus, validateArchivedVideo,
@@ -229,7 +230,7 @@ export function recoverStaleVideoTasks() {
  * 为什么按 last_used_at 排而不是随机：同一 IP 高频操作多账号会被风控（已经踩过：
  * 8 个号批量操作后失效 3 个）。轮转能让单号的使用频率尽量均匀，别可着一个号薅。
  */
-function candidates(preferId = null, seconds = null) {
+function candidates(preferId = null, seconds = null, { requireReferenceImages = false } = {}) {
   const nowIso = now();
   // free/pro are billing labels, not evidence that a requested duration is supported.
   // 跳过冷却中的账号：上游限流（710022002）时它们会话还好好的，
@@ -248,6 +249,7 @@ function candidates(preferId = null, seconds = null) {
     .filter((account) => !generationExitIpIssue(account))
     .filter((account) => Number(seconds) !== 15 || account.native_15s_state === 'available')
     .filter((account) => Number(seconds) !== 30 || account.native_30s_state === 'available')
+    .filter((account) => !requireReferenceImages || account.reference_image_state === 'available')
     .slice(0, 8);
   if (!preferId) return rest;
   // 指定的号排最前，**但不是唯一选项** —— 它体检不过时会自动落到后面的轮转队列，
@@ -366,6 +368,62 @@ export function nativeThirtySecondPoolStats() {
 }
 
 /**
+ * Read-only readiness for reference-image uploads.
+ * Mirrors native duration pools, but gates on reference_image_state
+ * (written only by the read-only DOM probe). Counts only — never labels,
+ * cookies, proxies, or IPs.
+ */
+export function referenceImagePoolStats() {
+  const nowIso = now();
+  const allValid = db.prepare(`SELECT reference_image_state AS capability_state, proxy, exit_ip, cooldown_until
+                               FROM dola_accounts
+                               WHERE status = 'valid'`).all();
+  const stateCounts = { available: 0, unknown: 0, unavailable: 0 };
+  const validExitCounts = new Map();
+  for (const row of allValid) {
+    const state = String(row.capability_state || 'unknown');
+    if (Object.hasOwn(stateCounts, state)) stateCounts[state]++;
+    const exitIp = String(row.exit_ip || '').trim();
+    if (exitIp) validExitCounts.set(exitIp, (validExitCounts.get(exitIp) || 0) + 1);
+  }
+
+  let eligible = 0;
+  let availableWithProxy = 0;
+  let availableMissingExitIp = 0;
+  let availableCooling = 0;
+  let availableSharedExitIp = 0;
+  for (const row of allValid) {
+    if (String(row.capability_state || 'unknown') !== 'available') continue;
+    if (String(row.proxy || '').trim()) availableWithProxy++;
+    else continue;
+    if (row.cooldown_until && row.cooldown_until > nowIso) {
+      availableCooling++;
+      continue;
+    }
+    const exitIp = String(row.exit_ip || '').trim();
+    if (!exitIp) {
+      availableMissingExitIp++;
+      continue;
+    }
+    if ((validExitCounts.get(exitIp) || 0) > 1) {
+      availableSharedExitIp++;
+      continue;
+    }
+    eligible++;
+  }
+
+  return {
+    ready: eligible > 0,
+    eligible,
+    ...stateCounts,
+    availableWithProxy,
+    availableMissingExitIp,
+    availableCooling,
+    availableSharedExitIp,
+  };
+}
+
+/**
  * 「会话确实死了」的 dola 业务码。只有命中这些才敢把账号标 invalid。
  *
  *   710012014 → 未登录 / 半失效（self_brief 的返回）
@@ -394,8 +452,8 @@ const SESSION_DEAD_CODES = new Set([710012014, 710012001]);
  *
  * @returns {Promise<{account:object|null, skipped:Array<{id:number,label:string,code:any}>}>}
  */
-async function pickLiveAccount(preferId = null, { probe = 3, seconds = null } = {}) {
-  const list = candidates(preferId, seconds);
+async function pickLiveAccount(preferId = null, { probe = 3, seconds = null, requireReferenceImages = false } = {}) {
+  const list = candidates(preferId, seconds, { requireReferenceImages });
   const skipped = [];
   for (const acc of list.slice(0, Math.max(1, probe))) {
     // Reserve before the first await. JavaScript is single-threaded, so this
@@ -571,6 +629,8 @@ export async function createVideoTask({
   chargeRef = '',
   createdBy = null,
   timeoutMinutes = null,
+  hasReferenceImages = false,
+  referenceImageCount = 0,
 } = {}) {
   const text = String(prompt ?? '').trim();
   if (!text) throw Object.assign(new Error('prompt 不能为空'), { status: 400 });
@@ -596,7 +656,7 @@ export async function createVideoTask({
   let admissionHeld = true;
   try {
     // 先体检再占坑 —— 拿到一个真的能用的号，别让任务跑一半死在死号上
-    const { account: acc, skipped } = await pickLiveAccount(accountId, { seconds: duration.seconds });
+    const { account: acc, skipped } = await pickLiveAccount(accountId, { seconds: duration.seconds, requireReferenceImages: Boolean(hasReferenceImages) });
     if (!acc) {
       const detail = skipped.length
         ? `本次跳过 ${skipped.length} 个账号（${skipped.map((s) => `#${s.id} ${s.kind ?? s.code}`).join('、')}）`
@@ -608,11 +668,16 @@ export async function createVideoTask({
       const isolation = pool.missingExitIp || pool.sharedExitIpRows
         ? `当前有效代理号中有 ${pool.missingExitIp} 个未完成出口 IP 核验、${pool.sharedExitIpRows} 个账号处于共享出口（${pool.sharedExitIpGroups} 组），请先重新核验或换 SID。`
         : '';
-      const capability = duration.seconds === 30
-        ? '30 秒还要求该账号已通过页面原生能力探测（Seedance 2.5 与 30 秒选项）'
-        : duration.seconds === 15
-          ? '15 秒还要求通过页面原生能力探测确认 Seedance 2.0 与 15 秒选项'
-          : '';
+      const capabilityParts = [];
+      if (duration.seconds === 30) {
+        capabilityParts.push('30 秒还要求该账号已通过页面原生能力探测（Seedance 2.5 与 30 秒选项）');
+      } else if (duration.seconds === 15) {
+        capabilityParts.push('15 秒还要求通过页面原生能力探测确认 Seedance 2.0 与 15 秒选项');
+      }
+      if (hasReferenceImages) {
+        capabilityParts.push('参考图还要求该账号已通过页面参考图上传控件探测');
+      }
+      const capability = capabilityParts.join('；');
       const reason = `请确认账号登录有效、身份匹配、已配置有效的 IPWeb 或显式代理，且出口 IP 已核验并只被一个有效账号使用；不按免费/订阅身份判定时长能力。${capability}${isolation}${queueHint}`;
       throw Object.assign(
         new Error(`账号池里没有可用账号（status=valid）。${reason}${detail}`),
@@ -622,13 +687,16 @@ export async function createVideoTask({
 
     let info;
     try {
+      const refCount = hasReferenceImages ? Math.max(0, Number(referenceImageCount) || 0) : 0;
       info = db.prepare(`INSERT INTO dola_videos
         (account_id, account_label, prompt, ratio, seconds, force_seconds, status, stage,
-         owner_token_id, owner_prefix, charge_ref, created_by, created_at, updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+         owner_token_id, owner_prefix, charge_ref, has_reference_images, reference_image_count,
+         created_by, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(acc.id, acc.label || '', text, String(ratio), duration.seconds,
           duration.forceSeconds, 'queued', '排队中',
-          ownerTokenId, ownerPrefix, chargeRef, createdBy, now(), now());
+          ownerTokenId, ownerPrefix, chargeRef, refCount > 0 ? 1 : 0, refCount,
+          createdBy, now(), now());
       const id = Number(info.lastInsertRowid);
       // 从这里开始队列名额由 active task 统计接管；即使后续更新/调度报错，
       // 数据库里的 queued 任务也必须继续占用名额，避免容量被错误释放。
@@ -667,7 +735,10 @@ function fail(id, message) {
   const updated = db.prepare(`UPDATE dola_videos SET status='failed', error=?, stage='失败', updated_at=?, finished_at=? WHERE id=?
     AND status IN ('queued','submitting','generating','resolving')`)
     .run(String(message).slice(0, 500), now(), now(), id);
-  if (updated.changes) settleFailedVideoRefund(db, getVideoTask(id));
+  if (updated.changes) {
+    settleFailedVideoRefund(db, getVideoTask(id));
+    void cleanupReferenceImages(id).catch(() => {});
+  }
 }
 
 /** Keep only non-sensitive model/duration telemetry in task errors for audit. */
@@ -699,7 +770,7 @@ function requestCaptureNote(cap) {
  */
 async function submitViaBrowser(cookieText, {
   prompt, seconds = 10, forceSeconds = null, targetModel = null, proxyUrl, accountId, log,
-  sessionVerified = false, isActive = () => true,
+  sessionVerified = false, isActive = () => true, referenceImagePaths = [],
 }) {
   proxyUrl = requireGenerationProxy(proxyUrl);
   if (!sessionVerified) throw new Error('未确认实时有效登录，拒绝提交');
@@ -781,7 +852,9 @@ async function submitViaBrowser(cookieText, {
 
     // 掐掉用不着的资源类型（实测只省 1%，但白省）。**只拦静态资源**：
     // XHR/fetch/document/script 一律放行 —— 那才是业务链路（含 SSE 流）。
-    const BLOCK_TYPES = new Set(['image', 'font', 'media']);
+    // Reference-image previews are themselves resourceType=image; keep them
+    // unblocked when this submission attaches files so attach evidence can land.
+    const BLOCK_TYPES = new Set(referenceImagePaths?.length ? ['font', 'media'] : ['image', 'font', 'media']);
     let submissionBlocked = false;
     await ctx.route('**/*', (route) => {
       const request = route.request();
@@ -868,6 +941,65 @@ async function submitViaBrowser(cookieText, {
       const requestedModel = targetModel || (requestedSeconds === 15 ? 'seedance_v2.0' : 'seedance_v2.5');
       log(`确认并选择 ${requestedModel === 'seedance_v2.0' ? 'Seedance 2.0' : 'Seedance 2.5'} 与页面原生 ${requestedSeconds} 秒选项`);
       await prepareNativeVideoComposer(page, { seconds: requestedSeconds, model: requestedModel, timeout: BOOT_MS, log });
+    }
+
+    if (referenceImagePaths?.length) {
+      if (!isActive()) throw new Error('generation_cancelled');
+      log(`挂载 ${referenceImagePaths.length} 张参考图`);
+      let composer;
+      try {
+        composer = await prepareReferenceImageComposer(page, { timeout: BOOT_MS, log });
+      } catch (error) {
+        const err = new Error(error?.message || '参考图上传控件不可用');
+        err.code = error?.code === 'NATIVE_CAPABILITY_UNKNOWN'
+          ? 'REFERENCE_IMAGE_CONTROL_MISSING'
+          : (error?.code || 'REFERENCE_IMAGE_CONTROL_MISSING');
+        throw err;
+      }
+      if (!composer?.referenceImages || !composer.imageInputs?.length) {
+        throw Object.assign(new Error('页面没有可用的参考图上传控件'), {
+          code: 'REFERENCE_IMAGE_CONTROL_MISSING',
+        });
+      }
+      const fileInput = page.locator('input[type="file"]').filter({
+        has: page.locator(':scope'),
+      });
+      // Prefer an input whose accept clearly allows images; fall back to first file input.
+      const handle = await page.evaluateHandle(() => {
+        const inputs = [...document.querySelectorAll('input[type="file"]')];
+        return inputs.find((input) => /image\//i.test(input.accept || '')
+          || /\.(?:png|jpe?g|webp)(?:,|$)/i.test(input.accept || ''))
+          || inputs[0]
+          || null;
+      });
+      const element = handle.asElement();
+      if (!element) {
+        throw Object.assign(new Error('未找到可写入的参考图文件控件'), {
+          code: 'REFERENCE_IMAGE_CONTROL_MISSING',
+        });
+      }
+      try {
+        await element.setInputFiles(referenceImagePaths);
+      } catch (error) {
+        throw Object.assign(new Error(`参考图上传失败：${error.message || error}`), {
+          code: 'REFERENCE_IMAGE_UPLOAD_FAILED',
+        });
+      }
+      const attached = await page.evaluate(() => {
+        const inputs = [...document.querySelectorAll('input[type="file"]')];
+        const imageInput = inputs.find((input) => /image\//i.test(input.accept || '')
+          || /\.(?:png|jpe?g|webp)(?:,|$)/i.test(input.accept || ''))
+          || inputs[0];
+        const files = imageInput?.files?.length || 0;
+        const preview = document.querySelectorAll('img[src^="blob:"], img[src^="data:image"]').length;
+        return { files, preview };
+      }).catch(() => ({ files: 0, preview: 0 }));
+      if (!attached.files && !attached.preview) {
+        throw Object.assign(new Error('参考图未能挂载到页面（未检测到 files 或预览）'), {
+          code: 'REFERENCE_IMAGE_UPLOAD_FAILED',
+        });
+      }
+      log(`参考图已挂载（files=${attached.files}, preview=${attached.preview}）`);
     }
 
     log('填提示词并提交');
@@ -998,6 +1130,12 @@ async function run(id, { maxMin }) {
     let sub;
     try {
       log('正在通过账号的显式代理提交');
+      const referenceImagePaths = row.has_reference_images
+        ? await listReferenceImages(id)
+        : [];
+      if (row.has_reference_images && !referenceImagePaths.length) {
+        return fail(id, '参考图文件缺失，无法提交');
+      }
       sub = await submitViaBrowser(acc.cookie, {
         prompt: row.prompt,
         seconds: duration.seconds,
@@ -1005,6 +1143,7 @@ async function run(id, { maxMin }) {
         targetModel: duration.targetModel,
         proxyUrl: accProxy, accountId: acc.id, log,
         sessionVerified, isActive: () => taskActive(id),
+        referenceImagePaths,
       });
     } catch (e) {
       return fail(id, `提交阶段失败：${e.message}`);
@@ -1135,6 +1274,7 @@ async function run(id, { maxMin }) {
     db.prepare(`UPDATE dola_videos SET status='ready', error='', stage=?, updated_at=?, finished_at=?
       WHERE id=? AND status='resolving'`)
       .run(`完成（已归档 ${(arch.bytes / 1048576).toFixed(2)} MiB；真实时长 ${durationSec.toFixed(2)} 秒）`, now(), now(), id);
+    void cleanupReferenceImages(id).catch(() => {});
   } finally {
     if (globalAcquired) release();
     releaseAccountLock();
@@ -1151,6 +1291,7 @@ export function cancelVideoTask(id) {
     // 但 token 已经花了 —— 所以退款判定交给调用方（见 gateway 的 refund 逻辑）。
     db.prepare("UPDATE dola_videos SET status='cancelled', stage='已取消', updated_at=? WHERE id=?")
       .run(now(), Number(id));
+    void cleanupReferenceImages(id).catch(() => {});
   }
   return getVideoTask(id);
 }

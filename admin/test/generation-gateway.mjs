@@ -141,12 +141,14 @@ test('actual gateway router enforces owner and readiness, with an isolated datab
     assert.equal(closedHealth.fixedSecondsReady, false);
     assert.equal(closedHealth.native15.ready, false);
     assert.equal(closedHealth.native30.ready, false);
+    assert.equal(closedHealth.referenceImagesReady, false);
+    assert.equal(closedHealth.referenceImages.ready, false);
 
     const accountAt = new Date().toISOString();
     db.prepare(`INSERT INTO dola_accounts
-      (label,cookie,cookie_hash,status,proxy,exit_ip,native_15s_state,native_30s_state,created_at,updated_at)
-      VALUES ('fixture-account','fixture-cookie','fixture-cookie-hash','valid',?,?,?,?,?,?)`)
-      .run('http://127.0.0.1:1', '198.51.100.10', 'available', 'available', accountAt, accountAt);
+      (label,cookie,cookie_hash,status,proxy,exit_ip,native_15s_state,native_30s_state,reference_image_state,created_at,updated_at)
+      VALUES ('fixture-account','fixture-cookie','fixture-cookie-hash','valid',?,?,?,?,?,?,?)`)
+      .run('http://127.0.0.1:1', '198.51.100.10', 'available', 'available', 'available', accountAt, accountAt);
     const openHealth = await (await fetch(`${base}/health`, { headers })).json();
     assert.equal(openHealth.expertSecondsReady, true);
     assert.equal(openHealth.native15.ready, true);
@@ -154,7 +156,11 @@ test('actual gateway router enforces owner and readiness, with an isolated datab
     assert.equal(openHealth.fixedSecondsReady, true);
     assert.equal(openHealth.native30.ready, true);
     assert.equal(openHealth.native30.eligible, 1);
+    assert.equal(openHealth.referenceImagesReady, true);
+    assert.equal(openHealth.referenceImages.ready, true);
+    assert.equal(openHealth.referenceImages.eligible, 1);
     assert.equal('exitIp' in openHealth.native30, false);
+    assert.equal('exitIp' in openHealth.referenceImages, false);
     assert.equal(JSON.stringify(openHealth).includes('fixture-cookie'), false);
     // Restore an empty generation pool before the later create rejection path;
     // this test must never launch a browser or touch a real upstream account.

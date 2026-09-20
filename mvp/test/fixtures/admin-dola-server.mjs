@@ -51,7 +51,7 @@ function video(req, res) {
   res.end(SYNTHETIC_VIDEO.subarray(start, end + 1));
 }
 
-export async function startFixture({ gate = false, port = 0, nativeFetch = globalThis.fetch, createClient, provider = 'admin-dola' } = {}) {
+export async function startFixture({ gate = false, imagesGate = false, port = 0, nativeFetch = globalThis.fetch, createClient, provider = 'admin-dola' } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'mvp-isolated-'));
   const state = { tasks: new Map(), points: new Map([[USER_A, 100], [USER_B, 100]]), calls: [], creates: 0, refunds: 0, external: [] };
   let app; let gatewayServer; let externalServer;
@@ -76,6 +76,8 @@ export async function startFixture({ gate = false, port = 0, nativeFetch = globa
             fixedSecondsReady: gate,
             native15: { ready: gate, eligible: gate ? 1 : 0, available: gate ? 1 : 0, unknown: gate ? 0 : 1, unavailable: 0 },
             native30: { ready: gate, eligible: gate ? 1 : 0, available: gate ? 1 : 0, unknown: gate ? 0 : 1, unavailable: 0 },
+            referenceImagesReady: imagesGate,
+            referenceImages: { ready: imagesGate, eligible: imagesGate ? 1 : 0, available: imagesGate ? 1 : 0, unknown: imagesGate ? 0 : 1, unavailable: 0 },
             generation: { running: 1, queued: 2, concurrency: 3, available: 2, reservedAccounts: 0, byStatus: { queued: 2, submitting: 0, generating: 1, resolving: 0 } },
           });
           return;

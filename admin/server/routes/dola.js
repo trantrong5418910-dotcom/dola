@@ -24,6 +24,7 @@ import {
 import { proxyOf, proxyUrlOf } from '../dola/proxy.js';
 import { accountHealth, creditBalanceFromHits, quotaObservation, summarizeQuota } from '../dola/account-observations.js';
 import { generationStatus } from '../dola/generator.js';
+import { referenceImageEvidenceNote } from '../dola/reference-images.js';
 
 const router = express.Router();
 router.use(requireAuth);
@@ -686,7 +687,8 @@ async function probeReferenceImageCapability(accountId) {
   }
 
   const state = ['available', 'unavailable', 'unknown'].includes(result?.state) ? result.state : 'unknown';
-  const note = String(result?.ok ? REFERENCE_IMAGE_PROBE_CONFIG.successNote : (result?.error || '本次未完成能力判定')).slice(0, 300);
+  const evidence = result?.ok ? referenceImageEvidenceNote(result.imageInputs) : '';
+  const note = String(result?.ok ? `${REFERENCE_IMAGE_PROBE_CONFIG.successNote}${evidence}` : (result?.error || '本次未完成能力判定')).slice(0, 300);
   const updated = db.prepare(`UPDATE dola_accounts
     SET reference_image_state=?, reference_image_at=?, reference_image_note=?, updated_at=?
     WHERE id=? AND cookie_hash=? AND proxy=? AND status <> 'disabled'`)

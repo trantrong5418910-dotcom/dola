@@ -30,8 +30,10 @@ import { streamVideoFile } from '../dola/video-file.js';
 import {
   createVideoTask, getVideoTask, listVideoTasks, cancelVideoTask,
   toPublic, generationStatus, nativeFifteenSecondPoolStats,
-  nativeThirtySecondPoolStats, localFileOf,
+  nativeThirtySecondPoolStats, referenceImagePoolStats, localFileOf,
 } from '../dola/generator.js';
+import { validateReferenceImages } from '../dola/reference-images.js';
+import { saveReferenceImages, cleanupReferenceImages } from '../dola/reference-image-store.js';
 
 const router = express.Router();
 
@@ -283,6 +285,7 @@ router.post('/refund', (req, res) => {
 router.get('/health', (req, res) => {
   const native15 = nativeFifteenSecondPoolStats();
   const native30 = nativeThirtySecondPoolStats();
+  const referenceImages = referenceImagePoolStats();
   res.json({
     ok: true,
     pointsPerTask: numSetting('gateway_points_per_task', 1),
@@ -297,6 +300,10 @@ router.get('/health', (req, res) => {
     fixedSecondsReady: native30.ready,
     native15,
     native30,
+    // Reference-image uploads open only when at least one probed account is
+    // available with an exclusive verified exit. Counts only — no labels/IPs.
+    referenceImagesReady: referenceImages.ready,
+    referenceImages,
     time: new Date().toISOString(),
   });
 });
@@ -374,6 +381,31 @@ router.post('/gen', async (req, res) => {
     });
   }
 
+  // 参考图：先校验，再看号池是否就绪；两者都在建任务/扣积分之前。
+  let inspectedImages = [];
+  try {
+    inspectedImages = await validateReferenceImages(req.body?.images, { prompt });
+  } catch (error) {
+    releasePromptReservation(t.id, prompt);
+    return res.status(error.status || 400).json({
+      ok: false,
+      code: error.code || 'REFERENCE_IMAGE_INVALID',
+      message: error.message,
+    });
+  }
+  if (inspectedImages.length) {
+    const refPool = referenceImagePoolStats();
+    if (!refPool.ready) {
+      releasePromptReservation(t.id, prompt);
+      return res.status(409).json({
+        ok: false,
+        code: 'REFERENCE_IMAGES_NOT_READY',
+        message: '当前没有已确认支持参考图且代理隔离的可用账号，任务未提交，也未扣积分',
+        referenceImages: { ready: false, eligible: refPool.eligible },
+      });
+    }
+  }
+
   // ① 建任务（内部会**先给账号做会话体检**再挑号；挑不到直接 409，此时还没扣费）
   let task;
   try {
@@ -387,6 +419,8 @@ router.post('/gen', async (req, res) => {
       ownerTokenId: t.id,
       ownerPrefix: t.prefix,
       chargeRef: '',
+      hasReferenceImages: inspectedImages.length > 0,
+      referenceImageCount: inspectedImages.length,
     });
   } catch (e) {
     releasePromptReservation(t.id, prompt);
@@ -408,6 +442,16 @@ router.post('/gen', async (req, res) => {
   // 任务行已经落库，后续请求由数据库历史记录继续拦截；释放进程内 reservation，避免内存累积。
   releasePromptReservation(t.id, prompt);
 
+  if (inspectedImages.length) {
+    try {
+      await saveReferenceImages(task.id, inspectedImages);
+    } catch (error) {
+      cancelVideoTask(task.id);
+      await cleanupReferenceImages(task.id).catch(() => {});
+      return res.status(500).json({ ok: false, code: 'REFERENCE_IMAGE_STORE_FAILED', message: '参考图保存失败，任务已取消，未扣积分' });
+    }
+  }
+
   // ② 扣积分：幂等键绑在任务 id 上，重试不会重复扣
   let charge;
   try { charge = chargeVideoTask(db, { taskId: task.id, tokenId: t.id, points }); }
@@ -415,6 +459,7 @@ router.post('/gen', async (req, res) => {
     // createVideoTask schedules work with setImmediate; this synchronous settlement
     // or cancellation completes before the worker can submit to Dola.
     cancelVideoTask(task.id);
+    await cleanupReferenceImages(task.id).catch(() => {});
     return res.status(error.status || 500).json({ ok: false, message: error.status ? error.message : '计费未完成，任务已取消', balance: error.balance, need: points });
   }
   const { chargeRef, balance } = charge;

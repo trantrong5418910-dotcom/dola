@@ -46,7 +46,7 @@ if (staleVideos) console.log(`[gen] 已把 ${staleVideos} 个中断的生成任�
 const stopDolaMaintenance = startDolaMaintenance();
 
 const app = express();
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: false }));
 app.use(authMiddleware);
 

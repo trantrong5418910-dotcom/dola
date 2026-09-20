@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { readFileSync } from 'node:fs';
-import { DatabaseSync } from 'node:sqlite';
+import Database from 'better-sqlite3';
 import vm from 'node:vm';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -23,16 +23,17 @@ const liveProfile = () => ({ ok: true, status: 200, code: 0, membershipLevel: 'p
 const artifact = () => ({ path: '/synthetic-only/not-a-real-file.mp4', bytes: 4096 });
 
 function fixture(t, { owner = null, seconds = 30 } = {}) {
-  const db = new DatabaseSync(':memory:');
+  const db = new Database(':memory:');
   t.after(() => db.close());
   db.exec(`CREATE TABLE dola_videos (
     id INTEGER PRIMARY KEY,account_id,account_label,conversation_id,prompt,ratio,seconds,force_seconds,status,stage,
     watermarked_url,unwatermarked_url,unwatermark_note,is_unwatermarked,local_path,local_bytes,duration_sec,bytes,error,
-    owner_token_id,owner_prefix,charge_ref,created_by,created_at,updated_at,finished_at);
+    owner_token_id,owner_prefix,charge_ref,has_reference_images,reference_image_count,created_by,created_at,updated_at,finished_at);
     CREATE TABLE dola_accounts (id INTEGER PRIMARY KEY,label,cookie,status,proxy,cookie_hash,sec_user_id,membership,
     cooldown_until,last_used_at,updated_at,last_check_at,last_error,quota_remaining,quota_source,quota_at,exit_ip,
     native_15s_state TEXT NOT NULL DEFAULT 'available', native_15s_at TEXT, native_15s_note TEXT NOT NULL DEFAULT '',
-    native_30s_state TEXT NOT NULL DEFAULT 'available', native_30s_at TEXT, native_30s_note TEXT NOT NULL DEFAULT '');
+    native_30s_state TEXT NOT NULL DEFAULT 'available', native_30s_at TEXT, native_30s_note TEXT NOT NULL DEFAULT '',
+    reference_image_state TEXT NOT NULL DEFAULT 'available', reference_image_at TEXT, reference_image_note TEXT NOT NULL DEFAULT '');
     CREATE TABLE point_transactions (id INTEGER PRIMARY KEY,token_id,kind,ref,delta);`);
   db.prepare(`INSERT INTO dola_accounts (id,label,cookie,status,proxy,cookie_hash,sec_user_id,membership,exit_ip,native_30s_state)
     VALUES (1,'synthetic-account','SYNTHETIC_ONLY','valid','http://proxy.example.invalid:8080','synthetic-hash','synthetic-dola','pro','192.0.2.10','available')`).run();
@@ -50,7 +51,7 @@ function fixture(t, { owner = null, seconds = 30 } = {}) {
   };
   const deny = () => { throw new Error('isolated_test_forbidden_io'); };
   const box = {
-    ...policy, installVideoRequestAdapter, prepareNativeThirtySecondComposer: deny,
+    ...policy, installVideoRequestAdapter, prepareNativeThirtySecondComposer: deny, prepareNativeVideoComposer: deny, prepareReferenceImageComposer: deny, listReferenceImages: async () => [], cleanupReferenceImages: async () => {},
     db, path, fileURLToPath, promisify, execFile: deny, fs: new Proxy({}, { get: () => deny }),
     getSetting: (_key, fallback) => fallback, getPlaywright: deny, proxyOf: deny, fetch: deny, startSocksBridge: deny,
     parseCookies: value => { assert.equal(value, 'SYNTHETIC_ONLY'); calls.cookies++; return { synthetic: 'synthetic' }; },

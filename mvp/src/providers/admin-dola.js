@@ -39,6 +39,8 @@ export class AdminDolaProvider {
     this.gateway = gateway;
     this.token = null;          // 当前登录用户令牌
     this.session = null;
+    /** Synced from gateway health by the workbench server. */
+    this.referenceImagesReady = false;
   }
 
   _requireGateway() {
@@ -99,7 +101,32 @@ export class AdminDolaProvider {
     if (requestedForceSeconds !== requestedSeconds) {
       throw new VideoProviderError('seconds 与 forceSeconds 必须一致');
     }
-    if (!Array.isArray(images) || images.length) throw Object.assign(new VideoProviderError('当前后台暂不支持参考图片，请使用纯文本提示词'), { status: 400, code: 'REFERENCE_IMAGES_UNSUPPORTED' });
+    if (!Array.isArray(images)) {
+      throw Object.assign(new VideoProviderError('images 必须是数组'), { status: 400, code: 'REFERENCE_IMAGES_INVALID' });
+    }
+    if (images.length && !this.referenceImagesReady) {
+      throw Object.assign(new VideoProviderError('当前后台暂不支持参考图片，请使用纯文本提示词'), {
+        status: 400, code: 'REFERENCE_IMAGES_UNSUPPORTED',
+      });
+    }
+
+    const gatewayImages = images.map((image, index) => {
+      if (image?.dataBase64) {
+        return { name: image.name || `image-${index}.png`, dataBase64: String(image.dataBase64) };
+      }
+      const buf = Buffer.isBuffer(image?.data) ? image.data
+        : Buffer.isBuffer(image) ? image
+          : image?.data ? Buffer.from(image.data) : null;
+      if (!buf) {
+        throw Object.assign(new VideoProviderError(`第 ${index + 1} 张参考图格式不受支持`), {
+          status: 400, code: 'REFERENCE_IMAGES_INVALID',
+        });
+      }
+      return {
+        name: image?.name || `image-${index}.png`,
+        dataBase64: buf.toString('base64'),
+      };
+    });
 
     const r = await this.gateway.generation.create({
       token: this.token,
@@ -109,6 +136,7 @@ export class AdminDolaProvider {
       seconds: requestedSeconds,
       forceSeconds: requestedForceSeconds,
       accountId,
+      images: gatewayImages,
     });
     this.session = this.session ? { ...this.session, points: r.balance } : this.session;
     return {

@@ -276,6 +276,9 @@ CREATE TABLE IF NOT EXISTS dola_videos (
   owner_token_id    INTEGER,                       -- 归属令牌（用户端网关模式用）
   owner_prefix      TEXT NOT NULL DEFAULT '',
   charge_ref        TEXT NOT NULL DEFAULT '',      -- 计费幂等键，和 point_transactions.ref 对应
+  -- 参考图只存开关与数量；文件在 data/reference-uploads/<id>/，不进 SQLite。
+  has_reference_images INTEGER NOT NULL DEFAULT 0,
+  reference_image_count INTEGER NOT NULL DEFAULT 0,
   created_by        INTEGER,
   created_at        TEXT NOT NULL,
   updated_at        TEXT NOT NULL,
@@ -327,6 +330,8 @@ function migrate() {
     ['dola_videos', 'local_path', 'TEXT'],
     ['dola_videos', 'local_bytes', 'INTEGER'],
     ['dola_videos', 'is_unwatermarked', 'INTEGER NOT NULL DEFAULT 0'],
+    ['dola_videos', 'has_reference_images', 'INTEGER NOT NULL DEFAULT 0'],
+    ['dola_videos', 'reference_image_count', 'INTEGER NOT NULL DEFAULT 0'],
   ];
   for (const [table, column, def] of ALTERS) {
     try {

@@ -1,0 +1,275 @@
+{
+  "base": "https://www.dola.com",
+  "cookieNames": [
+    "biz_trace_id",
+    "conversation_list_v2_group_mode",
+    "dbx-web-theme",
+    "flow_cur_user_sec_id",
+    "flow_multi_user_sec_info",
+    "flow_user_country",
+    "has_biz_token",
+    "i18next",
+    "msToken",
+    "oauth_token",
+    "oauth_token_v2",
+    "odin_tt",
+    "passport_auth_status",
+    "passport_auth_status_ss",
+    "passport_csrf_token",
+    "passport_csrf_token_default",
+    "sessionid",
+    "sessionid_ss",
+    "sid_guard",
+    "sid_tt",
+    "sid_ucp_v1",
+    "ssid_ucp_v1",
+    "store-country-code",
+    "store-country-code-src",
+    "store-idc",
+    "s_v_web_id",
+    "ttwid",
+    "uid_tt",
+    "uid_tt_ss"
+  ],
+  "missingRequired": [],
+  "at": "2026-09-19T01:40:18.977Z",
+  "session": {
+    "valid": true,
+    "launchStatus": 200,
+    "launchCode": 0,
+    "pullCode": 0,
+    "pullKind": "ok",
+    "secUid": "",
+    "uid": null,
+    "missing": []
+  },
+  "launchRaw": {
+    "code": 0,
+    "msg": "",
+    "data": {
+      "config": {
+        "frontier_app_key": "",
+        "frontier_access_key": "",
+        "frontier_app_id": "0",
+        "frontier_product_id": "0",
+        "frontier_domain": "",
+        "sami_token": "",
+        "sami_app_key": "",
+        "message_service_id": "134217731",
+        "ws_app_key": "3fc6ca748b6839a54d5c1922169fea56",
+        "ws_access_key": "c4bbe0cb0cc23b6bfafe39d3e44b4d19",
+        "ws_app_id": "489823",
+        "ws_product_id": "1289",
+        "ws_domain": "wss://wss-normal-i18n.dola.com",
+        "audio_token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3OTAwNDEwOTQsImlhdCI6MTc4OTc4MTg5NCwiaXNzIjoiZGF0YS5zcGVlY2guc2Fhc19yYW0iLCJ2ZXJzaW9uIjoiYXV0aC12MSIsImFjY291bnRfaWQiOjIxMDAwMDE2MTMsImFjY291bnRfbmFtZSI6Im9jZWFuIiwidXNlcl9pZCI6ODg5MDAzLCJ1c2VyX25hbWUiOiJ3YW5nYm8udmVhZXIiLCJhcHBfaWQiOjg4ODAwNTUyLCJhcHBfbmFtZSI6Ik5vdmEiLCJhcHBrZXkiOiJPY2tJVGpYV2ViIn0.xfpjdAQM6vn5mo9iui5WeGavJl4bY97RUT8Kb4oiLB-F4JCYzT-undp-mgXoIKukioS97c8vza2jPoF7b8E5Mg",
+        "audio_app_key": "OckITjXWeb",
+        "ttwid": "1%7C41mzRYbbqCYGjnebWzC4pIsbPVTZrLdXiV1Ny2qkzSQ%7C1789721815%7Cc5a25a8a6ca49b77262778ca5b9a18b599d87090335b243c8334fc6b5f62b397",
+        "web_id": "7686796313408833077",
+        "action_service_id": "0",
+        "im_service_id": "134217760",
+        "call_token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3OTAwMzk0NTcsImlhdCI6MTc4OTc4MDI1NywiaXNzIjoiZGF0YS5zcGVlY2guc2Fhc19yYW0iLCJ2ZXJzaW9uIjoiYXV0aC12MSIsImFjY291bnRfaWQiOjIxMDAwMDE2MTMsImFjY291bnRfbmFtZSI6Im9jZWFuIiwidXNlcl9pZCI6ODg5MDAzLCJ1c2VyX25hbWUiOiJ3YW5nYm8udmVhZXIiLCJhcHBfaWQiOjg4ODAwNjk2LCJhcHBfbmFtZSI6Im5vdmEgdGFrbGluZyBoZWFkIiwiYXBwa2V5IjoibWNSUFF5WFRRbyJ9.J4q7x8QJeZast8TjIuFbDV_YHjzBkhTsaYnw_QyyoVgd_Ej4pD4AlXhTv7EMu4CQPlxlj_EjXdtftIkJXdAgkQ",
+        "call_app_key": "mcRPQyXTQo",
+        "ws_access_key_v2": "c0a243261bbbe82e5bb6faae99d906b3",
+        "enterprise_audio_app_key": "vnyy32pbkEF7YunE",
+        "enterprise_call_app_key": "nKYtQoVZ7RO2XEAe"
+      },
+      "model_list": null,
+      "voice_list": null,
+      "sec_user_id": "",
+      "assistant_bot_id": "7339470689562525703",
+      "new_voice_list": null,
+      "timestamp": 0,
+      "icon_list": null,
+      "debug": false,
+      "speech_language_list": null,
+      "share_info": null,
+      "feedback_email": "",
+      "feedback_meta": null,
+      "feedback_placeholder": "",
+      "bot_language_list": null,
+      "feature_config": {
+        "active_voice_config": {
+          "enabled": false
+        },
+        "mailbox": {
+          "enabled": false
+        }
+      },
+      "profile_enable": false,
+      "bot_report_reason_list": null,
+      "message_report_reason_list": null,
+      "country": "",
+      "allow_ugc_voice": null,
+      "landing_config": null,
+      "ugc_voice_icon_list": null,
+      "asr_model_map": null,
+      "upload_file_allowed_types": null,
+      "preview_url_prefixes": [],
+      "upload_file_max_size": 0,
+      "ugc_voice_authorized": false,
+      "ugc_voice_freetalk_list": null,
+      "cold_start_enable_tts": false,
+      "save_chat_history_popup_enable": false,
+      "quota_config": null,
+      "login": {
+        "order": [
+          "line",
+          "google",
+          "phone_verify_code",
+          "apple",
+          "facebook"
+        ],
+        "display_count": 1
+      },
+      "is_social_enable": false,
+      "ugc_voice_freetalk_list_by_language": null,
+      "action_bar_show_bot_config": null,
+      "user_report_reason_list": null,
+      "conversation_report_reason_list": null,
+      "user_ban_status": 0,
+      "in_white": false,
+      "conversation_template_report_reason_list": null,
+      "voice_list_tab_info": null,
+      "flow_social_ab_config": null,
+      "upload_multi_entity_conf": null,
+      "conversation_bg_content": {
+        "ar": "بدء موضوع جديد",
+        "de": "Ein neues Thema beginnen",
+        "en": "Start a new topic",
+        "es": "Iniciar un nuevo tema",
+        "es-ES": "Iniciar un nuevo tema",
+        "fil": "Magsimula ng bagong paksa",
+        "fr": "Démarrer un nouveau sujet",
+        "id": "Mulai topik baru",
+        "it": "Inizia un nuovo argomento",
+        "ja": "新しいトピックを開始",
+        "ko": "새 주제 시작",
+        "ms-MY": "Mulakan topik baharu",
+        "pt": "Comece um novo tópico",
+        "ru": "Начать новую тему",
+        "th-TH": "เริ่มหัวข้อใหม่",
+        "uz": "Yangi mavzu boshlash",
+        "vi": "Bắt đầu chủ đề mới",
+        "zh": "聊聊新话题",
+        "zh-Hant": "開啟新話題"
+      },
+      "coco_setting_list": [],
+      "coco_setting_register_enable": false,
+      "conv_rcmd_bot_conf": {
+        "enable": false,
+        "mode": 1,
+        "loop_seconds": 7200
+      },
+      "audio_voice_feedback_item_list": null,
+      "upload_audio_entity_conf": null,
+      "enable_coco_setting_list": false,
+      "minor_info_data": {
+        "is_minor_mode": false,
+        "minor_config": {
+          "chat_bot": false,
+          "show_video": false,
+          "enter_web": false,
+          "ai_creation": false
+        },
+        "popup_config": {
+          "popup_type": 2,
+          "max_popup_count": 0
+        }
+      },
+      "is_realtime_new_background_enabled": false,
+      "user_self_profile_status": 0,
+      "degrade_status": 0,
+      "ug_campaign": "",
+      "extra": {
+        "is_login": "1"
+      }
+    }
+  },
+  "pullRaw": {
+    "code": 0,
+    "msg": "",
+    "data": {
+      "configs": null
+    }
+  },
+  "launchNumericHits": [],
+  "probes": [
+    {
+      "path": "/alice/profile/self_brief",
+      "note": "账号资料 + 会员等级（✅ 实测 code=0；免费号无额度字段）",
+      "status": 200,
+      "code": 0,
+      "kind": "ok",
+      "msg": "",
+      "ms": 466,
+      "flagged": false,
+      "numericHits": [
+        {
+          "field": "data.profile_bot_info.total",
+          "value": 0
+        }
+      ],
+      "sample": "{\"code\":0,\"msg\":\"\",\"data\":{\"profile_brief\":{\"id\":\"1474977758469649\",\"entity_id\":\"7686323974691652661\",\"nickname\":\"2d5lel 2d5lel\",\"user_name\":\"432012642\",\"image\":{\"uri\":\"user-avatar-mya/a9fae700a94b544de4c7fa4a4462f7b5\",\"tiny_url\":\"https://p16-flow-image-sign.ibyteimg.com/user-avatar-mya/a9fae700a94b544de4c7fa4a4462f7b5~tplv-0es2k971ck-icon-tiny.jpeg?rcl=2026091909401998B0FA0C8AFC2EC9F30F\\u0026rk3s=8e244e95\\u0026rrcfp=15ed19d4\\u0026x-expires=1792460420\\u0026x-signature=0UPcoVRJ28CHGXlT%2FkFJDFg3KxI%3D\",\"origin_url\":\"https://p16-flow-image-sign.ibyteimg.com/user-avatar-mya/a9fae700a94b544de4c7fa4a4462f7b5~tplv-0es2k971ck-image.jpeg?rcl=2026091909401998B0FA0C8AFC2EC9F30F\\u0026rk3s=8e244e95\\u0026rrcfp=15ed19d4\\u0026x-expires=1792460420\\u0026x-signature=42nY%2B7fcuBZY1ozq%2FmfNJeS2nnI%3D\"},\"is_default_nickname\":false,\"is_default_avatar\":false,\"user_type\":0,\"enterprise_user_type\":0,\"tenant_info\":{\"tenant_id\":\"0\",\"tenant_name\":\"\",\"user_name\":\"\"},\"lark_user_id\":\"0\"},\"profile_bot_info\":{\"total\":0}}}"
+    },
+    {
+      "path": "/alice/user/launch",
+      "note": "user_info；实测 quota_config 恒为 null",
+      "status": 200,
+      "code": 0,
+      "kind": "ok",
+      "msg": "",
+      "ms": 272,
+      "flagged": false,
+      "numericHits": [],
+      "sample": "{\"code\":0,\"msg\":\"\",\"data\":{\"config\":{\"frontier_app_key\":\"\",\"frontier_access_key\":\"\",\"frontier_app_id\":\"0\",\"frontier_product_id\":\"0\",\"frontier_domain\":\"\",\"sami_token\":\"\",\"sami_app_key\":\"\",\"message_service_id\":\"134217731\",\"ws_app_key\":\"3fc6ca748b6839a54d5c1922169fea56\",\"ws_access_key\":\"c4bbe0cb0cc23b6bfafe39d3e44b4d19\",\"ws_app_id\":\"489823\",\"ws_product_id\":\"1289\",\"ws_domain\":\"wss://wss-normal-i18n.dola.com\",\"audio_token\":\"eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3OTAwNDExNTEsImlhdCI6MTc4OTc4MTk1MSwiaXNzIjoiZGF0YS5zcGVlY2guc2Fhc19yYW0iLCJ2ZXJzaW9uIjoiYXV0aC12MSIsImFjY291bnRfaWQiOjIxMDAwMDE2MTMsImFjY291bnRfbmFtZSI6Im9jZWFuIiwidXNlcl9pZCI6ODg5MDAzLCJ1c2VyX25hbWUiOiJ3YW5nYm8udmVhZXIiLCJhcHBfaWQiOjg4ODAwNTUyLCJhcHBfbmFtZSI6Ik5vdmEiLCJhcHBrZXkiOiJPY2tJVGpYV2ViIn0.2AFmZZf10RlwDfyTPetmV5nHs0eXd9Gy3MnmcsX4Exa2rXxrHD8o5QG_gYUqAZukygTMOlf4GUSHHMNat8Q0ug\",\"audio_app_key\":\"OckITjXWeb\",\"ttwid\":\"1%7C41mzRYbbqCYGjnebWzC4pIsbPVTZrLdXiV1Ny2qkzSQ%7C1789721815%7Cc5a25a8a6ca49b77262778ca5b9a18b599d87090335b243c8334fc6b5f62b397\",\"web_id\":\"7686796313408833077\",\"action_service_id\":\"0\",\"im_service_id\":\"134217760\",\"call_token\":\"eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3OTAwMzg4NzksImlhdCI6MTc4OTc"
+    },
+    {
+      "path": "/alice/commerce/sale/subscription/entry/config/",
+      "note": "订阅入口；实测返回 subs_status: free/pro",
+      "status": 200,
+      "code": 0,
+      "kind": "ok",
+      "msg": "",
+      "ms": 243,
+      "flagged": false,
+      "numericHits": [],
+      "sample": "{\"data\":{\"action_bar\":{\"click_url\":\"\",\"is_enabled\":false,\"title\":\"\"},\"country_code\":\"JP\",\"enterprise_profile\":{\"is_enable\":false},\"has_active_subscription\":false,\"membership_display_name\":\"\",\"profile\":{\"is_enable\":false},\"profile_entry_list\":[],\"settings_management_page\":{\"is_enabled\":false},\"settings_page\":{\"click_url\":\"\",\"icon_name\":\"\",\"is_enabled\":false,\"sub_title\":\"\",\"title\":\"\"},\"settings_upgrade_page\":{\"is_enabled\":false},\"show_membership_name\":false,\"show_pc_campaign\":false,\"subs_status\":\"free\"},\"code\":0,\"msg\":\"\",\"message\":\"\"}"
+    },
+    {
+      "path": "/alice/slot/action_bar_v3/get_item_conf",
+      "note": "顶栏配置；里面的 credit 是模型消耗倍率，不是余额",
+      "status": 200,
+      "code": 0,
+      "kind": "ok",
+      "msg": "",
+      "ms": 347,
+      "flagged": true,
+      "numericHits": [],
+      "sample": "{\"data\":{\"item_list\":{\"1064442771334929\":{\"action_bar_key\":\"coco_deep_thinking\",\"action_type\":11,\"active_switch_conf\":{\"auto_cot_close_status\":0,\"default_select_model_map\":{\"chat\":{\"item_id\":\"0\"},\"creation\":{\"item_id\":\"4\"},\"office\":{\"item_id\":\"4\"}},\"default_status\":0,\"menu_conf\":{\"item_list\":[{\"active_dark_mode_icon\":{\"uri\":\"tos-mya-i-uo7y4d541q/rc_vlm/f77f6c70206246ab86413b04944d92cb\",\"url\":\"https://p16-flow-image-sign.ibyteimg.com/tos-mya-i-uo7y4d541q/rc_vlm/f77f6c70206246ab86413b04944d92cb~tplv-0es2k971ck-image-qvalue.png?rcl=20260919094020E3EE037BD1F776599404\\u0026rk3s=8e244e95\\u0026rrcfp=acaef535\\u0026x-expires=1792374020\\u0026x-signature=JKt2Hga0kVYJQEXfJH82m3YR9ag%3D\"},\"active_icon\":{\"uri\":\"tos-mya-i-uo7y4d541q/rc_vlm/f11b29eed96a4f48a6b7ea94dc6290ef\",\"url\":\"https://p16-flow-image-sign.ibyteimg.com/tos-mya-i-uo7y4d541q/rc_vlm/f11b29eed96a4f48a6b7ea94dc6290ef~tplv-0es2k971ck-image-qvalue.png?rcl=20260919094020E3EE037BD1F776599404\\u0026rk3s=8e244e95\\u0026rrcfp=acaef535\\u0026x-expires=1792374020\\u0026x-signature=VeAzNEArFBh6SGtW26uUw4B4x0k%3D\"},\"agent_mode\":2,\"conversation_mode_list\":[\"chat\",\"creation\"],\"dark_mode_icon\":{\"uri\":\"tos-mya-i-uo7y4d541q/rc_vlm/f77f6c70206246ab86413b"
+    },
+    {
+      "path": "/alice/slot/action_bar_v3/brief_list",
+      "note": "顶栏简报（✅ 实测 code=0，14KB，含模型配置）",
+      "status": 200,
+      "code": 0,
+      "kind": "ok",
+      "msg": "",
+      "ms": 336,
+      "flagged": false,
+      "numericHits": [],
+      "sample": "{\"data\":{\"entry_list\":[{\"action_bar_key\":\"coco_instruction\",\"action_type\":7,\"active_switch_conf\":{\"default_status\":0,\"menu_conf\":{\"item_list\":[]},\"switch_memory_strategy\":0,\"switch_type\":0},\"dark_mode_icon\":{\"uri\":\"tos-mya-i-uo7y4d541q/rc_vlm/d1fc17e56fda42d8bf98a57f34ba9fe3\",\"url\":\"https://p16-flow-image-sign.ibyteimg.com/tos-mya-i-uo7y4d541q/rc_vlm/d1fc17e56fda42d8bf98a57f34ba9fe3~tplv-0es2k971ck-image-qvalue.png?rcl=202609190940214F61E1220234584EC196\\u0026rk3s=8e244e95\\u0026rrcfp=df2d260b\\u0026x-expires=1792374021\\u0026x-signature=64pd%2BhT1adZSuUTlUkKGj0SE4dY%3D\"},\"display_extra\":{\"active_dark_mode_icon_uri\":\"https://p16-flow-image-sign.ibyteimg.com/tos-mya-i-uo7y4d541q/rc_vlm/221b2023b70f43188fed5e464e1c18d2~tplv-0es2k971ck-image-qvalue.png?rcl=2026091909290458538D1594EC4C9097BE\\u0026rk3s=8e244e95\\u0026rrcfp=7a23e094\\u0026x-expires=1821403744\\u0026x-signature=Yk3ySF5Nb5w%2F%2FabLz5k6MjZn944%3D\",\"active_icon_uri\":\"https://p16-flow-image-sign.ibyteimg.com/tos-mya-i-uo7y4d541q/rc_vlm/ea7864133f934894bf8f79d3363ff418~tplv-0es2k971ck-image-qvalue.png?rcl=2026091909290458538D1594EC4C9097BE\\u0026rk3s=8e244e95\\u0026rrcfp=7a23e094\\u0026x-expires=1821403744\\u0026x-signature=SGM%2FjMDDtz"
+    },
+    {
+      "path": "/alice/user/config/pull",
+      "note": "用户配置拉取（会话校验）",
+      "status": 200,
+      "code": 0,
+      "kind": "ok",
+      "msg": "",
+      "ms": 222,
+      "flagged": false,
+      "numericHits": [],
+      "sample": "{\"code\":0,\"msg\":\"\",\"data\":{\"configs\":null}}"
+    }
+  ]
+}

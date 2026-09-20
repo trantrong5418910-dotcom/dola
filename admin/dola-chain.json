@@ -1,0 +1,11 @@
+{
+  "cmd": 3100,
+  "sequence_id": "probe-1789782229063",
+  "downlink_body": {},
+  "version": "1",
+  "status_code": 712017001,
+  "status_desc": "数据不存在",
+  "ext": {
+    "tt_stable": "1"
+  }
+}

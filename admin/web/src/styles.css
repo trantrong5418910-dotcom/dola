@@ -1,0 +1,183 @@
+/**
+ * 全局样式：统一后台的视觉语言。
+ *
+ * 设计取舍（为什么这么改）：
+ *   ① **深色是默认主题**，但 Element Plus 的深色默认是「纯灰一片」，
+ *      页面背景 / 卡片 / 表头三层分不开，看着糊。这里显式拉开三层的明度差。
+ *      （第一版只差 8 个色阶，缩略图上看就是一片黑 —— 对比度是量出来的，不是感觉出来的。）
+ *   ② **表格是后台的主战场**，默认行高偏松、表头没有区分度。
+ *      这里把表头做成"浅色底 + 次要文字色"，行高压到 44px 上下 ——
+ *      一屏能多看好几行，密集数据才是后台的真实使用场景。
+ *   ③ 统一圆角与边框色。EP 默认圆角 4px 偏硬，边框在深色下偏亮刺眼。
+ */
+
+/* ---------------------------------------------------------------- 设计变量 */
+
+:root {
+  --adm-radius: 10px;
+  --adm-radius-sm: 7px;
+  --adm-gap: 14px;
+
+  /* 浅色（默认值，html.dark 会覆盖下面的三层） */
+  --adm-bg-page: #f4f5f7;
+  --adm-bg-card: #ffffff;
+  --adm-bg-head: #fafbfc;
+  --adm-border: #e6e8eb;
+  --adm-border-soft: #edeff2;
+  --adm-text-1: #1d2129;
+  --adm-text-2: #5f6672;
+  --adm-text-3: #8f959e;
+}
+
+/*
+ * 深色三层明度。
+ *
+ * ⚠️ 这里调过一版：最初用 page #16181d / card #1e2128，两者只差 8 个色阶，
+ * 截图缩略一看就是"糊成一片黑"，卡片完全没有浮起来的感觉。
+ * 实测采样确认颜色本身没错，是**对比度不够**。现在 page 压到 #0d0f13，
+ * 和卡片拉开 17+ 个色阶，层次一眼就出来了。
+ */
+html.dark {
+  --adm-bg-page: #0d0f13;
+  --adm-bg-card: #1c2028;
+  --adm-bg-head: #242933;
+  --adm-border: #2e333d;
+  --adm-border-soft: #262b34;
+  --adm-text-1: #e8eaed;
+  --adm-text-2: #a8aeb8;
+  --adm-text-3: #767d88;
+}
+
+/* ---------------------------------------------------------------- 基础 */
+
+html, body, #app { height: 100%; margin: 0; }
+
+body {
+  background: var(--adm-bg-page);
+  color: var(--adm-text-1);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 滚动条：默认太粗太亮，深色下很跳 */
+* { scrollbar-width: thin; scrollbar-color: var(--adm-border) transparent; }
+*::-webkit-scrollbar { width: 9px; height: 9px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: var(--adm-border);
+  border: 2px solid transparent;
+  background-clip: content-box;
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--adm-text-3); background-clip: content-box; }
+
+/* https://github.com/element-plus 变量对齐 */
+:root {
+  --el-border-radius-base: var(--adm-radius-sm);
+  --el-border-radius-small: 6px;
+}
+html.dark {
+  --el-bg-color-page: var(--adm-bg-page);
+  --el-bg-color: var(--adm-bg-card);
+  --el-border-color-light: var(--adm-border-soft);
+  --el-border-color-lighter: var(--adm-border-soft);
+  --el-text-color-primary: var(--adm-text-1);
+  --el-text-color-regular: var(--adm-text-2);
+  --el-text-color-secondary: var(--adm-text-3);
+}
+
+/* ---------------------------------------------------------------- 卡片 */
+
+.el-card {
+  border-radius: var(--adm-radius);
+  border-color: var(--adm-border-soft);
+}
+html.dark .el-card {
+  background: var(--adm-bg-card);
+  /* 深色下光靠底色分层不够，补一层极淡的投影把卡片"托"起来 */
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .4);
+}
+.el-card__body { padding: 18px 20px; }
+/* 卡片头部（有 header 的卡片）左侧对齐、字号统一 */
+.el-card__header { padding: 14px 20px; border-bottom-color: var(--adm-border-soft); }
+
+/* ---------------------------------------------------------------- 表格 */
+
+.el-table {
+  --el-table-border-color: var(--adm-border-soft);
+  --el-table-header-bg-color: var(--adm-bg-head);
+  --el-table-header-text-color: var(--adm-text-2);
+  --el-table-row-hover-bg-color: var(--el-fill-color-light);
+  font-size: 13px;
+}
+html.dark .el-table {
+  --el-table-bg-color: var(--adm-bg-card);
+  --el-table-tr-bg-color: var(--adm-bg-card);
+  --el-table-header-bg-color: var(--adm-bg-head);
+  --el-table-row-hover-bg-color: #262a33;
+}
+
+/* 表头：字重和字号压一点，靠底色和正文区分，别靠加粗 */
+.el-table th.el-table__cell {
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: .2px;
+  padding: 9px 0;
+}
+.el-table td.el-table__cell { padding: 9px 0; }
+
+/* 单元格默认上下居中；文字类单元格允许两行（主副信息） */
+.el-table .cell { line-height: 1.5; }
+.el-table .cell.wrap { white-space: normal; }
+
+/* 数字列右对齐更易比对（加 .num 类到 el-table-column 的 class-name） */
+.el-table .col-num { text-align: right; }
+.el-table .col-num .cell { justify-content: flex-end; }
+
+/*
+ * 表格里的文字按钮：Element Plus 默认左右各 11px 内边距，
+ * 一列放 3 个就把列撑爆 / 换行 / 被固定列盖住（实测 /tokens 整表超宽 198px）。
+ * 这里把内边距收到 5px，并把「操作」列统一改成不换行。
+ */
+.el-table .el-button.is-text,
+.el-table .el-button.is-link { padding: 4px 5px; }
+.el-table .el-button + .el-button { margin-left: 2px; }
+.el-table th:last-child,
+.el-table td:last-child { white-space: nowrap; }
+/* 固定列盖住相邻列时给个渐隐阴影，让人知道"右边还有内容" */
+.el-table .el-table-fixed-column--right.is-first-column::before,
+.el-table .el-table-fixed-column--right.is-last-column::before { box-shadow: -6px 0 8px -6px rgba(0, 0, 0, .35); }
+
+/* ---------------------------------------------------------------- 告警 */
+
+.el-alert { border-radius: var(--adm-radius-sm); }
+.el-alert__title { font-size: 13px; line-height: 1.7; }
+
+/* ---------------------------------------------------------------- 其它 */
+
+.el-dialog { border-radius: var(--adm-radius); }
+.el-dialog__header { margin-right: 0; }
+.el-message-box { border-radius: var(--adm-radius); }
+.el-tag { border-radius: 6px; }
+.el-button { border-radius: var(--adm-radius-sm); }
+
+/* 分页靠右时给点上边距 */
+.el-pagination { --el-pagination-font-size: 13px; }
+
+/* 主副两行信息（表格里用）：主行正常色，副行小字次要色 */
+.cell-stack { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.cell-stack .main { color: var(--adm-text-1); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cell-stack .sub {
+  color: var(--adm-text-3); font-size: 11.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cell-stack .sub.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* 失效/异常行：淡色底 + 左侧色条，扫一眼就能挑出坏账号 */
+.el-table .row-danger > td.el-table__cell { background: rgba(245, 108, 108, .06); }
+.el-table .row-danger > td.el-table__cell:first-child { box-shadow: inset 3px 0 0 var(--el-color-danger); }
+.el-table .row-warn > td.el-table__cell { background: rgba(230, 162, 60, .06); }
+.el-table .row-warn > td.el-table__cell:first-child { box-shadow: inset 3px 0 0 var(--el-color-warning); }
+.el-table .row-danger:hover > td.el-table__cell,
+.el-table .row-warn:hover > td.el-table__cell { background: var(--el-table-row-hover-bg-color); }

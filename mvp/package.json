@@ -1,0 +1,23 @@
+{
+  "name": "video-task-mvp",
+  "version": "1.0.0",
+  "description": "可替换 provider 的视频生成任务 MVP：创建任务 → 拿 task_id → 轮询状态 → 完成后预览/下载",
+  "type": "module",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "bin": {
+    "video-task": "src/cli.js"
+  },
+  "scripts": {
+    "cli": "node src/cli.js",
+    "serve": "node src/server.js",
+    "demo": "node src/cli.js create --provider mock --prompt '一只橘猫在窗台上晒太阳' --wait --download ./out",
+    "smoke": "node test/smoke.js",
+    "smoke:api": "node test/dola-api.js"
+  },
+  "dependencies": {},
+  "optionalDependencies": {},
+  "keywords": ["video", "task", "provider", "polling", "dola"],
+  "license": "MIT"
+}

@@ -1,0 +1,14 @@
+{
+  "acct": "7jzevt@ixzx.kdns.fr",
+  "convId": "38417915133082129",
+  "prompt": "海边日落，无人机航拍，海浪拍打礁石，暖橙色光芒",
+  "force": null,
+  "videoUrl": "http://v16-dola.dola.com/f59127ecc705355dc052b2d5129bb630/7d79f5ce/video/tos/mya/tos-mya-ve-50851/owMrtYYLvsQwXiE1uVifCA4mu8wBlHI4GCBz1Y/?a=489823&ch=0&cr=7&dr=0&er=0&lr=cici_ai&cd=0%7C0%7C0%7C1&cv=1&br=3294&bt=1647&cs=4&ds=4&ft=ApKAtl7",
+  "file": "/Users/feige/WorkBuddy/新网站/admin/dola-7jzevt@ixzx.kdns.fr-38417915133082129.mp4",
+  "bytes": 2125441,
+  "probe": "codec_name=aac\ncodec_name=hevc\nwidth=1280\nheight=720\nduration=10.080000\nsize=2125441",
+  "quota": {
+    "cost": 2,
+    "remaining": 2
+  }
+}

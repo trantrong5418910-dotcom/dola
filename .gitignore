@@ -1,0 +1,30 @@
+.env
+node_modules/
+out/
+__pycache__/
+*.pyc
+.DS_Store
+
+# 管理后台：产物与运行时数据
+#   含 admin/server/data/browser-profiles/（每账号一个浏览器 profile，
+#   用来缓存 dola 的 JS 包把代理流量从 ~12MB 降到 ~1MB；单账号约 20MB，别提交）
+admin/server/data/
+admin/server/public/
+admin/test/shots/
+
+# 视频任务 MVP 的下载产物
+mvp/out/
+python/out/
+
+.env.*
+!.env.example
+*.tgz
+
+# local tooling / media noise
+.playwright-cli/
+admin/.playwright-cli/
+*.mp4
+admin/output/
+capture/
+fangyue-evidence/
+.workbuddy/

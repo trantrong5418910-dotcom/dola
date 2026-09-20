@@ -1,0 +1,38 @@
+{
+  "name": "admin-console",
+  "version": "1.0.0",
+  "private": true,
+  "description": "通用后台骨架：Vue3 + Element Plus 前端，Express + SQLite 后端，含登录/RBAC/CRUD/设置/审计日志",
+  "type": "module",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "dev:api": "node server/index.js",
+    "dev:web": "vite --config web/vite.config.js",
+    "build": "vite build --config web/vite.config.js",
+    "start": "node server/index.js",
+    "reset-db": "node server/db.js --reset",
+    "smoke": "node test/smoke.js",
+    "test:maintenance": "node test/maintenance.mjs",
+    "test:native-probe": "node --test test/native-capability.mjs test/native-probe-job.mjs test/proxy-assign.mjs",
+    "test:proxy-batch": "node --test test/assign-proxies-script.mjs",
+    "test:concurrency": "node --test test/generation-concurrency.mjs test/generator-isolated.mjs",
+    "test:google-login": "node --test test/google-login.mjs test/google-login-cache.mjs test/google-login-restore.mjs",
+    "shots": "node scripts/shot-admin.mjs --path /dola --out ../capture/admin-dola.png",
+    "audit-ui": "node scripts/audit-table-width.mjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.7.0",
+    "express": "^4.21.2",
+    "undici": "^8.10.2"
+  },
+  "devDependencies": {
+    "@element-plus/icons-vue": "^2.3.1",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "element-plus": "^2.9.1",
+    "vite": "^6.0.7",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  }
+}

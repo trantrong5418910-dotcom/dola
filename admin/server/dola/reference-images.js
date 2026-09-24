@@ -16,6 +16,23 @@ export const REQUEST_MAX_BYTES = 22 * 1024 * 1024;
 export const IMAGE_MAX_SIDE = 8_192;
 export const IMAGE_MAX_PIXELS = 40_000_000;
 
+/**
+ * Short DOM evidence appended to probe notes (accept / multiple / name).
+ * Keeps notes under ~300 chars when sliced by the caller.
+ */
+export function referenceImageEvidenceNote(imageInputs = []) {
+  const list = Array.isArray(imageInputs) ? imageInputs : [];
+  if (!list.length) return '';
+  const bits = list.slice(0, 3).map((input, index) => {
+    const accept = String(input?.accept || '').slice(0, 40);
+    const multiple = input?.multiple ? 'multi' : 'single';
+    const name = String(input?.name || input?.id || `input${index + 1}`).slice(0, 24);
+    return `${name}:${accept || 'image/*'}:${multiple}`;
+  });
+  return `；证据 ${bits.join(' | ')}`;
+}
+
+
 const SOF_MARKERS = new Set([
   0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7,
   0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf,

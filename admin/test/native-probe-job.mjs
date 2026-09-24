@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
 import { once } from 'node:events';
 import express from 'express';
+import { isVerifiedNativeCapability } from '../server/dola/generation-policy.js';
 
 async function waitFor(predicate, label, timeoutMs = 3000) {
   const deadline = Date.now() + timeoutMs;
@@ -115,4 +116,15 @@ test('batch native probe job is read-only, serial and skips accounts without a b
     db.raw.close();
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('native probe contract must not persist a shorter UI carrier as available', () => {
+  // Keep this regression close to the batch job contract: a real page can show
+  // 10s while the adapter carries a requested 20/30s value. That is unknown,
+  // not native capability evidence.
+  const result = { ok: true, state: 'available', seconds: 20, uiSeconds: 10,
+    native: false, rewriteCarrier: true, model: 'seedance_v2.5' };
+  assert.equal(isVerifiedNativeCapability(result, 20), false);
+  assert.equal(isVerifiedNativeCapability({ ...result, seconds: 10, uiSeconds: 10,
+    native: true, rewriteCarrier: false }, 10), true);
 });

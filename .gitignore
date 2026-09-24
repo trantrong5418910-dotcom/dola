@@ -29,3 +29,19 @@ capture/
 fangyue-evidence/
 .workbuddy/
 output/
+
+# 手工备份（.bak-<日期>-<主题>）：历史由 git 负责，备份文件不入库
+*.bak-*
+
+# 独立子项目：自带 .gitignore 与 node_modules，不并入本仓
+duola-ruler/
+
+# 根目录的证据截图与源码包
+/*.png
+/*.zip
+
+# 根 node_modules 是指向沙箱工作区的符号链接，不能入库
+/node_modules
+
+# 抓包数据落盘
+admin/scripts/skill-upload-capture-*.jsonl

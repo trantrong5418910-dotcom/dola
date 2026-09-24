@@ -11,6 +11,8 @@
  *      但「查额度」到底需不需要签名，必须用真实 cookie 实测 —— 见 probeCredits()。
  */
 import crypto from 'node:crypto';
+import { observeVideoComposerBootstrap } from './composer-bootstrap.js';
+import { createPreflightDiagnostics } from './preflight-diagnostics.js';
 import {
   nativeCapabilityState,
   prepareNativeVideoComposer,
@@ -162,6 +164,28 @@ function contentTypeFor(path) {
 }
 
 /**
+ * 把 fetch 的嵌套错误摊平成一句能定位的话。
+ *
+ * 为什么要单独写这个：fetch 会把所有底层错误都包成笼统的 `fetch failed`，
+ * 不看 `cause` 就只能靠猜。实测被这个坑掉过一次 —— 真正原因是
+ * `invalid onRequestStart method`（两份 undici 版本不匹配），
+ * 而字面信息只有"fetch failed"。
+ *
+ * 注：`routes/dola.js` 的 describeFetchError 是同一份逻辑，
+ * 那边注释里也留了这条教训。这里补上，避免服务端和脚本端行为不一致。
+ */
+export function describeFetchError(e) {
+  const parts = [];
+  for (let cur = e, depth = 0; cur && depth < 5; depth++) {
+    const msg = cur.message || (typeof cur === 'string' ? cur : '');
+    const code = cur.code ? `[${cur.code}]` : '';
+    if (msg || code) parts.push(`${code}${msg}`.trim());
+    cur = cur.cause;
+  }
+  return parts.filter(Boolean).join(' ← ') || '未知网络错误';
+}
+
+/**
  * 调 dola 的 JSON 接口。
  *
  * `proxy` 是**必须**要传的（多账号场景）：不传就走本机出口，
@@ -200,7 +224,7 @@ export async function dolaFetch(path, {
     try { json = JSON.parse(text); } catch { /* 非 JSON */ }
     return { status: res.status, json, text, url, ms: Date.now() - started };
   } catch (e) {
-    return { status: 0, json: null, text: String(e.message), url, ms: Date.now() - started, error: true };
+    return { status: 0, json: null, text: describeFetchError(e), url, ms: Date.now() - started, error: true };
   } finally {
     clearTimeout(timer);
   }
@@ -430,6 +454,27 @@ export async function getPlaywright() {
 }
 
 /**
+ * ★ 拦住 dola 前端在限流时「自己登出自己」的请求。
+ *
+ * 实测：提交撞上限流（710022002）后，dola 前端会自己调 `/passport/web/logout/`
+ * 把会话销毁 —— **每失败一次就烧掉一个账号**。
+ * 这里把它 abort 掉，限流就退化成"这次没成功"，账号还在。
+ *
+ * 必须用 `ctx.route(...)` 在**页面发起之前**注册（路由拦截只对注册后的请求生效），
+ * 且要在 `addCookies` 之后、`newPage()` 之前调用，别放到导航之后。
+ *
+ * 原本这段代码在 `diag-submit.mjs` / `verify-flow.mjs` 里各抄了一份，
+ * 而 `submit30.mjs` / `dola-generate.mjs` / `exp-capture-submit.mjs` 这些
+ * **真会提交**的脚本反而漏了 —— 所以收口到这个函数，谁开浏览器谁调一次。
+ * 对只读探测脚本也安全：任何脚本都不希望账号自己登出。
+ *
+ * @param {import('playwright').BrowserContext} ctx
+ */
+export async function guardLogoutRequests(ctx) {
+  await ctx.route('**/passport/**/logout**', (route) => route.abort());
+}
+
+/**
  * 浏览器通道：带着账号 cookie 打开 dola，让页面自己算 a_bogus，
  * 我们只监听它发出的请求/响应，把额度字段扒出来。
  *
@@ -467,11 +512,16 @@ export async function fetchCreditsViaBrowser(cookies, {
     }
     browser = await pw.chromium.launch(launchOptions);
     const ctx = await browser.newContext({
+      serviceWorkers: 'block',
       viewport: { width: 1280, height: 900 },
       locale: 'en-US',
       userAgent: DOLA_HEADERS['user-agent'],
     });
     await ctx.route('**/passport/**/logout**', route => route.abort());
+
+    // Defense in depth: read-only capability probes must never submit a prompt.
+    await ctx.route('**/chat/completion**', route => route.abort());
+    await ctx.route('**/chat/**', route => route.request().method() === 'POST' ? route.abort() : route.continue());
 
     // 把导入的 cookie 灌进浏览器上下文
     const cookieList = Object.entries(cookies).map(([name, value]) => ({
@@ -503,6 +553,7 @@ export async function fetchCreditsViaBrowser(cookies, {
   } catch (e) {
     return { ok: false, error: e.message, hits, captured };
   } finally {
+    await ctx?.close().catch(() => {});
     await browser?.close().catch(() => {});
     await bridge?.close().catch(() => {});
   }
@@ -523,7 +574,12 @@ export async function probeNativeVideoViaBrowser(cookies, {
   pageUrl = `${DOLA_BASE}/chat/`,
   proxy = undefined,
   proxyUrl = null,
+  accountId = null,
 } = {}) {
+  timeout = Math.min(120000, Math.max(1, Number(timeout) || 60000));
+  const diagnostic = createPreflightDiagnostics({ seconds });
+  const deadline = Date.now() + timeout;
+  const remaining = () => Math.max(1, deadline - Date.now());
   if (!proxyUrl) {
     return { ok: false, state: 'unknown', error: '原生能力探测必须使用账号已绑定的代理' };
   }
@@ -537,8 +593,15 @@ export async function probeNativeVideoViaBrowser(cookies, {
     args: ['--disable-blink-features=AutomationControlled', '--no-sandbox'],
   };
   let browser = null;
+  let ctx = null;
+  let persistent = false;
   let bridge = null;
+  let deadlineTimer = null;
+  let deadlineExpired = false;
   try {
+    // Keep the installed runtime identical to the generation worker. This does
+    // not by itself establish page readiness; the composer must still confirm it.
+    launchOptions.executablePath = pw.chromium.executablePath();
     if (/^socks5h?:/i.test(proxyUrl)) {
       const { startSocksBridge } = await import('./socks-bridge.js');
       bridge = await startSocksBridge(proxyUrl);
@@ -549,14 +612,61 @@ export async function probeNativeVideoViaBrowser(cookies, {
       return { ok: false, state: 'unknown', error: '账号代理未能建立浏览器配置' };
     }
 
-    browser = await pw.chromium.launch(launchOptions);
-    const ctx = await browser.newContext({
+    // Bound the whole read-only admission probe, not each navigation separately.
+    // Otherwise a caller may time out while the backend continues creating a task.
+    deadlineTimer = setTimeout(() => {
+      deadlineExpired = true;
+      void browser?.close().catch(() => {});
+    }, remaining());
+    /**
+     * ★ 复用账号的持久化 profile（有 accountId 时）。
+     *
+     * 为什么必须：只读探测原本用临时上下文，**每次都冷启动**，
+     * 拉 ~12MB 的 JS 包。走住宅代理（尤其是静态 IP 只有 5Mbps）时
+     * 光加载就要 20 秒以上，探不到目标控件就超时 → 结果记成 `unknown`
+     * （而 `unknown` 会被误读成"这号没有该能力"）。
+     *
+     * 复用 profile 后命中 HTTP 缓存，热启动只要 ~0.36MB —— **快 30 倍**，
+     * 而且以后所有号的能力探测都受益。
+     */
+    const ctxOptions = {
+      serviceWorkers: 'block',
       viewport: { width: 1280, height: 900 },
       locale: 'zh-CN',
       userAgent: DOLA_HEADERS['user-agent'],
-    });
+    };
+    if (accountId) {
+      persistent = true;
+      const { mkdir } = await import('node:fs/promises');
+      const { dirname, join } = await import('node:path');
+      const { fileURLToPath } = await import('node:url');
+      const profileDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'data', 'browser-profiles', String(accountId));
+      await mkdir(profileDir, { recursive: true });
+      const launchPersistent = () => pw.chromium.launchPersistentContext(
+        profileDir,
+        { ...launchOptions, ...ctxOptions, timeout: Math.min(remaining(), 30000) },
+      );
+      try {
+        ctx = await launchPersistent();
+      } catch (e) {
+        // 进程被强杀时 Chromium 会留下 SingletonLock，不清理这个号以后永远起不来
+        if (!/SingletonLock|ProcessSingleton|profile.*in use/i.test(String(e.message))) throw e;
+        const { rm } = await import('node:fs/promises');
+        for (const f of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+          await rm(join(profileDir, f), { force: true, recursive: true }).catch(() => {});
+        }
+        ctx = await launchPersistent();
+      }
+    } else {
+      browser = await pw.chromium.launch({ ...launchOptions, timeout: Math.min(remaining(), 30000) });
+      ctx = await browser.newContext(ctxOptions);
+    }
+    if (deadlineExpired) throw new Error('capability_probe_timeout');
+    diagnostic.mark('context');
     await ctx.route('**/passport/**/logout**', route => route.abort());
 
+    await ctx.route('**/chat/completion**', route => route.abort());
+    await ctx.route('**/chat/**', route => route.request().method() === 'POST' ? route.abort() : route.continue());
     const cookieList = Object.entries(cookies || {}).map(([name, value]) => ({
       name, value, domain: '.dola.com', path: '/',
     }));
@@ -566,20 +676,30 @@ export async function probeNativeVideoViaBrowser(cookies, {
     }
     await ctx.addCookies(cookieList);
     const page = await ctx.newPage();
-    await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout }).catch(() => {});
-    await page.waitForLoadState('networkidle', { timeout: Math.min(timeout + 15000, 90000) }).catch(() => {});
-    const capability = await prepareNativeVideoComposer(page, { seconds, model, timeout });
+    diagnostic.attach(page);
+    observeVideoComposerBootstrap(page);
+    diagnostic.mark('navigate');
+    await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: Math.min(remaining(), 60000) }).catch(() => {});
+    // Streaming/telemetry can keep the network busy forever. Readiness comes
+    // from the visible composer controls below, not from zero open requests.
+    await page.waitForLoadState('networkidle', { timeout: Math.min(remaining(), 5000) }).catch(() => {});
+    const capability = await prepareNativeVideoComposer(page, { seconds, model, timeout: remaining(), onPhase: diagnostic.mark });
+    if (deadlineExpired) throw new Error('capability_probe_timeout');
     await ctx.close().catch(() => {});
-    return { ok: true, state: 'available', ...capability };
+    return { ok: true, state: 'available', ...capability, diagnostic: diagnostic.snapshot() };
   } catch (error) {
     return {
       ok: false,
       state: nativeCapabilityState(error),
-      error: error?.code === 'NATIVE_CAPABILITY_UNAVAILABLE'
+      reason: deadlineExpired ? 'VIDEO_PREPARATION_TIMEOUT' : error?.reason || null,
+      diagnostic: diagnostic.snapshot(deadlineExpired ? 'VIDEO_PREPARATION_TIMEOUT' : error?.reason || 'VIDEO_PROBE_ERROR'),
+      error: ['NATIVE_CAPABILITY_UNAVAILABLE', 'NATIVE_CAPABILITY_UNKNOWN'].includes(error?.code)
         ? error.message
         : '页面、登录状态或网络未能完成只读能力探测',
     };
   } finally {
+    diagnostic.dispose();
+    clearTimeout(deadlineTimer);
     await browser?.close().catch(() => {});
     await bridge?.close().catch(() => {});
   }
@@ -635,6 +755,7 @@ export async function probeReferenceImageViaBrowser(cookies, {
 
     browser = await pw.chromium.launch(launchOptions);
     const ctx = await browser.newContext({
+      serviceWorkers: 'block',
       viewport: { width: 1280, height: 900 },
       locale: 'zh-CN',
       userAgent: DOLA_HEADERS['user-agent'],
@@ -650,6 +771,8 @@ export async function probeReferenceImageViaBrowser(cookies, {
     }
     await ctx.addCookies(cookieList);
     const page = await ctx.newPage();
+    observeVideoComposerBootstrap(page);
+    await ctx.route('**/chat/**', route => route.request().method() === 'POST' ? route.abort() : route.continue());
     await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout }).catch(() => {});
     await page.waitForLoadState('networkidle', { timeout: Math.min(timeout + 15000, 90000) }).catch(() => {});
     await page.getByRole('button', { name: '我知道了' }).click({ timeout: 3000 }).catch(() => {});

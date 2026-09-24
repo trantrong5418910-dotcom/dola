@@ -5,7 +5,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseCookies, playwrightAvailable } from './provider.js';
+import { parseCookies, playwrightAvailable, guardLogoutRequests } from './provider.js';
 
 const args = process.argv.slice(2);
 const fi = args.indexOf('--file');
@@ -22,6 +22,7 @@ const ctx = await browser.newContext({
   userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
 });
 await ctx.addCookies(Object.entries(cookies).map(([name, value]) => ({ name, value, domain: '.dola.com', path: '/' })));
+await guardLogoutRequests(ctx);
 const page = await ctx.newPage();
 
 const hits = [];

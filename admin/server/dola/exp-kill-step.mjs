@@ -13,7 +13,7 @@
  * 每步之间**只查一次** self_brief，不重复打接口（否则样本被自己的探测污染）。
  */
 import { initDb, db } from '../db.js';
-import { parseCookies, fetchProfile, dolaFetch, getPlaywright, DOLA_HEADERS } from './provider.js';
+import { parseCookies, fetchProfile, dolaFetch, getPlaywright, DOLA_HEADERS, guardLogoutRequests } from './provider.js';
 
 const argv = process.argv.slice(2);
 const flag = (n, d = null) => {
@@ -45,6 +45,7 @@ async function withBrowser(fn) {
   try {
     const ctx = await browser.newContext({ viewport: { width: 1560, height: 950 }, locale: 'zh-CN', userAgent: DOLA_HEADERS['user-agent'] });
     await ctx.addCookies(Object.entries(ck).map(([name, value]) => ({ name, value, domain: '.dola.com', path: '/' })));
+await guardLogoutRequests(ctx);
     return await fn(ctx);
   } finally {
     await browser.close().catch(() => {});

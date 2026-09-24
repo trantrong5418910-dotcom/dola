@@ -75,9 +75,9 @@
     </el-row>
 
     <el-alert
-      v-if="summary.missingExitIp || summary.sharedExitIpRows"
+      v-if="summary.missingExitIp || summary.sharedExitIpRows || summary.validNoProxy"
       type="warning" :closable="false" show-icon class="proxy-isolation-alert"
-      :title="`生成前已拦截：${summary.missingExitIp || 0} 个代理账号未完成出口核验，${summary.sharedExitIpRows || 0} 个有效账号处于共享出口`"
+      :title="`生成前已拦截：未配置代理 ${summary.validNoProxy || 0} 个，未完成出口核验 ${summary.missingExitIp || 0} 个，共享出口 ${summary.sharedExitIpRows || 0} 个`"
     >
       <div class="proxy-alert-row">
         <span>未确认“一个有效账号对应一个出口 IP”前，不会提交新的 30 秒任务，也不会扣额度。</span>
@@ -86,9 +86,157 @@
     </el-alert>
 
     <el-tabs v-model="tab" class="tabs" @tab-change="onTab">
+      <!-- ============ 运营总览（合并 8790 Dashboard） ============ -->
+      <el-tab-pane label="运营总览" name="operations">
+        <template v-if="operationSummary">
+          <el-row :gutter="14" class="ops-stats">
+            <el-col v-for="card in operationCards" :key="card.label" :xs="12" :sm="8" :md="4">
+              <div class="stat ops-stat" :style="{ '--accent': card.color }">
+                <div class="label">{{ card.label }}</div>
+                <div class="num" :style="{ color: card.color }">{{ card.value }}</div>
+                <div class="sub">{{ card.sub }}</div>
+              </div>
+            </el-col>
+          </el-row>
+          <el-card shadow="never" class="ops-panel">
+            <div class="toolbar">
+              <div>
+                <b>统一运营数据</b>
+                <span class="muted ops-source">数据源：8788 dola_accounts / dola_videos / settings</span>
+              </div>
+              <div class="spacer" />
+              <el-button :icon="Refresh" :loading="operationsLoading" @click="loadOperations">刷新</el-button>
+              <el-button text @click="tab = 'proxies'">代理与出口</el-button>
+              <el-button text @click="tab = 'ratelimit'">限流与冷却</el-button>
+            </div>
+            <el-alert
+              v-if="operationSummary.proxy?.missingExitIp || operationSummary.proxy?.sharedExitIpRows || operationSummary.proxy?.withoutProxy"
+              type="warning" :closable="false" show-icon class="mb"
+              :title="`代理隔离待处理：未配置 ${operationSummary.proxy?.withoutProxy || 0} 个，未核验出口 ${operationSummary.proxy?.missingExitIp || 0} 个，共享出口 ${operationSummary.proxy?.sharedExitIpRows || 0} 个`"
+            >
+              <template #default>
+                生成只会选择已确认独立出口的有效账号；请从“代理与出口”处理待核验项。
+              </template>
+            </el-alert>
+            <el-row :gutter="14">
+              <el-col :xs="24" :md="12">
+                <div class="ops-box">
+                  <div class="ops-box-title">任务队列</div>
+                  <div class="ops-line"><span>运行中 / 排队</span><b>{{ operationSummary.queue?.running ?? 0 }} / {{ operationSummary.queue?.queued ?? 0 }}</b></div>
+                  <div class="ops-line"><span>并发</span><b>{{ operationSummary.queue?.running ?? 0 }} / {{ operationSummary.queue?.concurrency ?? 1 }}</b></div>
+                  <div class="ops-line"><span>容量</span><b>{{ operationSummary.queue?.activeTasks ?? 0 }} / {{ operationSummary.queue?.queueLimit ?? 6000 }}</b></div>
+                  <div class="ops-line"><span>选号占用</span><b>{{ operationSummary.queue?.reservedAccounts ?? 0 }}</b></div>
+                </div>
+              </el-col>
+              <el-col :xs="24" :md="12">
+                <div class="ops-box">
+                  <div class="ops-box-title">当前保护参数</div>
+                  <div class="ops-line"><span>同出口提交间隔</span><b>{{ operationSummary.settings?.minSubmitIntervalSec ?? 60 }} 秒</b></div>
+                  <div class="ops-line"><span>限流冷却</span><b>{{ operationSummary.settings?.rateLimitCooldownMin ?? 30 }} 分钟</b></div>
+                  <div class="ops-line"><span>相同提示词冷却</span><b>{{ operationSummary.settings?.promptCooldownSec ?? 120 }} 秒</b></div>
+                  <div class="ops-line"><span>队列容量</span><b>{{ operationSummary.settings?.generationQueueLimit ?? 6000 }}</b></div>
+                </div>
+              </el-col>
+            </el-row>
+            <div class="ops-section-title">最近限流事件</div>
+            <el-table :data="(operationSummary.recentRateLimitEvents || []).slice(0, 8)" border stripe size="small">
+              <el-table-column prop="created_at" label="时间" width="170"><template #default="{ row }">{{ fmt(row.created_at) }}</template></el-table-column>
+              <el-table-column prop="code" label="上游码" width="110" />
+              <el-table-column prop="account_label" label="账号" width="150" show-overflow-tooltip />
+              <el-table-column prop="video_id" label="任务" width="80" />
+              <el-table-column prop="cooldown_until" label="冷却至" width="170"><template #default="{ row }">{{ fmt(row.cooldown_until) }}</template></el-table-column>
+              <el-table-column prop="detail" label="说明" min-width="220" show-overflow-tooltip />
+              <template #empty><el-empty description="暂无限流事件" :image-size="60" /></template>
+            </el-table>
+          </el-card>
+        </template>
+        <el-empty v-else-if="!operationsLoading" description="运营数据加载失败，请刷新" />
+      </el-tab-pane>
+
+      <!-- ============ 代理与出口（合并 8790 Proxies，使用 8788 真实 IPWeb） ============ -->
+      <el-tab-pane label="代理与出口" name="proxies">
+        <el-card shadow="never">
+          <div class="toolbar">
+            <div class="stats-inline">
+              <span>已配置 <b>{{ proxySummary.withProxy ?? 0 }}</b></span>
+              <el-divider direction="vertical" />
+              <span>已核验出口 <b class="points">{{ proxySummary.withExitIp ?? 0 }}</b></span>
+              <el-divider direction="vertical" />
+              <span>共享出口 <b class="danger-text">{{ proxySummary.sharedExitIpRows ?? 0 }}</b></span>
+            </div>
+            <div class="spacer" />
+            <el-button v-if="can('dola:update')" type="primary" plain @click="openProxyRepair">分配 / 修复 IPWeb</el-button>
+            <el-button :icon="Refresh" :loading="proxyListLoading" @click="loadProxyAccounts">刷新</el-button>
+          </div>
+          <el-alert type="info" :closable="false" show-icon class="mb"
+            title="只保留 8788 的真实代理绑定；验证会真实访问出口检测服务，不写入 stub.* 假 IP。生成前仍会拦截未核验或共享出口。" />
+          <el-table :data="proxyAccounts" v-loading="proxyListLoading" border stripe>
+            <el-table-column prop="id" label="ID" width="62" />
+            <el-table-column label="账号" min-width="180" show-overflow-tooltip><template #default="{ row }">{{ primaryName(row) }}</template></el-table-column>
+            <el-table-column label="状态" width="100"><template #default="{ row }"><el-tag size="small" :type="statusType(row.status)">{{ statusLabel(row.status) }}</el-tag></template></el-table-column>
+            <el-table-column label="代理" width="120"><template #default="{ row }"><el-tag size="small" :type="row.proxy ? 'success' : 'danger'">{{ row.proxy ? proxyRegion(row.proxy) : '未配置' }}</el-tag></template></el-table-column>
+            <el-table-column label="出口隔离" width="125"><template #default="{ row }"><el-tag size="small" :type="row.exitIpShared ? 'danger' : (row.exitIpKnown ? 'success' : 'warning')">{{ row.exitIpShared ? '共享出口' : (row.exitIpKnown ? '已核验' : '待核验') }}</el-tag></template></el-table-column>
+            <el-table-column label="能力" width="150"><template #default="{ row }">30 秒 {{ row.native_30s_state === 'available' ? '✓' : '—' }} · 参考图 {{ row.reference_image_state === 'available' ? '✓' : '—' }}</template></el-table-column>
+            <el-table-column label="冷却" width="170"><template #default="{ row }">{{ row.cooldown_until && new Date(row.cooldown_until) > new Date() ? fmt(row.cooldown_until) : '—' }}</template></el-table-column>
+            <el-table-column label="操作" width="150" fixed="right"><template #default="{ row }"><el-button v-if="can('dola:update') && (!row.exitIpKnown || row.exitIpShared || !row.proxy)" size="small" text type="primary" @click="openProxyRepairFor(row)">处理</el-button><span v-else class="muted">正常</span></template></el-table-column>
+            <template #empty><el-empty description="暂无账号" :image-size="70" /></template>
+          </el-table>
+        </el-card>
+      </el-tab-pane>
+
+      <!-- ============ 限流与冷却（合并 8790 RateLimit，接入 8788 真实状态） ============ -->
+      <el-tab-pane label="限流与冷却" name="ratelimit">
+        <el-card shadow="never">
+          <div class="toolbar"><div><b>限流与冷却</b><span class="muted ops-source">上游码 710022002 · 只对真实命中记录冷却</span></div><div class="spacer" /><el-button :icon="Refresh" :loading="operationsLoading" @click="loadOperations">刷新</el-button></div>
+          <el-alert type="info" :closable="false" show-icon class="mb" title="这些设置直接作用于 8788 的生成编排器和用户端网关；不会创建另一套号池或 worker。" />
+          <el-form :inline="true" class="limit-form">
+            <el-form-item label="同出口提交间隔（秒）"><el-input-number v-model="limitForm.minSubmitIntervalSec" :min="0" :max="600" /></el-form-item>
+            <el-form-item label="限流冷却（分钟）"><el-input-number v-model="limitForm.rateLimitCooldownMin" :min="1" :max="1440" /></el-form-item>
+            <el-form-item label="相同提示词冷却（秒）"><el-input-number v-model="limitForm.promptCooldownSec" :min="0" :max="3600" /></el-form-item>
+            <el-form-item label="视频并发"><el-input-number v-model="limitForm.generationConcurrency" :min="1" :max="20" /></el-form-item>
+            <el-form-item label="队列容量"><el-input-number v-model="limitForm.generationQueueLimit" :min="1" :max="6000" /></el-form-item>
+            <el-form-item label="限流自动换号（个）"><el-input-number v-model="limitForm.autorotateMaxAttempts" :min="1" :max="24" /></el-form-item>
+            <el-form-item><el-button v-if="can('dola:update')" type="primary" :loading="limitsSaving" @click="saveLimits">保存保护参数</el-button></el-form-item>
+          </el-form>
+          <div class="ops-section-title">当前冷却中的账号（{{ operationSummary?.coolingAccounts?.length || 0 }}）</div>
+          <el-table :data="operationSummary?.coolingAccounts || []" border stripe size="small">
+            <el-table-column prop="id" label="ID" width="70" /><el-table-column prop="label" label="账号" min-width="180" show-overflow-tooltip />
+            <el-table-column prop="cooldown_until" label="冷却至" width="180"><template #default="{ row }">{{ fmt(row.cooldown_until) }}</template></el-table-column>
+            <el-table-column prop="last_used_at" label="最近使用" width="180"><template #default="{ row }">{{ fmt(row.last_used_at) }}</template></el-table-column>
+            <el-table-column prop="last_error" label="原因" min-width="260" show-overflow-tooltip />
+            <template #empty><el-empty description="当前没有冷却账号" :image-size="60" /></template>
+          </el-table>
+          <div class="ops-section-title">最近限流命中</div>
+          <el-table :data="operationSummary?.recentRateLimitEvents || []" border stripe size="small">
+            <el-table-column prop="created_at" label="时间" width="180"><template #default="{ row }">{{ fmt(row.created_at) }}</template></el-table-column>
+            <el-table-column prop="code" label="码" width="110" /><el-table-column prop="account_label" label="账号" width="180" show-overflow-tooltip /><el-table-column prop="cooldown_until" label="冷却至" width="180"><template #default="{ row }">{{ fmt(row.cooldown_until) }}</template></el-table-column><el-table-column prop="detail" label="说明" min-width="240" show-overflow-tooltip />
+            <template #empty><el-empty description="暂无记录" :image-size="60" /></template>
+          </el-table>
+        </el-card>
+      </el-tab-pane>
+
       <!-- ============ 账号池 ============ -->
       <el-tab-pane label="账号池" name="accounts">
         <el-card shadow="never">
+          <!-- 补号提示：有效账号数 / 已确认剩余额度低于阈值时出现，数据随轮询实时更新 -->
+          <el-alert
+            v-if="replenishBanner"
+            :type="replenishBanner.level"
+            :closable="false"
+            show-icon
+            class="replenish-banner"
+          >
+            <template #title>{{ replenishBanner.title }}</template>
+            <template #default>
+              <div class="replenish-body">
+                <span>{{ replenishBanner.text }}</span>
+                <span class="replenish-actions">
+                  <el-button v-if="can('dola:import')" size="small" type="primary" :icon="Upload" @click="importDlg = true">去补号</el-button>
+                  <el-button v-if="can('dola:check')" size="small" :icon="Money" @click="runJob('dola_credits')">批量查额度</el-button>
+                </span>
+              </div>
+            </template>
+          </el-alert>
           <div class="toolbar">
             <div class="filters">
               <el-input v-model="query.keyword" placeholder="搜索备注 / 备注名 / 用户标识" clearable style="width: 220px" @keyup.enter="reload" @clear="reload" />
@@ -111,7 +259,7 @@
               <el-button v-if="can('dola:check')" plain @click="runJob('dola_native_30s')">批量探测 30 秒</el-button>
               <el-button v-if="can('dola:check')" plain @click="runJob('dola_reference_images')">批量探测参考图</el-button>
               <el-button v-if="can('dola:convert')" :icon="Switch" @click="openConvert">计价换算</el-button>
-              <el-button v-if="can('dola:update') && (summary.missingExitIp || summary.sharedExitIpRows)" :icon="Refresh" plain @click="openProxyRepair">修复出口</el-button>
+        <el-button v-if="can('dola:update') && (summary.validNoProxy || summary.missingExitIp || summary.sharedExitIpRows)" :icon="Refresh" plain @click="openProxyRepair">修复出口</el-button>
               <DolaGoogleLogin v-if="can('dola:import')" @completed="Promise.allSettled([load(), refreshProvider()])" />
               <el-button v-if="can('dola:import')" type="primary" :icon="Upload" @click="importDlg = true">批量导入 Cookie</el-button>
             </div>
@@ -138,7 +286,7 @@
             <el-table-column label="账号" min-width="190">
               <template #default="{ row }">
                 <div class="cell-stack">
-                  <span class="main">{{ primaryName(row) }}</span>
+                  <span class="main"><template v-if="row.accountCode">[{{ row.accountCode }}] </template>{{ row.loginEmail || primaryName(row) }}</span>
                   <span class="sub mono">
                     <template v-if="secondaryName(row)">{{ secondaryName(row) }}</template>
                     <template v-else-if="!row.account_hint">未识别（校验后可回填）</template>
@@ -223,7 +371,7 @@
                   <el-button v-if="can('dola:check')" size="small" text type="primary" @click="rowAction(row, 'check')">
                     校验
                   </el-button>
-                  <el-button v-if="can('dola:list')" size="small" text @click="reveal(row)">看 cookie</el-button>
+                  <el-button v-if="can('dola:reveal')" size="small" text @click="reveal(row)">看 cookie</el-button>
                   <el-dropdown trigger="click" @command="(c) => rowMenu(row, c)">
                     <el-button size="small" text>更多<el-icon><ArrowDown /></el-icon></el-button>
                     <template #dropdown>
@@ -303,6 +451,9 @@
       </el-tab-pane>
 
       <!-- ============ 生成任务 ============ -->
+      <el-tab-pane label="生成统计与复核" name="analytics">
+        <DolaGenerationAnalytics v-if="tab === 'analytics'" />
+      </el-tab-pane>
       <el-tab-pane label="生成任务" name="generation">
         <el-card shadow="never">
           <div class="toolbar">
@@ -316,7 +467,7 @@
                 <el-option label="失败" value="failed" />
                 <el-option label="已取消" value="cancelled" />
               </el-select>
-              <span class="muted">只读监控，不提供重试或补扣费操作</span>
+              <span class="muted">任务列表只读监控；批量创建走网关链路扣积分</span>
             </div>
             <div class="spacer" />
             <span v-if="provider.generation" class="muted">
@@ -324,6 +475,7 @@
               并发 {{ provider.generation.running ?? 0 }}/{{ provider.generation.concurrency ?? 1 }} ·
               队列 {{ provider.generation.activeTasks ?? 0 }}/{{ provider.generation.queueLimit ?? 6000 }}
             </span>
+            <el-button v-if="can('dola:create')" type="primary" @click="openBatchGen">批量创建</el-button>
             <el-button :icon="Refresh" :loading="generationLoading" @click="loadGeneration">刷新</el-button>
           </div>
           <el-table :data="generationTasks" v-loading="generationLoading" border stripe>
@@ -349,6 +501,12 @@
             </el-table-column>
             <el-table-column label="错误说明" min-width="200" show-overflow-tooltip>
               <template #default="{ row }">{{ row.error || '—' }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="90" fixed="right">
+              <template #default="{ row }">
+                <el-button v-if="can('dola:check') && ['queued','submitting','generating','resolving'].includes(row.status)" size="small" text type="danger" @click="cancelGeneration(row)">取消</el-button>
+                <span v-else class="muted">—</span>
+              </template>
             </el-table-column>
             <template #empty><el-empty description="还没有生成任务" :image-size="80" /></template>
           </el-table>
@@ -394,6 +552,92 @@
         </el-card>
       </el-tab-pane>
     </el-tabs>
+
+    <!-- ============ 批量创建生成任务 ============ -->
+    <el-dialog v-model="batchGenDlg" title="批量创建生成任务" width="680px" :close-on-click-modal="false">
+      <el-alert type="info" :closable="false" show-icon class="tip">
+        <template #title>逐条顺序提交，单条失败不中断；每条都走用户端网关链路（排重 / 预检 / 扣积分 / 失败退款）</template>
+        <div class="notice-body">
+          积分从所选用户令牌扣除。<code>15 秒</code>只能走专家模式（选 15 秒会自动切专家模式）。
+          参考站没有的：批量创建不支持参考图。
+        </div>
+      </el-alert>
+      <el-form label-width="90px">
+        <el-form-item label="用户令牌" required>
+          <el-radio-group v-model="batchGenForm.tokenMode" size="small" style="margin-bottom: 8px">
+            <el-radio-button label="select">选择现有令牌</el-radio-button>
+            <el-radio-button label="paste">粘贴令牌原文</el-radio-button>
+          </el-radio-group>
+          <el-select v-if="batchGenForm.tokenMode === 'select'" v-model="batchGenForm.tokenId"
+            placeholder="选择要扣积分的用户令牌" filterable style="width: 100%">
+            <el-option v-for="t in tokenOptions" :key="t.id" :value="t.id"
+              :label="`${t.name || '令牌'}（${t.prefix}…，余 ${t.points} 分）`" />
+          </el-select>
+          <el-input v-else v-model="batchGenForm.tokenRaw" placeholder="粘贴用户令牌原文" class="mono-box" />
+        </el-form-item>
+        <el-form-item label="提示词" required>
+          <el-input v-model="batchGenForm.prompts" type="textarea" :rows="8" class="mono-box"
+            placeholder="每行一条提示词，最多 20 条&#10;海边日落，镜头缓慢横移&#10;雨夜街头，霓虹倒影" />
+          <div class="hint">共 {{ batchGenLines.length }} 条（空行自动忽略）</div>
+        </el-form-item>
+        <el-form-item label="模式">
+          <el-select v-model="batchGenForm.mode" style="width: 160px">
+            <el-option label="标准模式" value="standard" />
+            <el-option label="专家模式" value="expert" />
+          </el-select>
+          <span class="hint">15 秒自动切专家模式</span>
+        </el-form-item>
+        <el-form-item label="时长">
+          <el-select v-model="batchGenForm.seconds" style="width: 160px" @change="onBatchSecondsChange">
+            <el-option :value="10" label="10 秒" />
+            <el-option :value="15" label="15 秒" />
+            <el-option :value="20" label="20 秒" />
+            <el-option :value="30" label="30 秒" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="比例">
+          <el-select v-model="batchGenForm.ratio" style="width: 160px">
+            <el-option label="16:9 横屏" value="16:9" />
+            <el-option label="9:16 竖屏" value="9:16" />
+            <el-option label="1:1 方形" value="1:1" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="每任务积分">
+          <el-input-number v-model="batchGenForm.points" :min="1" :max="100" placeholder="默认按系统设置" />
+          <span class="hint">留空则按系统设置（用户端网关 → 每个视频任务扣积分）</span>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="batchGenDlg = false">取消</el-button>
+        <el-button type="primary" :loading="batchGenSaving" @click="submitBatchGen">开始提交</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- ============ 批量创建结果 ============ -->
+    <el-dialog v-model="batchGenResultDlg" title="批量创建结果" width="680px">
+      <el-alert :type="batchGenResult?.failCount ? 'warning' : 'success'" :closable="false" show-icon class="tip"
+        :title="`成功 ${batchGenResult?.okCount ?? 0} 条，失败 ${batchGenResult?.failCount ?? 0} 条`" />
+      <el-table :data="batchGenResult?.results || []" border stripe size="small" max-height="420">
+        <el-table-column label="提示词" min-width="260" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.prompt || '（空）' }}</template>
+        </el-table-column>
+        <el-table-column label="结果" width="90">
+          <template #default="{ row }">
+            <el-tag size="small" :type="row.ok ? 'success' : 'danger'">{{ row.ok ? '成功' : '失败' }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="任务 / 说明" min-width="200" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span v-if="row.ok">任务 #{{ row.taskId }}</span>
+            <span v-else class="muted">{{ row.error }}</span>
+          </template>
+        </el-table-column>
+      </el-table>
+      <template #footer>
+        <el-button @click="batchGenResultDlg = false">关闭</el-button>
+        <el-button type="primary" @click="batchGenResultDlg = false; loadGeneration()">查看任务列表</el-button>
+      </template>
+    </el-dialog>
 
     <!-- ============ 批量导入 ============ -->
     <el-dialog v-model="importDlg" title="批量导入 dola 账号 Cookie" width="680px">
@@ -528,8 +772,8 @@
       <el-form label-width="120px">
         <el-form-item label="计价方式">
           <el-radio-group v-model="convertForm.basis">
-            <el-radio value="account">按账号数</el-radio>
-            <el-radio value="credits">按额度</el-radio>
+            <el-radio label="account">按账号数</el-radio>
+            <el-radio label="credits">按额度</el-radio>
           </el-radio-group>
           <div class="hint block">
             免费号没有可查额度，用「按账号数」；付费号有 credits 才用「按额度」。
@@ -545,8 +789,8 @@
         </el-form-item>
         <el-form-item label="范围">
           <el-radio-group v-model="convertForm.scope">
-            <el-radio value="all">全部有效且已查到额度的账号</el-radio>
-            <el-radio value="selected">仅选中的 {{ selected.length }} 个</el-radio>
+            <el-radio label="all">全部有效且已查到额度的账号</el-radio>
+            <el-radio label="selected">仅选中的 {{ selected.length }} 个</el-radio>
           </el-radio-group>
         </el-form-item>
         <el-form-item label="充到令牌">
@@ -650,13 +894,15 @@
 
 <script setup>
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue';
+import { useRoute } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { ArrowDown, CircleCheck, CopyDocument, Key, Money, Refresh, Search, Switch, Upload } from '@element-plus/icons-vue';
 import { api, qs } from '../api.js';
 import { can } from '../store.js';
 import DolaGoogleLogin from '../components/DolaGoogleLogin.vue';
+import DolaGenerationAnalytics from '../components/DolaGenerationAnalytics.vue';
 
-const tab = ref('accounts');
+const tab = ref(useRoute().query.tab === 'analytics' ? 'analytics' : 'accounts');
 const items = ref([]);
 const summary = ref({});
 const selected = ref([]);
@@ -670,6 +916,22 @@ const provider = ref({ settings: {} });
 const tokenOptions = ref([]);
 const providerLoading = ref(false);
 const maintenanceLoading = ref(false);
+
+// 8790 的运营视图已并入本页，数据全部来自 8788 的真实表和编排器。
+const operationSummary = ref(null);
+const operationsLoading = ref(false);
+const proxySummary = ref({});
+const proxyAccounts = ref([]);
+const proxyListLoading = ref(false);
+const limitsSaving = ref(false);
+const limitForm = reactive({
+  minSubmitIntervalSec: 60,
+  rateLimitCooldownMin: 30,
+  promptCooldownSec: 120,
+  generationConcurrency: 1,
+  generationQueueLimit: 6000,
+  autorotateMaxAttempts: 3,
+});
 
 const importDlg = ref(false);
 const importForm = reactive({ raw: '', labelPrefix: '', note: '' });
@@ -694,6 +956,21 @@ const generationStatusFilter = ref('');
 let pollTimer = null;
 let jobPollVersion = 0;
 let providerTimer = null;
+
+const batchGenDlg = ref(false);
+const batchGenResultDlg = ref(false);
+const batchGenSaving = ref(false);
+const batchGenResult = ref(null);
+const batchGenForm = reactive({
+  tokenMode: 'select',
+  tokenId: null,
+  tokenRaw: '',
+  prompts: '',
+  mode: 'standard',
+  seconds: 10,
+  ratio: '16:9',
+  points: null,
+});
 let providerRequest = null;
 let generationRequest = null;
 let disposed = false;
@@ -773,7 +1050,7 @@ function relTime(iso) {
  * 优先用人工备注名（label，导入时可填、之后可改），没有才退回自动识别的标识。
  */
 function primaryName(row) {
-  return String(row.label || '').trim() || String(row.account_hint || '').trim().split(/\s+/)[0] || `#${row.id}`;
+  return String(row.loginEmail || row.label || '').trim() || String(row.account_hint || '').trim().split(/\s+/)[0] || `#${row.id}`;
 }
 
 /**
@@ -943,6 +1220,45 @@ const statCards = computed(() => {
   ];
 });
 
+/**
+ * 补号提示横幅：后端 summary.replenish 随每次轮询实时返回，
+ * 有效账号或已确认剩余额度低于阈值时显示 warning；有号但额度未确认时显示 info。
+ */
+const replenishBanner = computed(() => {
+  const r = summary.value?.replenish;
+  if (!r) return null;
+  if (r.needReplenish) {
+    return {
+      level: 'warning',
+      title: '号池需要补号',
+      text: `${(r.reasons || []).join('；')}（阈值：有效账号 ${r.minAccounts} 个 / 已确认剩余额度 ${r.minQuota}，可在「系统设置 → dola 账号池」调整）`,
+    };
+  }
+  if (r.quotaCheckHint) {
+    return {
+      level: 'info',
+      title: '额度尚未确认',
+      text: '有可用账号，但没有任何账号确认过今日额度——先批量查额度，再判断是否需要补号。',
+    };
+  }
+  return null;
+});
+
+const operationCards = computed(() => {
+  const o = operationSummary.value || {};
+  const a = o.accounts || {};
+  const t = o.today || {};
+  const q = o.queue || {};
+  return [
+    { label: '健康号', value: a.valid ?? 0, color: '#67c23a', sub: `空闲 ${a.idle ?? 0} · 冷却 ${a.cooling ?? 0}` },
+    { label: '今日成功', value: t.succeeded ?? 0, color: '#409eff', sub: `任务 ${t.total ?? 0}` },
+    { label: '今日失败', value: t.failed ?? 0, color: '#f56c6c', sub: `取消 ${t.cancelled ?? 0}` },
+    { label: '限流命中', value: t.rateLimitHits ?? 0, color: '#e6a23c', sub: '710022002' },
+    { label: '队列深度', value: q.activeTasks ?? 0, color: '#9b6eff', sub: `容量 ${q.queueLimit ?? 6000}` },
+    { label: '代理隔离', value: (o.proxy?.missingExitIp || o.proxy?.sharedExitIpRows || o.proxy?.withoutProxy) ? '待处理' : '正常', color: (o.proxy?.missingExitIp || o.proxy?.sharedExitIpRows || o.proxy?.withoutProxy) ? '#e6a23c' : '#67c23a', sub: `${o.proxy?.withExitIp ?? 0}/${o.proxy?.withProxy ?? 0} 已核验` },
+  ];
+});
+
 async function copy(text) {
   try { await navigator.clipboard.writeText(text); ElMessage.success('已复制'); }
   catch { ElMessage.warning('浏览器拒绝了剪贴板权限，请手动复制'); }
@@ -1023,6 +1339,59 @@ async function loadGeneration({ silent = false } = {}) {
   }
 }
 
+const batchGenLines = computed(() =>
+  String(batchGenForm.prompts || '').split('\n').map((l) => l.trim()).filter(Boolean));
+
+function onBatchSecondsChange() {
+  // 15 秒只能走专家模式：与 8787 前台保持一致，自动切过去
+  if (batchGenForm.seconds === 15) batchGenForm.mode = 'expert';
+}
+
+async function openBatchGen() {
+  batchGenForm.prompts = '';
+  batchGenForm.tokenId = null;
+  batchGenForm.tokenRaw = '';
+  batchGenForm.tokenMode = 'select';
+  batchGenForm.mode = 'standard';
+  batchGenForm.seconds = 10;
+  batchGenForm.ratio = '16:9';
+  batchGenForm.points = null;
+  batchGenResult.value = null;
+  batchGenDlg.value = true;
+  try { tokenOptions.value = (await api.get('/api/tokens/options')).items; } catch { /* 无权限 */ }
+}
+
+async function submitBatchGen() {
+  const lines = batchGenLines.value;
+  if (!lines.length) { ElMessage.error('请至少填写一条提示词'); return; }
+  if (lines.length > 20) { ElMessage.error('一次最多提交 20 条'); return; }
+  if (batchGenForm.tokenMode === 'select' && !batchGenForm.tokenId) { ElMessage.error('请选择要扣积分的用户令牌'); return; }
+  if (batchGenForm.tokenMode === 'paste' && !batchGenForm.tokenRaw.trim()) { ElMessage.error('请粘贴用户令牌原文'); return; }
+  batchGenSaving.value = true;
+  try {
+    const body = {
+      items: lines.map((prompt) => ({
+        prompt,
+        mode: batchGenForm.seconds === 15 ? 'expert' : batchGenForm.mode,
+        seconds: batchGenForm.seconds,
+        ratio: batchGenForm.ratio,
+      })),
+    };
+    if (batchGenForm.tokenMode === 'select') body.tokenId = batchGenForm.tokenId;
+    else body.token = batchGenForm.tokenRaw.trim();
+    if (batchGenForm.points != null) body.points = batchGenForm.points;
+    const res = await api.post('/api/dola/generation-tasks/batch', body);
+    batchGenResult.value = res;
+    batchGenDlg.value = false;
+    batchGenResultDlg.value = true;
+    await loadGeneration();
+  } catch (e) {
+    ElMessage.error(e.message || '批量提交失败');
+  } finally {
+    batchGenSaving.value = false;
+  }
+}
+
 async function loadConversions() {
   convLoading.value = true;
   try {
@@ -1032,7 +1401,47 @@ async function loadConversions() {
   } finally { convLoading.value = false; }
 }
 
+async function loadOperations({ silent = false } = {}) {
+  if (!silent) operationsLoading.value = true;
+  try {
+    const res = await api.get('/api/dola/operations/summary', { silent });
+    if (disposed) return;
+    operationSummary.value = res;
+    proxySummary.value = res.proxy || {};
+    Object.assign(limitForm, res.settings || {});
+  } finally {
+    if (!silent) operationsLoading.value = false;
+  }
+}
+
+async function loadProxyAccounts() {
+  proxyListLoading.value = true;
+  try {
+    const [summary, rows] = await Promise.all([
+      api.get('/api/dola/accounts/proxy/summary', { silent: true }),
+      api.get('/api/dola/accounts?page=1&pageSize=500', { silent: true }),
+    ]);
+    proxySummary.value = summary;
+    proxyAccounts.value = rows.items || [];
+  } finally {
+    proxyListLoading.value = false;
+  }
+}
+
+async function saveLimits() {
+  limitsSaving.value = true;
+  try {
+    await api.put('/api/dola/operations/limits', { ...limitForm });
+    ElMessage.success('保护参数已保存');
+    await Promise.allSettled([loadOperations(), refreshProvider()]);
+  } finally {
+    limitsSaving.value = false;
+  }
+}
+
 function onTab(name) {
+  if (name === 'operations' || name === 'ratelimit') loadOperations();
+  if (name === 'proxies') loadProxyAccounts();
   if (name === 'jobs') loadJobs();
   if (name === 'generation') loadGeneration();
   if (name === 'conversions') loadConversions();
@@ -1050,19 +1459,27 @@ async function doImport() {
 }
 
 /** Load only the accounts whose proxy isolation is not proven or is duplicated. */
-async function openProxyRepair() {
+async function openProxyRepair({ focusId = null } = {}) {
   proxyDlg.value = true;
   proxyResult.value = null;
   proxyForm.password = '';
+  proxyForm.mode = 'reuse';
   proxyTargetLoading.value = true;
   try {
     const res = await api.get('/api/dola/accounts?page=1&pageSize=500', { silent: true });
-    proxyTargets.value = (res.items || []).filter((row) => row.status !== 'disabled' && row.proxy
-      && (row.exitIpShared || !row.exitIpKnown));
+    proxyTargets.value = (res.items || []).filter((row) => row.status !== 'disabled'
+      && (!row.proxy || row.exitIpShared || !row.exitIpKnown));
     proxyForm.ids = proxyTargets.value.map((row) => row.id);
+    if (focusId && proxyTargets.value.some((row) => row.id === focusId)) proxyForm.ids = [focusId];
+    // 包含未配置代理的账号时必须走新 IPWeb 配置，避免复用模式把空代理当成坏代理。
+    if (proxyTargets.value.some((row) => !row.proxy)) proxyForm.mode = 'manual';
   } finally {
     proxyTargetLoading.value = false;
   }
+}
+
+function openProxyRepairFor(row) {
+  openProxyRepair({ focusId: row.id });
 }
 
 async function assignProxyRepair() {
@@ -1215,6 +1632,20 @@ async function cancelJob(row) {
   await Promise.allSettled([loadJobs(), refreshProvider(), load()]);
 }
 
+async function cancelGeneration(row) {
+  try {
+    await ElMessageBox.confirm(
+      row.status === 'queued'
+        ? '任务尚未提交到上游，取消后会按规则退回已扣积分。继续吗？'
+        : '任务已经进入提交或生成阶段，取消后通常不会退款。继续吗？',
+      '取消生成任务', { type: 'warning', confirmButtonText: '确认取消', cancelButtonText: '保留任务' },
+    );
+  } catch { return; }
+  await api.post(`/api/dola/generation-tasks/${row.id}/cancel`);
+  ElMessage.success('生成任务已取消');
+  await Promise.allSettled([loadGeneration(), loadOperations(), refreshProvider()]);
+}
+
 function openSetCredits(row) {
   current.value = row;
   creditsInput.value = row.credits ?? 0;
@@ -1299,6 +1730,7 @@ async function pollProvider() {
   // refreshProvider 自带单飞锁，串行调度也避免慢请求堆积。
   await refreshProvider({ silent: true }).catch(() => {});
   if (tab.value === 'generation') await loadGeneration({ silent: true }).catch(() => {});
+  if (tab.value === 'operations' || tab.value === 'ratelimit') await loadOperations({ silent: true }).catch(() => {});
   const generation = provider.value.generation || {};
   const busy = [generation.running, generation.queued, generation.reservedAccounts]
     .some((value) => Number(value) > 0);
@@ -1354,6 +1786,17 @@ onUnmounted(() => {
 .proxy-inline-input { margin-top: 8px; }
 .proxy-mode-hint { margin-top: 6px; }
 .proxy-results { max-height: 150px; overflow: auto; }
+.ops-stats { margin-bottom: 14px; }
+.ops-stat { min-height: 104px; }
+.ops-panel { margin-bottom: 14px; }
+.ops-source { margin-left: 10px; font-size: 12px; }
+.ops-box { border: 1px solid var(--el-border-color-light); border-radius: 6px; padding: 12px 14px; margin-bottom: 14px; }
+.ops-box-title, .ops-section-title { font-weight: 600; margin-bottom: 10px; }
+.ops-section-title { margin-top: 16px; }
+.ops-line { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-bottom: 1px dashed var(--el-border-color-lighter); font-size: 13px; }
+.ops-line:last-child { border-bottom: 0; }
+.limit-form { max-width: 980px; }
+.danger-text { color: var(--el-color-danger); }
 .stats :deep(.el-col) { display: flex; }
 .stat {
   width: 100%;
@@ -1404,6 +1847,10 @@ onUnmounted(() => {
 .quota-ok { font-weight: 600; color: var(--el-color-success); }
 .quota-pending { font-weight: 600; color: var(--el-color-warning); }
 .quota-out { font-weight: 600; color: var(--el-color-danger); }
+/* 补号提示横幅：紧贴工具栏上方，按钮右对齐 */
+.replenish-banner { margin-bottom: 12px; }
+.replenish-body { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.replenish-actions { display: inline-flex; gap: 8px; flex-shrink: 0; }
 /* 出口代理标识：小到不抢戏，但"直连"必须能一眼看见 */
 .px-tag {
   display: inline-block; margin-left: 6px; padding: 0 5px;

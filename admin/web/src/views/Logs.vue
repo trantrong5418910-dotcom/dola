@@ -7,6 +7,7 @@
       </el-select>
       <el-button type="primary" :icon="Search" @click="reload">查询</el-button>
       <div class="spacer" />
+      <el-button :icon="Download" :loading="exporting" @click="exportDiagnostics">导出脱敏诊断包</el-button>
       <el-button :icon="Refresh" @click="load">刷新</el-button>
     </div>
 
@@ -43,13 +44,14 @@
 
 <script setup>
 import { onMounted, reactive, ref } from 'vue';
-import { Refresh, Search } from '@element-plus/icons-vue';
+import { Download, Refresh, Search } from '@element-plus/icons-vue';
 import { api, qs } from '../api.js';
 
 const items = ref([]);
 const actions = ref([]);
 const total = ref(0);
 const loading = ref(false);
+const exporting = ref(false);
 const query = reactive({ page: 1, pageSize: 20, keyword: '', action: '' });
 
 const ACTION = {
@@ -71,10 +73,11 @@ const ACTION = {
   'dola.set_credits': '手动录入额度', 'dola.convert': '额度转积分',
   'dola.delete': '删除账号', 'dola.force_delete': '强制删除账号', 'dola.bulk_delete': '批量删除账号',
   'dola.job_create': '提交批量任务', 'dola.job_cancel': '取消批量任务',
+  'gateway.gen.preflight_rejected': '生成预检未通过',
 };
 const actionLabel = (a) => ACTION[a] || a;
 function actionType(a) {
-  if (a.includes('failed')) return 'danger';
+  if (a.includes('failed') || a.includes('preflight_rejected')) return 'danger';
   if (a.includes('delete')) return 'warning';
   if (a === 'login' || a === 'logout') return 'info';
   return 'primary';
@@ -90,6 +93,22 @@ async function load() {
   } finally { loading.value = false; }
 }
 function reload() { query.page = 1; load(); }
+
+async function exportDiagnostics() {
+  exporting.value = true;
+  try {
+    const result = await api.get('/api/logs/diagnostics');
+    const blob = new Blob([JSON.stringify(result.bundle, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = result.fileName || 'workbench-diagnostics.json';
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } finally {
+    exporting.value = false;
+  }
+}
 
 onMounted(async () => {
   load();

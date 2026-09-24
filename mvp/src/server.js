@@ -87,6 +87,9 @@ const SUPPORTED_SECONDS = Object.freeze(PER_USER_PROVIDER ? [10, 15, 20, 30] : [
 const EXPERT_SECONDS = Object.freeze(PER_USER_PROVIDER ? [15] : []);
 const DEFAULT_SECONDS = FIXED_SECONDS;
 
+/** key = 用户令牌；值 = 已绑定该令牌的 VideoClient（须早于 syncAdminDolaCapabilityFlags） */
+const userClients = new Map();
+
 /**
  * admin-dola 的固定时长能力以后台实时号池状态为准。
  * 网关只返回计数和布尔值；失败时清空缓存，避免旧的 ready 状态误放行任务。
@@ -181,9 +184,6 @@ if (PER_USER_PROVIDER) {
 }
 
 // ---------------- 按用户取生成客户端 ----------------
-
-/** key = 用户令牌；值 = 已绑定该令牌的 VideoClient */
-const userClients = new Map();
 
 /**
  * 任务归属校验。
@@ -443,8 +443,8 @@ const server = http.createServer(async (req, res) => {
       const client = await clientFor(me);
       const limit = Number(u.searchParams.get('limit') || 20);
       const { items } = await client.listTasks({ limit: 200 });
-      // 只回属于当前令牌的任务（网关模式才有归属概念）
-      const visible = items.filter((t) => canAccess(me, t.id));
+      // 只回属于当前令牌的任务（网关模式才有归属概念）；已在工作台删除的不再展示
+      const visible = items.filter((t) => canAccess(me, t.id) && !ledger.isHidden(t.id));
       json(res, 200, { items: visible.slice(0, limit).map(publicTask) });
       return;
     }
@@ -459,16 +459,18 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const seconds = Number(body.seconds ?? DEFAULT_SECONDS);
+      // 专家模式校验放前面：mock 等单租户模式只支持 30 秒，
+      // 15 秒+标准模式应报 EXPERT_MODE_REQUIRED 而不是 UNSUPPORTED_DURATION。
+      if (seconds === 15 && mode !== 'expert') {
+        json(res, 400, { ok: false, code: 'EXPERT_MODE_REQUIRED', message: '15 秒视频只能在专家模式提交，任务未提交，也未扣积分' });
+        return;
+      }
       if (!Number.isInteger(seconds) || !SUPPORTED_SECONDS.includes(seconds)) {
         json(res, 400, {
           ok: false,
           code: 'UNSUPPORTED_DURATION',
           message: `当前工作台支持 ${SUPPORTED_SECONDS.join('、')} 秒视频`,
         });
-        return;
-      }
-      if (seconds === 15 && mode !== 'expert') {
-        json(res, 400, { ok: false, code: 'EXPERT_MODE_REQUIRED', message: '15 秒视频只能在专家模式提交，任务未提交，也未扣积分' });
         return;
       }
       if (PER_USER_PROVIDER && [15, FIXED_SECONDS].includes(seconds)) {
@@ -584,7 +586,13 @@ const server = http.createServer(async (req, res) => {
         ledger.own(created.taskId, { tokenId: me.tokenId, prefix: me.prefix, ref: chargeRef, prompt: payload.prompt });
       }
 
-      const out = { taskId: created.taskId, createdVia: created.via, status: 'queued', chargedPoints: billing?.charged ?? null, balance: billing?.balance ?? me.points };
+      // 网关未参与扣费时（mock / 本地直连），provider 内部可能已扣积分，
+      // 这里重新读一次，避免把扣费前的旧值返回给前端。
+      let freshBalance = billing?.balance ?? null;
+      if (freshBalance == null) {
+        try { freshBalance = await client.getBalance(); } catch { freshBalance = me.points; }
+      }
+      const out = { taskId: created.taskId, createdVia: created.via, status: 'queued', chargedPoints: billing?.charged ?? null, balance: freshBalance };
       if (body.wait) {
         try {
           const t = await client.waitFor(created.taskId, {
@@ -612,15 +620,29 @@ const server = http.createServer(async (req, res) => {
       if (!requirePlatform(res)) return;
       const client = await clientFor(me);
       const id = decodeURIComponent(m[1]);
-      if (!canAccess(me, id)) {
+      if (!canAccess(me, id) || ledger.isHidden(id)) {
         json(res, 404, { ok: false, message: '任务不存在' });   // 不暴露"存在但不属于你"
         return;
       }
       if (req.method === 'GET') { json(res, 200, publicTask(await client.getTask(id))); return; }
       if (req.method === 'DELETE') {
-        const r = await client.deleteTask(id);
+        // 工作台删除以本地隐藏为准：上游 cancel 失败（已终态任务等）仍要从列表移除
+        let r = { ok: true, refunded: false, message: '已删除' };
+        try {
+          r = await client.deleteTask(id);
+        } catch (error) {
+          // admin-dola relies on gateway ownership checks; errors must not hide another user's task.
+          if (PER_USER_PROVIDER) throw error;
+          r = {
+            ok: true,
+            refunded: false,
+            message: `已从列表移除（上游：${error?.message || error}）`,
+            upstreamError: String(error?.message || error),
+          };
+        }
         ledger.forget(id);
-        json(res, 200, { ok: Boolean(r.ok), refunded: Boolean(r.refunded), message: r.message });
+        ledger.hide(id);
+        json(res, 200, { ok: Boolean(r.ok), refunded: Boolean(r.refunded), message: r.message || '已删除' });
         return;
       }
     }
@@ -632,8 +654,8 @@ const server = http.createServer(async (req, res) => {
       const client = await clientFor(me);
       const id = decodeURIComponent(m[1]);
       const mode = m[2];
-      if (!canAccess(me, id)) {
-        json(res, 404, { ok: false, message: '任务不存在' });
+      if (!canAccess(me, id) || ledger.isHidden(id)) {
+        json(res, 404, { ok: false, message: '任务不存在' });   // 不暴露"存在但不属于你"
         return;
       }
       const t = await client.getTask(id);
@@ -651,7 +673,7 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(200, {
           'Content-Type': 'video/mp4',
           'Content-Length': buf.length,
-          ...(mode === 'download' ? { 'Content-Disposition': `attachment; filename="${id}.mp4"` } : {}),
+          ...(mode === 'download' ? { 'Content-Disposition': `attachment; filename="${id.replace(/[^A-Za-z0-9_-]/g, '_')}.mp4"` } : {}),
         });
         res.end(buf);
         return;

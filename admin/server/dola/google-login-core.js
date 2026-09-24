@@ -1,4 +1,11 @@
 import { randomUUID } from 'node:crypto';
+import { parseAccountLoginEntries } from './account-login-format.js';
+
+const SECRET_FIELDS = ['password', 'recoveryEmail', 'googleSessionUrl', 'verificationUrl'];
+function eraseSecrets(value, remove = false) {
+  if (!value) return;
+  for (const key of SECRET_FIELDS) { if (remove) delete value[key]; else value[key] = ''; }
+}
 
 const terminal = new Set(['succeeded', 'failed', 'cancelled']);
 const waitingMessages = {
@@ -6,14 +13,63 @@ const waitingMessages = {
   security: 'Google 要求安全验证：已停止自动填写，后续账号已暂停；请在登录窗口处理，最多保留 10 分钟',
   browser_blocked: 'Google 不接受当前登录浏览器：后续账号已暂停，请取消批次并使用 Google 支持的登录方式；不会伪装浏览器重试',
   manual_step: '本次登录曾触发安全验证，自动填写已停止；请在窗口继续登录（密码已从自动填写内存清除），后续账号仍暂停',
+  manual_login: '请在独立窗口自行选择手机号或邮箱登录 Dola；系统将核验真实会话，完成后自动入池并关闭窗口',
   identity: '密码页显示的账号未能与输入邮箱对应，请核对登录窗口；未写入号池',
   google_step: 'Google 页面需要人工继续，请查看当前登录或授权步骤；未写入号池',
+  dola_entry: 'Dola 登录入口或 Google 跳转尚未就绪，已停止自动操作；请检查最后阶段，这不代表账号密码错误',
   email_form: '尚未识别 Google 邮箱输入框，请在独立窗口确认页面已加载；未写入号池',
   callback: '尚未收到 Google 登录返回，请在独立窗口继续登录；未写入号池',
   binding: '尚未确认 Google 登录与 Dola 会话对应关系，请完成返回步骤；未写入号池',
   session: 'Google 身份已确认，但 Dola 会话尚未验证成功；未写入号池',
-  saved_session: '已保存会话的在线核验暂未通过，或身份与号池不一致；未重新输入密码，请取消后检查代理及原账号状态',
+  saved_session: '已保存会话的在线核验暂未通过，或身份与号池不一致；未重新输入密码，请取消并检查原账号，也可选择独立窗口手动重新登录',
+  otp_identity: '两步验证页的账号或前序登录未能核实，已停止取码并暂停后续账号；请在窗口核对',
+  otp_fetch_failed: '未取得符合格式的验证器动态码，已停止自动填写并暂停后续账号；请检查取码服务或手动输入',
+  otp_refresh_exhausted: '动态码自动刷新已达上限（最多取码 3 次、提交 2 个不同码），后续账号已暂停；请在窗口处理',
+  otp_not_accepted: '动态码提交后尚未确认通过，已停止自动填写并暂停后续账号；请查看登录窗口',
+  otp_step_changed: '取码期间账号或验证页面发生变化，已停止填写并暂停后续账号；未写入号池',
 };
+const securityReasons = new Set(['captcha', 'security', 'browser_blocked', 'otp_identity',
+  'otp_fetch_failed', 'otp_refresh_exhausted', 'otp_not_accepted', 'otp_step_changed']);
+const progressMessages = {
+  otp_submitted: '验证器动态码已提交，正在等待 Google 确认；尚未入池',
+  otp_waiting_refresh: 'Google 未接受上个动态码，正在等待刷新间隔；不会连续重复提交',
+  otp_same_code: '取码接口仍返回同一个动态码，暂不重复提交，等待有限刷新',
+};
+// Keep only one allowlisted phase in bounded batch memory, never driver text or URLs.
+const stageLabels = {
+  session_restore: '恢复已保存会话',
+  browser_launch: '启动独立浏览器',
+  proxy_check: '检查代理连通性',
+  dola_home: '打开 Dola 首页',
+  dola_login_button: '查找并点击 Dola 登录入口',
+  dola_google_button: '查找并点击 Google 登录入口',
+  google_redirect: '等待跳转至 Google',
+  google_email: '填写 Google 邮箱',
+  google_password: '填写 Google 密码',
+  google_recovery: '填写 Google 恢复邮箱',
+  email_otp: '邮件验证码验证',
+  authenticator_otp: '验证器动态码验证',
+  google_identity: '核验 Google 身份',
+  dola_binding: '确认 Dola 登录绑定',
+  dola_session: '核验 Dola 会话',
+  session_save: '保存登录会话',
+  otp_submitted: '等待验证器动态码确认',
+  otp_waiting_refresh: '等待验证器动态码刷新',
+  otp_same_code: '等待不同的验证器动态码',
+};
+const failureMessages = {
+  browser_closed: '登录窗口已关闭，登录未完成；未写入号池',
+  credentials_rejected: 'Google 拒绝了账号或密码，请核对登录凭据；未写入号池',
+  identity_mismatch: '返回的 Google 账号与输入邮箱不一致，已停止登录；未写入号池',
+};
+const allowedMessage = (messages, value) => typeof value === 'string' && Object.hasOwn(messages, value) ? messages[value] : '';
+function withStage(item, message, last = false) {
+  const label = allowedMessage(stageLabels, item.stage);
+  return label ? `${message}；${last ? '最后' : '当前'}阶段：${label}` : message;
+}
+function stageProgress(item, fallback = '正在登录，尚未入池') {
+  return allowedMessage(progressMessages, item.stage) || withStage(item, fallback);
+}
 const error = (message, status = 400) => Object.assign(new Error(message), { status });
 export const normalizeEmail = value => String(value || '').trim().replace(/\\@/g, '@').toLowerCase();
 
@@ -92,8 +148,8 @@ export function authExchangeSucceeded(json) {
 
 /** One isolated browser at a time; no persistent passwords, URLs, tokens or raw errors. */
 export class GoogleLoginManager {
-  constructor({ driver, lookupAccount, storeAccount, resolveProxy, clock = Date.now, timeoutMs = 300000, manualTimeoutMs = 600000, pollMs = 2500 }) {
-    Object.assign(this, { driver, lookupAccount, storeAccount, resolveProxy, clock, timeoutMs, manualTimeoutMs, pollMs });
+  constructor({ driver, lookupAccount, storeAccount, reserveProfiles, resolveProxy, clock = Date.now, timeoutMs = 300000, manualTimeoutMs = 600000, pollMs = 2500 }) {
+    Object.assign(this, { driver, lookupAccount, storeAccount, reserveProfiles, resolveProxy, clock, timeoutMs, manualTimeoutMs, pollMs });
     this.batches = new Map();
     this.active = null;
     this.pending = new Set();
@@ -103,19 +159,24 @@ export class GoogleLoginManager {
   public(batch) {
     if (!batch) return null;
     return { id: batch.id, status: batch.status, currentIndex: batch.currentIndex, createdAt: batch.createdAt,
-      items: batch.items.map(({ email, status, message, accountId }) => ({ email, status, message, ...(accountId ? { accountId } : {}) })) };
+      items: batch.items.map(({ email, status, message, accountId, accountCode, loginMethod }) => ({ email, status, message,
+        ...(accountId ? { accountId } : {}), ...(accountCode ? { accountCode, loginMethod } : {}),
+        ...(!accountCode && loginMethod === 'manual' ? { loginMethod } : {}) })) };
   }
 
   current(ownerId) {
     return this.public([...this.batches.values()].reverse().find(b => b.ownerId === ownerId));
   }
 
-  create(raw, ownerId) {
+  create(raw, ownerId, { manual = false } = {}) {
     if (this.closing) throw error('登录服务正在退出，请稍后重试', 503);
     if (this.active || this.pending.size) throw error('已有登录批次正在处理或清理，请先完成或取消', 409);
-    const entries = parseGoogleAccounts(raw);
+    const entries = parseAccountLoginEntries(raw, { manual });
+    const profiles = this.reserveProfiles ? this.reserveProfiles(entries) : [];
     const batch = { id: randomUUID(), ownerId, status: 'running', currentIndex: -1,
-      createdAt: new Date(this.clock()).toISOString(), items: entries.map(entry => ({ ...entry, status: 'queued', message: '等待独立登录窗口' })) };
+      createdAt: new Date(this.clock()).toISOString(), items: entries.map((entry, index) => ({ ...entry,
+        ...(profiles[index]?.email === entry.email ? { profileId: profiles[index].profileId, accountCode: profiles[index].accountCode } : {}),
+        status: 'queued', message: '等待独立登录窗口' })) };
     this.batches.set(batch.id, batch);
     this.active = batch;
     // Bounded metadata retention. Credentials are already erased for finished batches.
@@ -126,6 +187,13 @@ export class GoogleLoginManager {
 
   isCurrent(batch, item) {
     return this.active === batch && batch.items[batch.currentIndex] === item && !terminal.has(item.status);
+  }
+
+  recordStage(batch, item, stage) {
+    if (!allowedMessage(stageLabels, stage) || !this.isCurrent(batch, item)
+        || item.controller?.signal.aborted || this.clock() >= item.deadlineAt) return false;
+    item.stage = stage;
+    return true;
   }
 
   scheduleAdvance(batch) {
@@ -152,11 +220,12 @@ export class GoogleLoginManager {
     batch.currentIndex = index;
     batch.status = 'running';
     const item = batch.items[index];
-    item.status = 'opening'; item.message = '正在打开独立 Google 登录窗口';
+    item.status = 'opening'; item.message = item.loginMethod === 'manual' ? '正在打开独立手动登录窗口' : '正在打开独立 Google 登录窗口';
     item.startedAt = this.clock();
     item.deadlineAt = item.startedAt + this.timeoutMs;
-    const secret = { email: item.email, password: item.password };
-    delete item.password;
+    const secret = { email: item.email, loginMethod: item.loginMethod, profileId: item.profileId, accountCode: item.accountCode,
+      ...Object.fromEntries(SECRET_FIELDS.map(key => [key, item[key] || ''])) };
+    eraseSecrets(item, true);
     item.controller = new AbortController();
     item.pendingSecret = secret;
     item.expiryTimer = setTimeout(() => this.expire(batch, item), this.timeoutMs);
@@ -166,19 +235,26 @@ export class GoogleLoginManager {
       if (account?.blocked) throw error('account_unavailable');
       item.accountSnapshot = account;
       item.loginProxy = this.resolveProxy ? this.resolveProxy(item.email, account) : account?.proxy;
-      const session = await this.driver.open(secret, this.resolveProxy ? { ...account, proxy: item.loginProxy } : account, { signal: item.controller.signal });
-      secret.password = '';
+      const session = await this.driver.open(secret, this.resolveProxy ? { ...account, proxy: item.loginProxy } : account, {
+        signal: item.controller.signal,
+        onStage: stage => {
+          if (this.recordStage(batch, item, stage) && item.status === 'opening') item.message = stageProgress(item);
+        },
+      });
+      eraseSecrets(secret);
       delete item.pendingSecret;
       if (!this.isCurrent(batch, item)) { await session.close(); return; }
       item.session = session;
-      item.status = 'signing_in'; item.message = '正在尝试 Google 登录';
+      if (this.clock() >= item.deadlineAt) return await this.expire(batch, item);
+      item.status = 'signing_in'; item.message = stageProgress(item, item.loginMethod === 'manual' ? '请在独立窗口登录 Dola，系统将核验真实会话' : '正在尝试 Google 登录');
       item.timer = setInterval(() => this.inspect(batch, item), this.pollMs);
       item.timer.unref?.();
       await this.inspect(batch, item);
     } catch {
-      secret.password = '';
+      eraseSecrets(secret);
       delete item.pendingSecret;
       if (this.isCurrent(batch, item)) {
+        if (this.clock() >= item.deadlineAt) return await this.expire(batch, item);
         this.cancelQueued(batch, '前序账号或代理启动失败，已停止后续登录并清除密码；请检查后重新提交');
         await this.finish(batch, item, 'failed', '登录窗口启动失败，或账号已停用/正在使用；请检查本机浏览器及代理');
       }
@@ -188,7 +264,7 @@ export class GoogleLoginManager {
   cancelQueued(batch, message) {
     for (const entry of batch.items) {
       if (entry.status !== 'queued') continue;
-      delete entry.password;
+      eraseSecrets(entry, true);
       entry.status = 'cancelled'; entry.message = message;
     }
   }
@@ -239,41 +315,47 @@ export class GoogleLoginManager {
       if (this.clock() >= item.deadlineAt) {
         return await this.expire(batch, item);
       }
+      this.recordStage(batch, item, result.stage);
       if (result.kind === 'ready') {
-        if (!matchesGoogleIdentity(result.identity, item.email)) {
-          return await this.finish(batch, item, 'failed', '返回的 Google 账号与输入邮箱不一致或身份未验证，未入池');
+        const manualVerified = item.loginMethod === 'manual' && result.manual === true && result.identity == null
+          && result.sessionVerified === true && result.profile?.ok === true && Boolean(result.profile.entityId || result.profile.id);
+        if (item.loginMethod === 'manual' ? !manualVerified : (result.manual === true || !matchesGoogleIdentity(result.identity, item.email))) {
+          return await this.finish(batch, item, 'failed', item.loginMethod === 'manual'
+            ? '手动登录的真实 Dola 身份尚未核验通过，未入池' : '返回的 Google 账号与输入邮箱不一致或身份未验证，未入池');
         }
         item.status = 'verifying';
         // storeAccount is synchronous: cancellation cannot interleave with this commit.
         let saved;
         try {
-          saved = this.storeAccount({ ...result, email: item.email, ownerId: batch.ownerId, snapshot: item.accountSnapshot, loginProxy: item.loginProxy });
+          saved = this.storeAccount({ ...result, email: item.email, loginMethod: item.loginMethod, ownerId: batch.ownerId, snapshot: item.accountSnapshot, loginProxy: item.loginProxy });
         } catch {
           await this.finish(batch, item, 'failed', '账号池记录已变化、停用或身份重复，未覆盖原记录');
           return;
         }
         item.accountId = saved.id;
-        const message = result.sessionReused
+        const message = manualVerified ? 'Dola 会话已核验入池；显示邮箱为你填写的标注，不代表已核实上游邮箱绑定'
+          : result.sessionReused
           ? '已通过原代理核验并复用已保存会话，没有重复输入密码；Dola 身份与原记录一致'
           : 'Google 身份与 Dola 会话已确认，登录凭据已自动入池';
         await this.finish(batch, item, 'succeeded', message + (result.loginStateSaved === true && !result.sessionReused
           ? '；独立登录状态已保存（不含密码）' : result.loginStateSaved === false ? '；登录状态保存失败，下次需重新登录' : ''));
       } else if (result.kind === 'failed') {
-        await this.finish(batch, item, 'failed', '账号或密码未通过验证，或窗口已关闭；未写入号池');
+        await this.finish(batch, item, 'failed', allowedMessage(failureMessages, result.reason) || '登录未完成，请检查登录窗口或当前阶段；未写入号池');
       } else {
-        if (result.kind === 'waiting_user' && ['captcha', 'security', 'browser_blocked'].includes(result.reason)) {
+        if (result.kind === 'waiting_user' && securityReasons.has(result.reason)) {
           this.pauseForSecurity(batch, item);
         }
         item.status = result.kind === 'waiting_user' || batch.securityPaused ? 'waiting_user' : 'signing_in';
         batch.status = item.status === 'waiting_user' ? 'waiting_user' : 'running';
         item.message = item.status === 'waiting_user'
-          ? waitingMessages[result.reason || (batch.securityPaused ? 'manual_step' : '')] || '请在弹出的浏览器完成验证码、安全检查或授权，然后点击“检查登录”；不会自动处理验证或同意条款'
-          : '正在等待 Google 返回 Dola 并验证登录身份';
+          ? withStage(item, allowedMessage(waitingMessages, result.reason || (batch.securityPaused ? 'manual_step' : '')) || '请在弹出的浏览器完成验证码、安全检查或授权，然后点击“检查登录”；不会自动处理验证或同意条款')
+          : stageProgress(item);
       }
     } catch {
       if (this.isCurrent(batch, item)) {
+        if (this.clock() >= item.deadlineAt) return await this.expire(batch, item);
         item.status = 'waiting_user'; batch.status = 'waiting_user';
-        item.message = '暂未确认登录身份或会话，请检查浏览器后重试；未写入号池';
+        item.message = withStage(item, '暂未确认登录身份或会话，请检查浏览器后重试；未写入号池');
       }
     } finally { item.busy = false; }
   }
@@ -283,8 +365,8 @@ export class GoogleLoginManager {
     clearInterval(item.timer);
     clearTimeout(item.expiryTimer);
     item.cleaning = true;
-    item.status = status; item.message = message; delete item.password;
-    if (item.pendingSecret) item.pendingSecret.password = '';
+    item.status = status; item.message = status === 'failed' ? withStage(item, message, true) : message; eraseSecrets(item, true);
+    eraseSecrets(item.pendingSecret);
     item.controller?.abort();
     delete item.accountSnapshot;
     delete item.loginProxy;
@@ -312,9 +394,9 @@ export class GoogleLoginManager {
       clearTimeout(batch.pauseTimer);
       const sessions = [];
       for (const entry of batch.items) {
-        delete entry.password; clearInterval(entry.timer);
+        eraseSecrets(entry, true); clearInterval(entry.timer);
         clearTimeout(entry.expiryTimer);
-        if (entry.pendingSecret) entry.pendingSecret.password = '';
+        eraseSecrets(entry.pendingSecret);
         entry.controller?.abort();
         delete entry.accountSnapshot;
         delete entry.loginProxy;

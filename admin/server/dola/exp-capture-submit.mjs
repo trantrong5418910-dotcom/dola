@@ -8,7 +8,7 @@
  * 原文打出来，看服务端到底回了什么让前端决定登出。
  */
 import { initDb, db } from '../db.js';
-import { parseCookies, getPlaywright, DOLA_HEADERS } from './provider.js';
+import { parseCookies, getPlaywright, DOLA_HEADERS, guardLogoutRequests } from './provider.js';
 
 const argv = process.argv.slice(2);
 const flag = (n, d = null) => {
@@ -27,6 +27,7 @@ const pw = await getPlaywright();
 const browser = await pw.chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'] });
 const ctx = await browser.newContext({ viewport: { width: 1560, height: 950 }, locale: 'zh-CN', userAgent: DOLA_HEADERS['user-agent'] });
 await ctx.addCookies(Object.entries(ck).map(([name, value]) => ({ name, value, domain: '.dola.com', path: '/' })));
+await guardLogoutRequests(ctx);
 
 const hits = [];
 ctx.on('response', async (res) => {

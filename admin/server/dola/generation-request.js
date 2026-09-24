@@ -7,6 +7,77 @@
  * Limits: 1 MiB input, depth 8, 4096 values, 2 MiB cumulative decoded JSON,
  * 100 capture entries. Unsupported/over-limit bodies pass through unchanged.
  */
+
+/**
+ * Node-side Fangyue rewrite: set ability_param.duration on chat completion bodies.
+ * Mirrors the page adapter's duration rewrite without touching unrelated fields.
+ */
+export function rewriteVideoDurationBody(body, { seconds, targetModel = 'seedance_v2.5' } = {}) {
+  if (![10, 15, 20, 30].includes(Number(seconds))) {
+    throw new TypeError('seconds must be 10, 15, 20 or 30');
+  }
+  if (typeof body !== 'string' || !body || body.length > 1024 * 1024) return { body, changed: false, records: [] };
+  const records = [];
+  const models = new Set(['seedance_v2.0', 'seedance_v2.5']);
+  const envelopes = new Set([
+    'chat_ability', 'ability', 'abilities', 'payload', 'data', 'message', 'body', 'params', 'param',
+  ]);
+  try {
+    const root = JSON.parse(body);
+    let changed = false;
+    const walk = (value, depth, eligible) => {
+      if (!value || typeof value !== 'object' || depth > 8) return value;
+      if (Array.isArray(value)) {
+        for (let i = 0; i < value.length; i++) value[i] = walk(value[i], depth + 1, eligible);
+        return value;
+      }
+      const ability = Object.prototype.hasOwnProperty.call(value, 'ability_type')
+        || Object.prototype.hasOwnProperty.call(value, 'ability_param');
+      if (eligible && ability && [17, '17'].includes(value.ability_type)
+          && Object.prototype.hasOwnProperty.call(value, 'ability_param')) {
+        let param = value.ability_param;
+        let asString = false;
+        if (typeof param === 'string') {
+          try { param = JSON.parse(param); asString = true; } catch { param = null; }
+        }
+        if (param && typeof param === 'object' && models.has(param.model)
+            && (targetModel == null || param.model === targetModel)
+            && (Number(seconds) < 20 || param.model === 'seedance_v2.5')
+            && Number.isFinite(Number(param.duration))) {
+          const before = Number(param.duration);
+          if (before !== Number(seconds)) {
+            param.duration = Number(seconds);
+            value.ability_param = asString ? JSON.stringify(param) : param;
+            changed = true;
+            records.push({ model: param.model, before, after: Number(seconds), via: 'route-rewrite' });
+          } else {
+            records.push({ model: param.model, before, after: before, via: 'route-rewrite' });
+          }
+        }
+      }
+      for (const key of Object.keys(value)) {
+        if (eligible && ability && [17, '17'].includes(value.ability_type) && key === 'ability_param') continue;
+        const child = value[key];
+        if (typeof child === 'string' && eligible && envelopes.has(key)) {
+          try {
+            const parsed = JSON.parse(child);
+            const next = walk(parsed, depth + 1, true);
+            const encoded = JSON.stringify(next);
+            if (encoded !== child) { value[key] = encoded; changed = true; }
+          } catch { /* plain */ }
+        } else if (child && typeof child === 'object') {
+          walk(child, depth + 1, eligible && !ability && envelopes.has(key));
+        }
+      }
+      return value;
+    };
+    walk(root, 0, true);
+    return { body: changed ? JSON.stringify(root) : body, changed, records };
+  } catch {
+    return { body, changed: false, records: [] };
+  }
+}
+
 export function installVideoRequestAdapter({ seconds, targetModel = null, rewrite = true }) {
   if (![10, 15, 20, 30].includes(seconds)) {
     throw new TypeError('seconds must be 10, 15, 20 or 30');

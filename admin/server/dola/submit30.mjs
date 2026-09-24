@@ -11,7 +11,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseCookies } from './provider.js';
+import { parseCookies, guardLogoutRequests } from './provider.js';
 
 const args = process.argv.slice(2);
 const flag = (n, d = null) => { const i = args.indexOf(`--${n}`); return i >= 0 && args[i + 1] && !args[i + 1].startsWith('--') ? args[i + 1] : d; };
@@ -35,6 +35,7 @@ const ctx = await browser.newContext({
   userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
 });
 await ctx.addCookies(Object.entries(ck).map(([name, value]) => ({ name, value, domain: '.dola.com', path: '/' })));
+await guardLogoutRequests(ctx);
 
 // ★ 关键：在页面加载前就注入 patch（等价于扩展的 world:MAIN content script）
 await ctx.addInitScript(([force, forceModel]) => {

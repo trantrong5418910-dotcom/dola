@@ -35,13 +35,17 @@ function parseSocksUrl(url) {
 }
 
 /** 与上游 SOCKS5 建连 + 认证 + 请求连到 targetHost:targetPort */
-function socksConnect(up, targetHost, targetPort) {
+function socksConnect(up, targetHost, targetPort, signal) {
   return new Promise((resolve, reject) => {
     const s = net.connect(up.port, up.host);
     let step = 0;
     let buf = Buffer.alloc(0);
 
     const fail = (m) => { try { s.destroy(); } catch { /* ignore */ } reject(new Error(m)); };
+    const abort = () => fail('代理桥已关闭');
+    signal?.addEventListener('abort', abort, { once: true });
+    s.once('close', () => signal?.removeEventListener('abort', abort));
+    if (signal?.aborted) { abort(); return; }
     s.setTimeout(20000, () => fail('连上游 SOCKS5 超时'));
     s.on('error', (e) => fail(`连上游 SOCKS5 失败：${e.code || e.message}`));
 
@@ -122,9 +126,14 @@ function socksConnect(up, targetHost, targetPort) {
 export function startSocksBridge(upstreamSocksUrl) {
   const up = parseSocksUrl(upstreamSocksUrl);
   const stats = { tunnels: 0, errors: [] };
+  const sockets = new Set();
+  const controller = new AbortController();
+  let closePromise;
 
   return new Promise((resolve, reject) => {
     const server = net.createServer((client) => {
+      sockets.add(client);
+      client.once('close', () => sockets.delete(client));
       let buf = Buffer.alloc(0);
       let settled = false;
 
@@ -161,7 +170,10 @@ export function startSocksBridge(upstreamSocksUrl) {
         }
 
         try {
-          const { socket: upstream, leftover } = await socksConnect(up, targetHost, targetPort);
+          const { socket: upstream, leftover } = await socksConnect(up, targetHost, targetPort, controller.signal);
+          if (controller.signal.aborted || client.destroyed) { upstream.destroy(); cleanup(); return; }
+          sockets.add(upstream);
+          upstream.once('close', () => sockets.delete(upstream));
           stats.tunnels++;
 
           if (method === 'CONNECT') {
@@ -198,7 +210,13 @@ export function startSocksBridge(upstreamSocksUrl) {
         port,
         url: `http://127.0.0.1:${port}`,
         stats,
-        close: () => new Promise((r) => server.close(() => r())),
+        // server.close() alone waits for active/idle tunnels indefinitely.
+        // Close pending handshakes and established sockets so probe deadlines hold.
+        close: () => closePromise ||= new Promise((r) => {
+          controller.abort();
+          for (const socket of sockets) socket.destroy();
+          server.close(() => r());
+        }),
       });
     });
   });

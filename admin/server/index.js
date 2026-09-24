@@ -13,7 +13,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { initDb, db, DB_PATH } from './db.js';
-import { authMiddleware, requireAuth } from './auth.js';
+import { authMiddleware, requireAuth, verifyPassword } from './auth.js';
 import authRoutes from './routes/auth.js';
 import userRoutes from './routes/users.js';
 import roleRoutes from './routes/roles.js';
@@ -26,20 +26,37 @@ import dolaRoutes, { startDolaMaintenance } from './routes/dola.js';
 import dolaGoogleLoginRoutes, { stopGoogleLogins } from './routes/dola-google-login.js';
 import frontendRoutes from './routes/frontend.js';
 import gatewayRoutes from './routes/gateway.js';
+import materialRoutes from './routes/materials.js';
 import { recoverStaleJobs } from './jobs.js';
 import { recoverStaleVideoTasks } from './dola/generator.js';
+import { seedHistoricalGenerationGuards } from './dola/generation-guards.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(HERE, 'public');
 const PORT = Number(process.env.PORT || 8788);
+/**
+ * 监听地址。**默认必须钉死在 127.0.0.1。**
+ *
+ * 踩过的坑：`app.listen(PORT)` 不传 host 时 Node 会绑到 `0.0.0.0`（所有网卡），
+ * 而启动日志打印的是 `http://127.0.0.1:PORT` —— 日志给了「只监听本机」的错觉，
+ * 实际门是敞开的。配合「默认口令 admin123 未强制修改」，等于同网段任何人
+ * 都能登进后台、读走网关密钥和全部账号 cookie。
+ *
+ * 确实需要对外暴露时，显式设 HOST=0.0.0.0，并且**必须**先改掉默认口令。
+ * 用 127.0.0.1 之外的地址启动会打醒目警告。
+ */
+const HOST = String(process.env.HOST || '127.0.0.1').trim();
+const EXPOSED = !['127.0.0.1', 'localhost', '::1'].includes(HOST);
 
 await initDb();
+const guarded = seedHistoricalGenerationGuards(db);
+if (guarded) console.log(`[gen] 已为 ${guarded} 项未确认能力启用重复失败保护`);
 // 上次进程没跑完的任务不会自动续跑，标成中断，别让前端一直转圈
 const stale = recoverStaleJobs();
 if (stale) console.log(`[job] 已把 ${stale} 个中断的任务标记为 failed`);
-// 视频生成任务同理：跑一半的服务重启后不可能自己续上（浏览器已经关了）
+// 已有可靠回执的生成任务只恢复查询；未知提交保留待核对，不再统一标失败。
 const staleVideos = recoverStaleVideoTasks();
-if (staleVideos) console.log(`[gen] 已把 ${staleVideos} 个中断的生成任务标记为 failed`);
+if (staleVideos) console.log(`[gen] 已核对 ${staleVideos} 个中断任务：可靠回执恢复查询，未知提交保留待核对`);
 
 // 账号池自动维护：约 15 秒后首次巡检，之后按系统设置周期运行。
 // 只做健康/额度读取；明确失效的账号标记为 invalid，cookie 记录保留以便重新导入或人工恢复。
@@ -120,6 +137,7 @@ app.use('/api/dola', dolaRoutes);
 app.use('/api/dola/google-login', dolaGoogleLoginRoutes);
 app.use('/api/frontend', frontendRoutes);
 app.use('/api/gateway', gatewayRoutes);
+app.use('/api/materials', materialRoutes);
 
 app.use('/api', (req, res) => res.status(404).json({ ok: false, message: `未找到接口 ${req.method} ${req.path}` }));
 
@@ -179,8 +197,31 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
   });
 }
 
-app.listen(PORT, () => {
-  console.log(`\n  管理后台已启动  http://127.0.0.1:${PORT}`);
+app.listen(PORT, HOST, () => {
+  console.log(`\n  管理后台已启动  http://${EXPOSED ? HOST : '127.0.0.1'}:${PORT}`);
+  console.log(`  监听地址：${HOST}${EXPOSED ? '  ⚠️ 非本机回环，同网段/公网可访问' : '（仅本机可访问）'}`);
   console.log(`  数据库：${DB_PATH}`);
-  console.log(`  默认账号：admin / admin123（若未改过）\n`);
+  if (usingDefaultAdminPassword()) {
+    console.log('\n  ⚠️⚠️  管理员口令仍是默认值 admin123，请立刻修改！');
+    console.log('        改动位置：后台 → 用户管理 → admin → 重置密码\n');
+  } else {
+    console.log('  默认账号：admin（口令已自定义）\n');
+  }
+  if (EXPOSED) {
+    console.log(`  ⚠️  已绑定非回环地址 ${HOST}：后台将对外网开放。`);
+    console.log('     暴露前请确认：① admin 口令已改 ② 网关密钥已轮换 ③ 前面有反代/防火墙\n');
+  }
 });
+
+/**
+ * 启动时检查管理员口令是否还是出厂默认值。
+ * 只读校验，失败一律当「已改过」，不能因为查不到就把服务拦住。
+ */
+function usingDefaultAdminPassword() {
+  try {
+    const admin = db.prepare("SELECT password_hash FROM users WHERE username='admin'").get();
+    return Boolean(admin && verifyPassword('admin123', admin.password_hash));
+  } catch {
+    return false;
+  }
+}

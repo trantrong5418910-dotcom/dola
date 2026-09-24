@@ -243,6 +243,18 @@ Google 关于受信任设备的 Cookie 建议针对两步验证，不代表保�
 | `dola_auto_cleanup_invalid` | true | 明确会话失效后隔离，保留账号和 Cookie；关闭时标为待复查 |
 | `dola_auto_quota_probe` | true | 巡检时通过只读 HTTP 接口探测明确账户余额 |
 | `dola_auto_maintenance_interval_minutes` | 180 | 巡检间隔，支持 15～1440 分钟 |
+| `dola_submit_mode` | browser | 视频提交通道：`browser`=浏览器模拟提交（默认）/ `scheme-a`=Abort取签名+页内重放提交（实验） |
+
+### 视频提交通道（browser / scheme-a）
+
+`server/dola/generator.js` 的提交阶段支持双通道，由设置项 `dola_submit_mode` 切换（系统设置 → dola 账号池，保存即时生效，无需重启）：
+
+- `browser`（默认）：操作页面 UI（选模型/时长、填提示词、点发送），观察 SSE 拿 conversationId。
+- `scheme-a`（实验，`server/dola/scheme-a.js`）：页内 fetch 触发一次 `/chat/completion`，路由拦截捕获带 `a_bogus` 签名的完整请求后 abort（探测不消耗额度），再用同一浏览器把请求原样重放一次完成真正提交，随后立刻关浏览器。
+
+两个通道拿回 conversationId 之后走同一条下游：纯 HTTP 轮询 `/im/chain/single` → fallback 解析无水印 → 归档 → 计费/退款 → 任务日志。限流（710022002）冷却、提交日志、防自毁登出等保护在两个通道都生效。
+
+限制：`scheme-a` 暂不支持参考图任务（会直接失败并提示切回 browser）。
 
 ### 自动维护与额度读数
 

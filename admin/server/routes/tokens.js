@@ -72,8 +72,18 @@ router.post('/generate', requirePerm('token:generate'), (req, res) => {
   res.status(201).json({ ok: true, items: created, count: created.length });
 });
 
-/** GET /api/tokens/export —— 导出 CSV，body 不带完整值（要完整值请用 reveal 或生成时另存） */
-router.get('/export', requirePerm('token:list'), (req, res) => {
+/**
+ * GET /api/tokens/export —— 导出 CSV，**含完整令牌值**。
+ *
+ * 权限必须是 `token:reveal` 而不是 `token:list`。
+ * 踩过的坑：这里原本只要求 `token:list`（语义是「查看令牌」），
+ * 但 SQL 里 `SELECT ... value ...` 把完整令牌明文写进了 CSV ——
+ * 于是一个只读角色导出一次，就能拿到所有令牌，等于接管所有人的积分。
+ * 项目里其实已经有专门的 `token:reveal` 权限点，这里漏用了。
+ *
+ * 另注：原注释写着「body 不带完整值」，与实现完全相反，已一并订正。
+ */
+router.get('/export', requirePerm('token:reveal'), (req, res) => {
   const status = req.query.status || '';
   const rows = db.prepare(`SELECT id, name, prefix, value, points, status, expires_at, created_at
                            FROM tokens ${status ? 'WHERE status = ?' : ''} ORDER BY id DESC`)
@@ -82,7 +92,7 @@ router.get('/export', requirePerm('token:list'), (req, res) => {
     ['ID', '名称', '前缀', '完整令牌', '积分', '状态', '过期时间', '创建时间'],
     rows.map((r) => [r.id, r.name, r.prefix, r.value, r.points, r.status, r.expires_at ?? '', r.created_at]),
   );
-  audit(req, 'token.export', 'token', '', `导出 ${rows.length} 条`);
+  audit(req, 'token.export', 'token', '', `导出 ${rows.length} 条（含完整令牌值）`);
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="tokens-${Date.now()}.csv"`);
   res.send(csv);

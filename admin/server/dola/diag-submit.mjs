@@ -10,7 +10,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseCookies, getPlaywright, DOLA_HEADERS } from './provider.js';
+import { parseCookies, getPlaywright, DOLA_HEADERS, guardLogoutRequests } from './provider.js';
 
 const argv = process.argv.slice(2);
 const flag = (n, d = null) => {
@@ -100,7 +100,7 @@ await ctx.addCookies(Object.entries(ck).map(([name, value]) => ({ name, value, d
 // ★ 拦住 dola 前端在限流时「自己登出自己」的请求。
 // 实测：提交撞上限流后前端会调 /passport/web/logout/，把会话销毁 ——
 // 每失败一次就烧掉一个账号。这里 abort 掉，限流就只是"这次没成功"。
-await ctx.route('**/passport/**/logout**', (r) => r.abort());
+await guardLogoutRequests(ctx);
 
 
 const page = await ctx.newPage();

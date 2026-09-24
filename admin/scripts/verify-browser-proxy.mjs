@@ -23,6 +23,9 @@ const flag = (n, d = null) => {
   return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : d;
 };
 const ACC_ID = Number(flag('account-id', 83));
+// 期望国家：默认 KR（历史用法）。换成日本/美国的静态 IP 时必须显式传，
+// 否则会把正确的 JP 判成失败 —— 这个假阴性我自己踩过。
+const EXPECT = String(flag('country', 'KR')).toUpperCase();
 
 await initDb();
 const acc = db.prepare('SELECT id,label,cookie,proxy,exit_ip FROM dola_accounts WHERE id=?').get(ACC_ID);
@@ -78,8 +81,9 @@ const usedBridge = bridge.stats.tunnels > 0;
 const changed = browserIp && directIp && browserIp !== directIp;
 console.log(`① 浏览器走了桥：${usedBridge ? '✅ 是' : '❌ 否 —— 代理根本没生效！'}`);
 console.log(`② 出口 IP 变了：${changed ? `✅ 是（${directIp} → ${browserIp}）` : '❌ 否'}`);
-console.log(`③ 出口地区是代理地区：${browserCountry === 'KR' ? '✅ KR' : `❌ ${browserCountry}`}`);
-if (usedBridge && changed && browserCountry === 'KR') {
+console.log(`③ 出口地区符合预期(${EXPECT})：${browserCountry === EXPECT ? '✅ ' + browserCountry : `❌ 实际 ${browserCountry}`}`);
+console.log(`   （② 需要能取到本机直连 IP 才可比；取不到时看 ③ 即可）`);
+if (usedBridge && (changed || !directIp) && browserCountry === EXPECT) {
   console.log('\n→ 代理链路完全正常。"换了 IP 还被限流"就说明**限流是按账号（或账号+IP）的**，');
   console.log('  不单看 IP —— 那批被限过的号即使换新 IP 也不会立刻恢复，得等窗口过去。');
 }

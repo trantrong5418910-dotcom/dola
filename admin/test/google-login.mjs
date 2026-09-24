@@ -19,6 +19,8 @@ import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
 import tls from 'node:tls';
+import dns from 'node:dns';
+import dnsPromises from 'node:dns/promises';
 import childProcess from 'node:child_process';
 
 const EMAIL = 'synthetic-one@example.test';
@@ -31,6 +33,9 @@ const OLD_AT = '2001-01-01T00:00:00.000Z';
 const CLOCK = Date.parse('2026-09-19T00:00:00.000Z');
 const SYNTHETIC_TOKEN = 'synthetic-google-access-token-not-real';
 const SYNTHETIC_PROXY = 'http://synthetic-proxy:synthetic-proxy-password@proxy.example.test:8080';
+const RECOVERY_EMAIL = 'synthetic-private-recovery@example.test';
+const VERIFICATION_URL = 'https://verification.example.invalid/otp?token=synthetic-verification-secret';
+const GOOGLE_SESSION_URL = 'https://gapi.mailsapi.com/google/login?uid=synthetic-google-link-secret';
 const blocked = [];
 let tempDirectory, db, auth, core, createGoogleAccountStore, createGoogleLoginRouter;
 let requireLoginProxy, createLoginProxyResolver;
@@ -101,14 +106,14 @@ function managerFixture(t, options = {}) {
       return storeAccount ? storeAccount(value) : { id: 301 + fixture.writes.length };
     },
     driver: {
-      async open(secret, snapshot, { signal } = {}) {
+      async open(secret, snapshot, { signal, onStage } = {}) {
         assert.match(secret.email, /^synthetic-[^@]+@example\.test$/);
         assert.match(secret.password, /^synthetic-/);
         assert.ok(signal instanceof AbortSignal);
-        fixture.opens.push({ secret, snapshot, signal });
+        fixture.opens.push({ secret, snapshot, signal, onStage });
         const session = fakeSession();
         fixture.sessions.push(session);
-        return open ? open({ secret, snapshot, session, fixture }) : session;
+        return open ? open({ secret, snapshot, signal, onStage, session, fixture }) : session;
       },
     },
     ...managerOptions,
@@ -231,6 +236,48 @@ async function route(router, {
   return result;
 }
 
+function readOnlyRouteFixture(t) {
+  const beforeState = poolState();
+  const profiles = db.prepare('SELECT * FROM dola_login_profiles ORDER BY id').all();
+  const changes = () => db.prepare('SELECT total_changes() AS n').get().n;
+  const beforeChanges = changes();
+  const attempts = [];
+  const getManager = t.mock.fn(() => { throw new Error('Read-only route must not resolve a manager'); });
+  const prepare = db.prepare;
+  const prepareGuard = t.mock.method(db, 'prepare', sql => {
+    // Auth legitimately SELECTs the synthetic user. Any audit, reservation or
+    // write attempt must fail the test, even if implementation catches it.
+    if (!/^\s*SELECT\b/i.test(sql)) {
+      attempts.push('non-SELECT prepare');
+      throw new Error('Read-only route attempted a database mutation');
+    }
+    return prepare(sql);
+  });
+  const execGuard = t.mock.method(db, 'exec', () => {
+    attempts.push('exec');
+    throw new Error('Read-only route attempted database exec');
+  });
+  t.after(() => {
+    prepareGuard.mock.restore();
+    execGuard.mock.restore();
+    assert.equal(getManager.mock.callCount(), 0, 'Preview/validation must not instantiate the manager');
+    assert.deepEqual(attempts, [], 'No audit, profile reservation or database write may be attempted');
+    assert.equal(changes(), beforeChanges, 'No writes, including writes later rolled back');
+    assert.deepEqual(poolState(), beforeState);
+    assert.deepEqual(db.prepare('SELECT * FROM dola_login_profiles ORDER BY id').all(), profiles);
+    assert.deepEqual(blocked, [], 'No DNS, network, process or browser call may be attempted');
+  });
+  return createGoogleLoginRouter(getManager);
+}
+
+function assertPreviewRedacted(response, extraSecrets = []) {
+  const serialized = JSON.stringify({ body: response.body, headers: response.headers });
+  for (const secret of [PASSWORD, RECOVERY_EMAIL, VERIFICATION_URL, GOOGLE_SESSION_URL,
+    'synthetic-verification-secret', 'synthetic-google-link-secret', SYNTHETIC_TOKEN, ...extraSecrets]) {
+    assert.ok(!serialized.includes(secret), 'Preview must not disclose synthetic credential sentinels');
+  }
+}
+
 describe('isolated Google login contracts (synthetic only)', { concurrency: false, timeout: 30_000 }, () => {
   before(async () => {
     tempDirectory = await realpath(await mkdtemp(join(tmpdir(), 'google-login-test-')));
@@ -245,6 +292,8 @@ describe('isolated Google login contracts (synthetic only)', { concurrency: fals
       [http, ['request', 'get']], [https, ['request', 'get']],
       [net, ['connect', 'createConnection']], [net.Socket.prototype, ['connect']],
       [tls, ['connect']],
+      [dns, ['lookup', 'resolve', 'resolve4', 'resolve6', 'resolveAny']],
+      [dnsPromises, ['lookup', 'resolve', 'resolve4', 'resolve6', 'resolveAny']],
       [childProcess, ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']],
     ]) for (const method of methods) mock.method(object, method, deny(method));
     syncBuiltinESMExports();
@@ -632,7 +681,8 @@ describe('isolated Google login contracts (synthetic only)', { concurrency: fals
   });
 
   test('security pause: all challenge reasons latch a ten-minute default deadline only once', async t => {
-    for (const reason of ['captcha', 'security', 'browser_blocked']) {
+    for (const reason of ['captcha', 'security', 'browser_blocked', 'otp_identity', 'otp_fetch_failed',
+      'otp_refresh_exhausted', 'otp_not_accepted', 'otp_step_changed']) {
       const f = managerFixture(t);
       assert.equal(f.manager.manualTimeoutMs, 600_000);
       const batch = await started(f, QUEUED_RAW);
@@ -1055,6 +1105,248 @@ describe('isolated Google login contracts (synthetic only)', { concurrency: fals
     assert.equal(f.opens.length, 0);
     assert.equal(f.writes.length, 0);
     assertPublic(result);
+  });
+
+  test('diagnostics: async boot reports phases before returning a session without refreshing the deadline', async t => {
+    let gate;
+    const f = managerFixture(t, { open: async ({ onStage, session }) => {
+      onStage('session_restore');
+      await gate.promise;
+      session.next = { kind: 'pending' };
+      return session;
+    } });
+    gate = f.gate();
+    const created = f.manager.create(RAW, OWNER);
+    const batch = f.manager.batches.get(created.id);
+    await waitFor(() => f.opens.length, 'boot callback');
+    const item = batch.items[0];
+    const deadline = item.deadlineAt, timer = item.expiryTimer;
+    assert.equal(item.session, undefined);
+    assert.equal(item.status, 'opening');
+    assert.equal(item.stage, 'session_restore');
+    assert.match(item.message, /恢复已保存会话/);
+    for (const [stage, label] of [
+      ['browser_launch', /启动独立浏览器/], ['proxy_check', /检查代理连通性/],
+      ['dola_home', /打开 Dola 首页/], ['dola_login_button', /点击 Dola 登录入口/],
+      ['dola_google_button', /点击 Google 登录入口/],
+    ]) {
+      f.now += 100;
+      f.opens[0].onStage(stage);
+      assert.equal(item.stage, stage);
+      assert.equal(item.status, 'opening');
+      assert.match(f.manager.public(batch).items[0].message, label);
+      assert.equal(item.deadlineAt, deadline);
+      assert.equal(item.expiryTimer, timer);
+      assertPublic(f.manager.public(batch));
+    }
+    gate.resolve();
+    await waitFor(() => f.sessions[0].inspectCalls, 'first inspection');
+    assert.equal(item.status, 'signing_in');
+    assert.match(item.message, /Google 登录入口/);
+    assert.equal(item.stage, 'dola_google_button');
+    assert.equal(f.writes.length, 0);
+  });
+
+  test('diagnostics: every allowed inspection phase and existing OTP progress remains readable', async t => {
+    const f = managerFixture(t);
+    const batch = await started(f), item = batch.items[0];
+    const deadline = item.deadlineAt, timer = item.expiryTimer;
+    for (const [stage, label] of [
+      ['session_restore', /恢复已保存会话/], ['browser_launch', /启动独立浏览器/],
+      ['proxy_check', /检查代理连通性/], ['dola_home', /打开 Dola 首页/],
+      ['dola_login_button', /点击 Dola 登录入口/], ['dola_google_button', /点击 Google 登录入口/],
+      ['google_redirect', /等待跳转至 Google/], ['google_email', /填写 Google 邮箱/],
+      ['google_password', /填写 Google 密码/], ['google_recovery', /填写 Google 恢复邮箱/],
+      ['email_otp', /邮件验证码验证/], ['authenticator_otp', /验证器动态码验证/],
+      ['google_identity', /核验 Google 身份/], ['dola_binding', /确认 Dola 登录绑定/],
+      ['dola_session', /核验 Dola 会话/], ['session_save', /保存登录会话/],
+      ['otp_submitted', /动态码已提交/], ['otp_waiting_refresh', /等待刷新间隔/],
+      ['otp_same_code', /同一个动态码/],
+    ]) {
+      f.sessions[0].next = { kind: 'pending', stage };
+      await f.manager.inspect(batch, item);
+      assert.equal(item.stage, stage);
+      assert.match(item.message, label);
+      assert.equal(item.deadlineAt, deadline);
+      assert.equal(item.expiryTimer, timer);
+      assert.equal(item.status, 'signing_in');
+      assertPublic(f.manager.public(batch));
+    }
+    f.sessions[0].next = { kind: 'waiting_user', reason: 'security', stage: 'authenticator_otp' };
+    await f.manager.inspect(batch, item);
+    assert.match(item.message, /Google 要求安全验证.*当前阶段：验证器动态码验证/);
+    const pauseDeadline = item.deadlineAt, pauseTimer = batch.pauseTimer;
+    f.now += 1000;
+    f.opens[0].onStage('email_otp');
+    assert.equal(item.deadlineAt, pauseDeadline);
+    assert.equal(batch.pauseTimer, pauseTimer);
+    assert.equal(item.status, 'waiting_user');
+    assert.equal(batch.status, 'waiting_user');
+    assert.equal(f.writes.length, 0);
+  });
+
+  test('diagnostics: cancellation during boot freezes the phase, message and deadlines', async t => {
+    let gate;
+    const f = managerFixture(t, { open: async ({ onStage, session }) => {
+      onStage('dola_home');
+      await gate.promise;
+      onStage('google_password');
+      return session;
+    } });
+    gate = f.gate();
+    const created = f.manager.create(QUEUED_RAW, OWNER);
+    await waitFor(() => f.opens.length, 'held boot');
+    const batch = f.manager.batches.get(created.id), item = batch.items[0];
+    await f.manager.action(batch.id, OWNER, 'cancel');
+    const snapshot = f.manager.public(batch), deadline = item.deadlineAt;
+    f.opens[0].onStage('google_email');
+    gate.resolve();
+    await waitFor(() => f.sessions[0].closeCalls, 'cancelled boot cleanup');
+    assert.deepEqual(f.manager.public(batch), snapshot);
+    assert.equal(item.stage, 'dola_home');
+    assert.equal(item.deadlineAt, deadline);
+    assert.equal(f.sessions[0].inspectCalls, 0);
+    assert.equal(f.writes.length, 0);
+    assertCredentialsErased(batch);
+  });
+
+  test('diagnostics: old item callbacks and inspection results cannot change the next account', async t => {
+    const f = managerFixture(t);
+    const batch = await started(f, QUEUED_RAW), item = batch.items[0];
+    f.opens[0].onStage('dola_login_button');
+    const gate = f.gate();
+    f.sessions[0].next = async () => { await gate.promise; return { kind: 'pending', stage: 'google_password' }; };
+    const inspecting = f.manager.inspect(batch, item);
+    await f.manager.action(batch.id, OWNER, 'skip');
+    await waitFor(() => f.sessions[1]?.inspectCalls, 'next account');
+    const snapshot = f.manager.public(batch), deadline = batch.items[1].deadlineAt;
+    f.opens[0].onStage('session_save');
+    gate.resolve();
+    await inspecting;
+    assert.equal(item.stage, 'dola_login_button');
+    assert.equal(batch.items[1].stage, undefined);
+    assert.equal(batch.items[1].deadlineAt, deadline);
+    assert.deepEqual(f.manager.public(batch), snapshot);
+    assert.equal(f.writes.length, 0);
+  });
+
+  test('diagnostics: expired boot callbacks are ignored before and after the timeout is processed', async t => {
+    let gate;
+    const f = managerFixture(t, { open: async ({ onStage, session }) => {
+      onStage('dola_home');
+      await gate.promise;
+      return session;
+    } });
+    gate = f.gate();
+    const created = f.manager.create(QUEUED_RAW, OWNER);
+    await waitFor(() => f.opens.length, 'held boot');
+    const batch = f.manager.batches.get(created.id), item = batch.items[0];
+    const snapshot = f.manager.public(batch), deadline = item.deadlineAt;
+    f.now = deadline;
+    f.opens[0].onStage('google_password');
+    assert.equal(item.stage, 'dola_home');
+    assert.equal(item.deadlineAt, deadline);
+    assert.deepEqual(f.manager.public(batch), snapshot);
+    await f.manager.expire(batch, item);
+    const expired = f.manager.public(batch);
+    assert.match(item.message, /^等待登录超过 5 分钟.*没有继续尝试其他账号；最后阶段：打开 Dola 首页$/);
+    f.opens[0].onStage('google_email');
+    gate.resolve();
+    await waitFor(() => f.sessions[0].closeCalls, 'expired boot cleanup');
+    assert.deepEqual(f.manager.public(batch), expired);
+    assert.equal(f.sessions[0].inspectCalls, 0);
+    assertCredentialsErased(batch);
+  });
+
+  for (const security of [false, true]) test(`diagnostics: ${security ? 'ten' : 'five'}-minute expiry preserves its cause and last live phase`, async t => {
+    const f = managerFixture(t, { timeoutMs: 300_000 });
+    const batch = await started(f, QUEUED_RAW), item = batch.items[0];
+    f.sessions[0].next = security
+      ? { kind: 'waiting_user', reason: 'security', stage: 'authenticator_otp' }
+      : { kind: 'pending', stage: 'dola_google_button' };
+    await f.manager.inspect(batch, item);
+    assert.equal(item.deadlineAt - f.now, security ? 600_000 : 300_000);
+    const gate = f.gate();
+    f.sessions[0].next = async () => { await gate.promise; return ready(EMAIL, { stage: 'session_save' }); };
+    const inspecting = f.manager.inspect(batch, item);
+    f.now = item.deadlineAt;
+    gate.resolve();
+    await inspecting;
+    await done(f, batch);
+    assert.match(item.message, security
+      ? /^安全验证等待超过 10 分钟.*没有继续尝试其他账号；最后阶段：验证器动态码验证$/
+      : /^等待登录超过 5 分钟.*没有继续尝试其他账号；最后阶段：查找并点击 Google 登录入口$/);
+    assert.equal(item.stage, security ? 'authenticator_otp' : 'dola_google_button');
+    assert.deepEqual(batch.items.map(entry => entry.status), ['failed', 'cancelled', 'cancelled']);
+    assert.equal(f.writes.length, 0);
+    assertCredentialsErased(batch);
+    assertPublic(f.manager.public(batch));
+  });
+
+  test('diagnostics: unknown stages/reasons, inherited keys and raw secrets are never retained or displayed', async t => {
+    const f = managerFixture(t);
+    const batch = await started(f), item = batch.items[0];
+    const unsafe = [PASSWORD, EMAIL, RECOVERY_EMAIL, VERIFICATION_URL, GOOGLE_SESSION_URL,
+      '654321', '<input value="synthetic-DOM-secret">', 'unknown_phase', '__proto__', 'constructor', 'toString',
+      '', null, undefined, 42, ['google_password'], { [Symbol.toPrimitive]() { throw new Error(PASSWORD); } }];
+    for (const stage of unsafe) f.opens[0].onStage(stage);
+    assert.equal(Object.hasOwn(item, 'stage'), false);
+    f.sessions[0].next = { kind: 'pending', stage: 'dola_login_button' };
+    await f.manager.inspect(batch, item);
+    for (const value of unsafe) {
+      f.opens[0].onStage(value);
+      for (const kind of ['pending', 'waiting_user']) {
+        f.sessions[0].next = { kind, stage: value, reason: value, message: PASSWORD, error: VERIFICATION_URL };
+        await f.manager.inspect(batch, item);
+        assert.equal(item.stage, 'dola_login_button');
+        assert.equal(typeof item.message, 'string');
+        assert.match(item.message, /当前阶段：查找并点击 Dola 登录入口/);
+        for (const raw of unsafe.filter(value => typeof value === 'string' && value)) assert.ok(!item.message.includes(raw));
+        assert.equal(Object.hasOwn(item, 'reason'), false);
+        assertPublic(f.manager.public(batch));
+      }
+    }
+    assert.equal(f.writes.length, 0);
+  });
+
+  for (const [reason, expected] of [
+    ['browser_closed', /^登录窗口已关闭/], ['credentials_rejected', /^Google 拒绝了账号或密码/],
+    ['identity_mismatch', /^返回的 Google 账号与输入邮箱不一致/],
+    [undefined, /^登录未完成/], [PASSWORD, /^登录未完成/], ['__proto__', /^登录未完成/],
+    ['constructor', /^登录未完成/], [{ toString() { throw new Error(PASSWORD); } }, /^登录未完成/],
+  ]) test(`diagnostics: failed reason ${typeof reason === 'string' && ['browser_closed', 'credentials_rejected', 'identity_mismatch'].includes(reason) ? reason : 'unknown'} uses only safe fixed text`, async t => {
+    const f = managerFixture(t, { open: ({ onStage, session }) => {
+      onStage('dola_home');
+      session.next = { kind: 'failed', stage: 'dola_google_button', reason, message: PASSWORD, error: VERIFICATION_URL };
+      return session;
+    } });
+    const created = f.manager.create(RAW, OWNER), batch = f.manager.batches.get(created.id);
+    const result = await done(f, batch);
+    assert.match(result.items[0].message, expected);
+    assert.match(result.items[0].message, /；最后阶段：查找并点击 Google 登录入口$/);
+    assert.equal(batch.items[0].stage, 'dola_google_button');
+    assert.equal(f.writes.length, 0);
+    assert.equal(f.sessions[0].closeCalls, 1);
+    assertPublic(result);
+    assert.ok(!result.items[0].message.includes(VERIFICATION_URL));
+  });
+
+  test('diagnostics: boot and inspect exceptions retain the last phase without exposing raw errors', async t => {
+    const opening = managerFixture(t, { open: ({ onStage }) => {
+      onStage('proxy_check');
+      throw new Error(VERIFICATION_URL);
+    } });
+    const created = opening.manager.create(QUEUED_RAW, OWNER);
+    const failed = await done(opening, opening.manager.batches.get(created.id));
+    assert.match(failed.items[0].message, /登录窗口启动失败.*最后阶段：检查代理连通性/);
+    assert.ok(!failed.items[0].message.includes(VERIFICATION_URL));
+    const checking = managerFixture(t);
+    const batch = await started(checking), item = batch.items[0];
+    checking.opens[0].onStage('dola_home');
+    checking.sessions[0].next = () => { throw new Error(PASSWORD); };
+    await checking.manager.inspect(batch, item);
+    assert.match(item.message, /暂未确认登录身份.*当前阶段：打开 Dola 首页/);
+    assertPublic(checking.manager.public(batch));
   });
 
   test('manager: raw open/inspect/store errors never reach public state', async t => {
@@ -1530,6 +1822,7 @@ describe('isolated Google login contracts (synthetic only)', { concurrency: fals
     const router = createGoogleLoginRouter(() => { calls++; throw new Error('Manager must not be resolved'); });
     const endpoints = [
       { url: '/batches/current' }, { method: 'POST', url: '/batches', body: { raw: RAW } },
+      { method: 'POST', url: '/preview', body: { raw: RAW } },
       { method: 'POST', url: '/batches/synthetic-id/action', body: { action: 'cancel' } },
     ];
     for (const endpoint of endpoints) {
@@ -1545,28 +1838,133 @@ describe('isolated Google login contracts (synthetic only)', { concurrency: fals
     assert.deepEqual(poolState(), { accounts: [], audit: [] });
   });
 
-  test('route: owner IDs come from authenticated user, raw input is removed, audit contains no password', async () => {
+  test('route: preview returns only email/method/booleans without manager, audit, writes or browser', async t => {
+    seedAccount(); // A preview must also leave an existing synthetic account untouched.
+    const router = readOnlyRouteFixture(t);
+    const raw = [
+      ` Synthetic-One\\@EXAMPLE.TEST |${PASSWORD}`,
+      `synthetic-recovery@example.test----${PASSWORD}----${RECOVERY_EMAIL}`,
+      `synthetic-verification@example.test----${PASSWORD}----${RECOVERY_EMAIL}----${VERIFICATION_URL}`,
+      `synthetic-link@example.test----${PASSWORD}----no----${GOOGLE_SESSION_URL}`,
+    ].join('\r\n');
+    const expected = { ok: true, items: [
+      { email: EMAIL, loginMethod: 'password', hasRecoveryEmail: false, hasVerificationUrl: false },
+      { email: 'synthetic-recovery@example.test', loginMethod: 'password', hasRecoveryEmail: true, hasVerificationUrl: false },
+      { email: 'synthetic-verification@example.test', loginMethod: 'password', hasRecoveryEmail: true, hasVerificationUrl: true },
+      { email: 'synthetic-link@example.test', loginMethod: 'google_link', hasRecoveryEmail: false, hasVerificationUrl: false },
+    ] };
+    for (const options of [{}, { manual: false }]) {
+      const body = { raw, ...options, ownerId: otherUser.id };
+      const response = await route(router, { method: 'POST', url: '/preview', body });
+      assert.equal(response.status, 200);
+      assert.equal(response.headers['cache-control'], 'no-store');
+      assert.deepEqual(response.body, expected, 'No secrets, account IDs, profile IDs or extra fields');
+      assert.equal(response.req.body, body);
+      assert.equal(Object.hasOwn(body, 'raw'), false);
+      assertPreviewRedacted(response);
+    }
+    const body = { raw: ` Synthetic-One\\@EXAMPLE.TEST \nsynthetic-manual@example.test`, manual: true };
+    const response = await route(router, { method: 'POST', url: '/preview', body });
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, { ok: true, items: [EMAIL, 'synthetic-manual@example.test'].map(email => ({
+      email, loginMethod: 'manual', hasRecoveryEmail: false, hasVerificationUrl: false,
+    })) });
+    assert.equal(Object.hasOwn(body, 'raw'), false);
+    assertPreviewRedacted(response);
+  });
+
+  test('route: preview rejects remote peers despite forwarded headers and accepts only local socket forms', async t => {
+    const router = readOnlyRouteFixture(t);
+    for (const remoteAddress of ['203.0.113.10', '::ffff:203.0.113.10', '2001:db8::1',
+      '192.168.1.10', '127.0.0.2', 'localhost', null]) {
+      const response = await route(router, {
+        method: 'POST', url: '/preview', body: { raw: RAW }, remoteAddress,
+        headers: { 'x-forwarded-for': '127.0.0.1', 'x-real-ip': '::1',
+          forwarded: 'for=127.0.0.1;proto=https', 'x-forwarded-proto': 'https' },
+      });
+      assert.equal(response.status, 403);
+      assert.equal(response.body.ok, false);
+      assert.equal(response.headers['cache-control'], 'no-store');
+      assertPreviewRedacted(response, [EMAIL]);
+    }
+    for (const remoteAddress of ['127.0.0.1', '::1', '::ffff:127.0.0.1']) {
+      const body = { raw: RAW };
+      const response = await route(router, { method: 'POST', url: '/preview', body, remoteAddress });
+      assert.equal(response.status, 200);
+      assert.equal(response.headers['cache-control'], 'no-store');
+      assert.equal(Object.hasOwn(body, 'raw'), false);
+      assertPreviewRedacted(response);
+    }
+  });
+
+  test('route: malformed preview is redacted, returns no partial items and erases body.raw', async t => {
+    const router = readOnlyRouteFixture(t);
+    const malformed = [
+      undefined, null, {}, [], 17, '', ' \n\r\n', 'x'.repeat(32769),
+      EMAIL, `${EMAIL},${PASSWORD}`, `${EMAIL}|`, `bad@@example.test|${PASSWORD}`,
+      `${RAW}\0`, `${RAW}\nSYNTHETIC-ONE@EXAMPLE.TEST|${PASSWORD}`,
+      `${EMAIL}----${PASSWORD}----synthetic-invalid-recovery`,
+      `${EMAIL}----${PASSWORD}----${RECOVERY_EMAIL}----http://verification.example.invalid/?token=synthetic-verification-secret`,
+      `${EMAIL}----${PASSWORD}----no----https://gapi.mailsapi.com/google/login?uid=synthetic-google-link-secret&extra=1`,
+      `${RAW}\nsynthetic-invalid-second-line-${SYNTHETIC_TOKEN}`,
+    ];
+    for (const body of [...malformed.map(raw => ({ raw })), { raw: RAW, manual: true }, undefined, null, {}]) {
+      const response = await route(router, { method: 'POST', url: '/preview', body });
+      assert.equal(response.status, 400);
+      assert.deepEqual(Object.keys(response.body).sort(), ['message', 'ok']);
+      assert.equal(response.body.ok, false);
+      assert.equal(typeof response.body.message, 'string');
+      assert.ok(response.body.message.length > 0);
+      assert.equal(response.headers['cache-control'], 'no-store');
+      if (body) assert.equal(Object.hasOwn(body, 'raw'), false);
+      assertPreviewRedacted(response, [EMAIL, 'bad@@example.test', 'synthetic-invalid-recovery']);
+    }
+  });
+
+  test('route: preview and batches reject non-boolean manual before manager resolution and erase raw', async t => {
+    const router = readOnlyRouteFixture(t);
+    for (const url of ['/preview', '/batches']) {
+      for (const manual of [null, 'true', 'false', '', 0, 1, [], {}, [true], SYNTHETIC_TOKEN]) {
+        const body = { raw: RAW, manual };
+        const response = await route(router, { method: 'POST', url, body });
+        assert.equal(response.status, 400);
+        assert.deepEqual(response.body, { ok: false, message: '登录方式无效' });
+        assert.equal(response.headers['cache-control'], 'no-store');
+        assert.equal(Object.hasOwn(body, 'raw'), false);
+        assertPreviewRedacted(response, [EMAIL]);
+      }
+    }
+  });
+
+  test('route: batches forwards manual booleans and authenticated owner, erases raw and redacts audit', async () => {
     const calls = [];
     const batch = { id: 'synthetic-batch-id', status: 'running', items: [{ email: EMAIL, status: 'queued' }] };
     const manager = {
       current(ownerId) { calls.push(['current', ownerId]); return batch; },
-      create(raw, ownerId) { calls.push(['create', raw, ownerId]); return batch; },
+      create(raw, ownerId, options) { calls.push(['create', raw, ownerId, options]); return batch; },
       async action(id, ownerId, action) { calls.push(['action', id, ownerId, action]); return batch; },
     };
     const router = createGoogleLoginRouter(() => manager);
-    const body = { raw: RAW, ownerId: otherUser.id };
-    const created = await route(router, { method: 'POST', url: '/batches', body });
-    assert.equal(created.status, 201);
-    assert.equal(Object.hasOwn(body, 'raw'), false);
-    assert.equal(created.headers['cache-control'], 'no-store');
+    for (const options of [{}, { manual: false }, { manual: true }]) {
+      const body = { raw: options.manual ? EMAIL : RAW, ownerId: otherUser.id, ...options };
+      const created = await route(router, { method: 'POST', url: '/batches', body });
+      assert.equal(created.status, 201);
+      assert.equal(Object.hasOwn(body, 'raw'), false);
+      assert.equal(created.headers['cache-control'], 'no-store');
+      assert.ok(!JSON.stringify(created.body).includes(PASSWORD));
+    }
     assert.equal((await route(router)).status, 200);
     assert.equal((await route(router, { method: 'POST', url: '/batches/synthetic-batch-id/action', body: { action: 'cancel', ownerId: otherUser.id } })).status, 200);
-    assert.deepEqual(calls, [ ['create', RAW, ownerUser.id], ['current', ownerUser.id], ['action', batch.id, ownerUser.id, 'cancel'] ]);
+    assert.deepEqual(calls, [
+      ['create', RAW, ownerUser.id, { manual: false }],
+      ['create', RAW, ownerUser.id, { manual: false }],
+      ['create', EMAIL, ownerUser.id, { manual: true }],
+      ['current', ownerUser.id], ['action', batch.id, ownerUser.id, 'cancel'],
+    ]);
     const logs = db.prepare('SELECT * FROM audit_logs ORDER BY id').all();
-    assert.equal(logs.length, 2);
+    assert.equal(logs.length, 4);
     for (const log of logs) assert.equal(log.user_id, ownerUser.id);
     assert.ok(!JSON.stringify(logs).includes(PASSWORD));
-    assert.ok(!JSON.stringify(created.body).includes(PASSWORD));
   });
 
   test('route: remote peer rejected even with forged loopback forwarded header; loopback forms accepted', async () => {

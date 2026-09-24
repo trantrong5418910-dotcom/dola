@@ -1,31 +1,61 @@
 <template>
-  <el-button type="primary" plain :disabled="!!busy" @click="openDialog">Google 登录入池</el-button>
+  <el-button type="primary" plain :disabled="!!busy" @click="openDialog">账号登录入池</el-button>
 
   <el-dialog
-    v-model="visible" title="Google 批量登录入池" width="min(860px, 94vw)"
+    v-model="visible" title="账号导入与独立登录" width="min(860px, 94vw)"
     append-to-body destroy-on-close :close-on-click-modal="false"
   >
     <el-alert type="info" :closable="false" show-icon>
-      <template #title>强制 IP 代理 · 慢速逐字输入 · 每批最多 20 个账号</template>
+      <template #title>强制 IP 代理 · 独立登录窗口 · 每批最多 20 个账号</template>
       <div class="help">
         已有账号沿用已绑定代理；没有代理的账号从现有 IPWeb 配置分配固定独立会话。先检查代理，再逐字输入邮箱和密码。
         代理缺失或不可用会停止，绝不退回直连。每个账号使用独立窗口，窗口会在后台所在电脑弹出。
-        经你授权，核验成功的会话会按账号独立保存在本机（不保存密码），最多复用 7 天；先通过原代理核验会话，有效则不重复输入密码。
-        遇到验证码或安全限制会停止自动填写并暂停后续账号，当前窗口最多保留 10 分钟；超时会清除剩余密码，不自动换号重试。
+        <details class="login-notes"><summary>会话保存、验证码与超时说明</summary>
+        新会话加密保存于本机 DolaLogin/encrypted-sessions，旧会话目录只兼容读取、不自动迁移；不保存密码，最多复用 7 天，复用前仍核验原代理与身份。
+        加密范围是新会话备份，号池数据库仍沿用现有 Cookie 存储格式。
+        邮件验证码与 Google Authenticator 动态码分别识别，仅在账号和输入框均确认后取码填写。
+        动态码最多取码 3 次、提交 2 个不同码，刷新至少间隔 15 秒，总等待不超过 90 秒；同一个码不会重复提交。
+        遇到图形验证码、安全限制或取码失败会停止自动填写并暂停后续账号，当前窗口最多保留 10 分钟；超时清除剩余凭据，不自动换号重试。
         完成当前步骤后点击「我已完成，检查登录」，结束当前账号后才可明确继续剩余账号。
         系统不会绕过验证，也不保证免验证。只有后端验证成功的账号才会入池。
+        </details>
       </div>
     </el-alert>
 
     <el-form v-if="!activeBatch" label-position="top" class="credentials" @submit.prevent="createBatch">
-      <el-form-item label="Google 账号（每行：邮箱|密码）">
+      <el-form-item label="登录方式">
+        <el-radio-group v-model="loginMode" :disabled="!!busy" @change="clearPreview">
+          <el-radio-button value="auto">自动识别账号格式</el-radio-button>
+          <el-radio-button value="manual">独立窗口手动登录</el-radio-button>
+        </el-radio-group>
+      </el-form-item>
+      <div v-if="loginMode === 'auto'" class="help formats">
+        每行一条，第一段始终作为账号显示；导入后分配稳定编号 [A01]、[A02]…，重复导入不会换号。
+        <div><code>主邮箱|密码</code> 或 <code>主邮箱----密码----恢复邮箱</code></div>
+        <div><code>主邮箱----密码----no----谷歌已登录链接</code></div>
+        <div><code>主邮箱----密码----恢复邮箱----验证码接口</code></div>
+        谷歌链接仅接受 https://gapi.mailsapi.com/google/login?uid=…；验证码接口默认只接受公网域名 HTTPS。
+        HTTP、公网 IP、非标准端口必须匹配管理员配置的取码服务路径白名单；不会开放任意地址。
+        HTTP 会明文传输取码链接中的秘密及验证码，仅在信任服务并接受该风险时使用，推荐 HTTPS。
+        Google 链接会在独立代理窗口访问该第三方服务，不向它填写账号密码；如不信任服务提供方，请选择手动登录。
+      </div>
+      <div v-else class="help formats">每行填写一个用于标注的主邮箱，无需密码。系统会打开普通 Chrome 独立窗口；请你本人在其中选择手机号或邮箱完成登录。后台不自动填写、不点击 Google 登录步骤，只核验 Dola 回调后的真实会话身份。手动标签不代表上游邮箱绑定已核实。</div>
+      <el-form-item :label="loginMode === 'manual' ? '账号标注邮箱（每行一个）' : '账号列表（支持两段、三段、四段格式）'">
         <el-input
           v-model="raw" type="textarea" :rows="6" :disabled="!!busy || !restored"
+          :class="{ 'secret-input': !showInput }" @input="previewItems = []"
           autocomplete="off" autocapitalize="off" :spellcheck="false"
-          placeholder="alice@example.com|示例密码&#10;bob@example.com|示例密码"
-          aria-label="Google 账号，每行邮箱竖线密码"
+          :placeholder="loginMode === 'manual' ? 'alice@example.com' : 'alice@example.com|示例密码'"
+          aria-label="账号列表，包含敏感凭据，请勿共享截图"
         />
       </el-form-item>
+      <el-checkbox v-model="showInput">显示输入内容（含敏感信息）</el-checkbox>
+      <el-button size="small" :loading="busy === 'preview-format'" :disabled="!!busy || !restored || !accountCount" @click="previewFormat">检查格式，不启动登录</el-button>
+      <el-table v-if="previewItems.length" :data="previewItems" size="small" border class="format-preview">
+        <el-table-column prop="email" label="主邮箱" min-width="190" />
+        <el-table-column label="识别方式" min-width="150"><template #default="{ row }">{{ methodLabels[row.loginMethod] }}</template></el-table-column>
+        <el-table-column label="附加信息" min-width="150"><template #default="{ row }">{{ row.hasVerificationUrl ? '邮件 / 验证器取码接口' : row.hasRecoveryEmail ? '恢复邮箱' : '—' }}</template></el-table-column>
+      </el-table>
       <div class="help">
         已填写 {{ accountCount }} / 20 个账号，空行忽略。输入仅保存在当前页面内存中，不写入浏览器本地存储；
         提交成功、关闭弹窗或离开页面时会清空。
@@ -40,7 +70,7 @@
     </div>
     <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon class="error" />
 
-    <section v-if="batch" class="batch" aria-label="Google 登录批次进度">
+    <section v-if="batch" class="batch" aria-label="账号登录批次进度">
       <div class="batch-head">
         <el-tag :type="['waiting_user', 'paused'].includes(batch.status) ? 'warning' : 'info'">{{ batchLabels[batch.status] }}</el-tag>
         <span>批次 {{ batch.id }}</span>
@@ -49,6 +79,7 @@
       <p class="help">已处理 {{ finishedCount }} / {{ batch.items.length }} · 成功入池 {{ succeededCount }} · 失败 {{ failedCount }}</p>
       <el-progress :percentage="progress" />
       <p v-if="activeBatch && currentItem" class="help">当前账号：{{ currentItem.email }}</p>
+      <p v-if="activeBatch && currentItem && !waitingForUser && !terminalItems.has(currentItem.status)" class="help" role="status">{{ currentItem.message }}</p>
       <el-alert
         v-if="waitingForUser" type="warning" :closable="false" show-icon class="waiting"
         :title="currentItem?.message || '请查看登录窗口的当前步骤，再点击下方检查登录。'"
@@ -57,6 +88,7 @@
         title="本批曾遇到安全验证，当前窗口已结束，剩余账号仍暂停。确认后才会继续；从首次验证起满 10 分钟仍未继续，将清除剩余密码。" />
       <el-table :data="batch.items" border class="items">
         <el-table-column type="index" label="#" width="48" />
+        <el-table-column label="稳定编号" width="90"><template #default="{ row }">{{ row.accountCode ? `[${row.accountCode}]` : '—' }}</template></el-table-column>
         <el-table-column prop="email" label="邮箱" min-width="190" show-overflow-tooltip />
         <el-table-column label="状态" width="125">
           <template #default="{ row }">
@@ -102,6 +134,11 @@ const emit = defineEmits(['completed']);
 const endpoint = '/api/dola/google-login/batches';
 const visible = ref(false);
 const raw = ref('');
+const loginMode = ref('auto');
+const showInput = ref(false);
+const previewItems = ref([]);
+const methodLabels = { password: 'Google 密码登录', google_link: 'Google 已登录链接', manual: '独立窗口手动登录' };
+function clearPreview() { raw.value = ''; previewItems.value = []; showInput.value = false; error.value = ''; }
 const batch = ref(null);
 const busy = ref('');
 const restored = ref(false);
@@ -164,9 +201,9 @@ function acceptBatch(next) {
   // 只保留约定的进度字段，不缓存接口可能附带的原始账号输入。
   batch.value = next === null ? null : {
     id: next.id, status: next.status, currentIndex: next.currentIndex, createdAt: next.createdAt,
-    items: next.items.map(({ email, status, message, accountId }) => ({ email, status, message, accountId })),
+    items: next.items.map(({ email, status, message, accountId, accountCode, loginMethod }) => ({ email, status, message, accountId, accountCode, loginMethod })),
   };
-  if (activeBatch.value) raw.value = '';
+  if (activeBatch.value) { raw.value = ''; previewItems.value = []; showInput.value = false; }
   if (next && ['done', 'cancelled'].includes(next.status) && !notifiedBatches.has(next.id)) {
     notifiedBatches.add(next.id);
     emit('completed');
@@ -211,14 +248,27 @@ function openDialog() {
 function validateRaw() {
   const lines = raw.value.split(/\r?\n/).filter((line) => line.trim());
   if (!lines.length || lines.length > 20) return '每批请输入 1–20 个账号，空行不计入数量。';
-  for (let i = 0; i < lines.length; i += 1) {
-    const separator = lines[i].indexOf('|');
-    const email = lines[i].slice(0, separator).trim();
-    if (separator < 1 || !/^[^\s@|]+@[^\s@|]+\.[^\s@|]+$/.test(email) || !lines[i].slice(separator + 1).trim()) {
-      return `第 ${i + 1} 个账号格式有误，请使用「邮箱|密码」，两项均不能为空。`;
-    }
-  }
   return '';
+}
+
+async function inspectFormat() {
+  try {
+    const response = await api.post('/api/dola/google-login/preview', { raw: raw.value, manual: loginMode.value === 'manual' }, { silent: true });
+    if (disposed || !visible.value) return false;
+    if (response?.ok !== true || !Array.isArray(response.items)) throw new Error('invalid preview');
+    previewItems.value = response.items.map(({ email, loginMethod, hasRecoveryEmail, hasVerificationUrl }) => ({ email, loginMethod, hasRecoveryEmail, hasVerificationUrl }));
+    return true;
+  } catch (e) {
+    if (disposed || !visible.value) return false;
+    previewItems.value = [];
+    if (e.status === 400) { error.value = e.message; return false; }
+    throw e;
+  }
+}
+function previewFormat() {
+  const problem = validateRaw();
+  if (problem) { error.value = problem; return; }
+  return withRequest('preview-format', inspectFormat, '格式检查失败，未启动登录；请稍后再试。');
 }
 
 function createBatch() {
@@ -226,6 +276,7 @@ function createBatch() {
   const problem = validateRaw();
   if (problem) { error.value = problem; return; }
   return withRequest('create', async () => {
+    if (!await inspectFormat() || disposed || !visible.value) return;
     // 同一页面串行提交；提交前恢复其他页面可能创建的批次。跨页面的原子互斥由后端保证。
     const current = await api.get(`${endpoint}/current`, { silent: true });
     if (disposed || !visible.value) return;
@@ -234,8 +285,8 @@ function createBatch() {
       error.value = '已有批次正在进行，已恢复其进度，请先完成或取消该批次。';
       return;
     }
-    const response = await api.post(endpoint, { raw: raw.value }, { silent: true });
-    if (response?.ok === true) raw.value = '';
+    const response = await api.post(endpoint, { raw: raw.value, manual: loginMode.value === 'manual' }, { silent: true });
+    if (response?.ok === true) { raw.value = ''; previewItems.value = []; showInput.value = false; }
     if (disposed) return;
     acceptBatch(readBatch(response));
   }, '提交结果未确认。请先点击「刷新当前批次」恢复后台状态，再决定是否重新提交。');
@@ -262,7 +313,7 @@ function loadPreview() {
 
 watch(visible, (open) => {
   if (!open) {
-    raw.value = '';
+    clearPreview();
     loginPreview.value = '';
     error.value = '';
     restored.value = false;
@@ -272,7 +323,7 @@ watch(visible, (open) => {
 
 onBeforeUnmount(() => {
   disposed = true;
-  raw.value = '';
+  clearPreview();
   loginPreview.value = '';
   batch.value = null;
   stopPolling();
@@ -284,6 +335,12 @@ onBeforeUnmount(() => {
 .credentials { margin-top: 18px; }
 .credentials :deep(.el-form-item) { margin-bottom: 8px; }
 .credentials :deep(textarea) { font-family: monospace; }
+.secret-input :deep(textarea) { -webkit-text-security: disc; }
+.formats { margin-bottom: 12px; }
+.login-notes { margin-top: 4px; }
+.login-notes summary { cursor: pointer; color: var(--el-color-primary); }
+.formats code { white-space: normal; }
+.format-preview { margin: 12px 0; }
 .status-toolbar, .batch-head { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 .status-toolbar { justify-content: space-between; margin: 16px 0; }
 .batch-head { overflow-wrap: anywhere; }

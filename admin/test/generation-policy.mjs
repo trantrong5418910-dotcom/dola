@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   normalizeVideoDuration, requireGenerationProxy, hasLiveSession,
-  isNativeThirtySecondRequest, isActiveGenerationStatus, validateArchivedVideo,
+  isNativeVideoRequest, isNativeThirtySecondRequest, isActiveGenerationStatus, validateArchivedVideo, hasConfirmedZeroVideoQuota,
+  isVerifiedNativeCapability,
 } from '../server/dola/generation-policy.js';
 
 test('duration defaults and explicit/native 30s normalize to one contract', () => {
@@ -63,6 +64,17 @@ test('live login requires successful response and identity, never a paid tier', 
 const body = (model, duration) => JSON.stringify({ chat_ability: {
   ability_type: 17, ability_param: JSON.stringify({ model, duration }),
 } });
+
+test('only fresh explicit zero quota blocks admission; never infer zero from missing or stale data', () => {
+  const at = '2026-09-20T12:00:00.000Z';
+  const account = { quota_remaining: 0, quota_source: 'generation_receipt', quota_at: '2026-09-20T11:00:00.000Z' };
+  assert.equal(hasConfirmedZeroVideoQuota(account, at), true);
+  for (const changed of [{ quota_remaining: null }, { quota_remaining: 1 }, { quota_remaining: '0' },
+    { quota_at: '2026-09-19T23:00:00.000Z' }, { quota_at: '2026-09-20T13:00:00.000Z' }, { quota_source: 'unknown' }]) {
+    assert.equal(hasConfirmedZeroVideoQuota({ ...account, ...changed }, at), false);
+  }
+  assert.equal(hasConfirmedZeroVideoQuota(null, at), false);
+});
 test('native 30s guard accepts only explicit matching model/duration and never changes payload', () => {
   const native = body('seedance_v2.5', 30);
   assert.equal(isNativeThirtySecondRequest(native), true);
@@ -82,11 +94,43 @@ test('native 20s guard accepts the same model with an explicit 20s duration', as
   assert.equal(isNativeVideoRequest(body('other-model', 20), 20), false);
 });
 
+test('wire guard cannot use prompt or arbitrary metadata as proof of a video request', () => {
+  const video = JSON.parse(body('seedance_v2.5', 10));
+  for (const input of [{ prompt: video }, { content: video }, { metadata: video },
+    { messages: [{ content: video }] }, { unrelated_ability: video }]) {
+    assert.equal(isNativeVideoRequest(JSON.stringify(input), 10), false);
+  }
+  assert.equal(isNativeVideoRequest(JSON.stringify({ ...video, prompt: { chat_ability: { ability_type: 999 } } }), 10), true);
+});
+
+test('wire guard rejects multi-video requests, malformed abilities and excessive nesting', () => {
+  const video = JSON.parse(body('seedance_v2.5', 10));
+  assert.equal(isNativeVideoRequest(JSON.stringify({ list: [video, video] }), 10), false);
+  assert.equal(isNativeVideoRequest(body('seedance_v2.5', [10]), 10), false);
+  assert.equal(isNativeVideoRequest(JSON.stringify({ list: [video, { ability_type: 18 }] }), 10), false);
+  let nested = video;
+  for (let n = 0; n < 12; n++) nested = { payload: nested };
+  assert.equal(isNativeVideoRequest(JSON.stringify(nested), 10), false);
+});
+
 test('native 15s expert guard accepts only Seedance 2.0', async () => {
   const { isNativeVideoRequest } = await import('../server/dola/generation-policy.js');
   assert.equal(isNativeVideoRequest(body('seedance_v2.0', 15), 15, 'seedance_v2.0'), true);
   assert.equal(isNativeVideoRequest(body('seedance_v2.5', 15), 15, 'seedance_v2.0'), false);
   assert.equal(isNativeVideoRequest(body('seedance_v2.0', 10), 15, 'seedance_v2.0'), false);
+});
+
+test('preflight requires exact native duration/model evidence, not a shorter carrier rewrite', () => {
+  for (const seconds of [10, 15, 20, 30]) {
+    const good = { ok: true, state: 'available', seconds, uiSeconds: seconds, native: true,
+      rewriteCarrier: false, model: seconds === 15 ? 'seedance_v2.0' : 'seedance_v2.5' };
+    assert.equal(isVerifiedNativeCapability(good, seconds), true);
+    assert.equal(isVerifiedNativeCapability({ ...good, uiSeconds: 10, native: false, rewriteCarrier: true }, seconds), false);
+    assert.equal(isVerifiedNativeCapability({ ...good, model: 'seedance_v2.0' }, seconds), seconds === 15);
+    assert.equal(isVerifiedNativeCapability({ ...good, state: 'adapter_only' }, seconds), false);
+    assert.equal(isVerifiedNativeCapability({ ...good, seconds: seconds + 1 }, seconds), false);
+  }
+  assert.equal(isVerifiedNativeCapability({ ok: true, state: 'available', seconds: 10, model: 'seedance_v2.5' }, 10), false);
 });
 
 test('archive and independently measured duration are both necessary', () => {

@@ -11,6 +11,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { hashPassword } from './auth.js';
 import { generateTokenValue, generateCardCode, insertMany, makeBatchNo } from './generate.js';
+import { GENERATION_GUARD_SCHEMA } from './dola/generation-guards.js';
+import { SUBMISSION_JOURNAL_SCHEMA } from './dola/submission-journal.js';
+import { LOGIN_REGISTRY_SCHEMA } from './dola/account-login-registry.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const DATA_DIR = path.join(HERE, 'data');
@@ -279,6 +282,7 @@ CREATE TABLE IF NOT EXISTS dola_videos (
   -- 参考图只存开关与数量；文件在 data/reference-uploads/<id>/，不进 SQLite。
   has_reference_images INTEGER NOT NULL DEFAULT 0,
   reference_image_count INTEGER NOT NULL DEFAULT 0,
+  strict_account  INTEGER NOT NULL DEFAULT 0,  -- 锁定账号验收：限流/冷却时不自动换号
   created_by        INTEGER,
   created_at        TEXT NOT NULL,
   updated_at        TEXT NOT NULL,
@@ -287,6 +291,34 @@ CREATE TABLE IF NOT EXISTS dola_videos (
 CREATE INDEX IF NOT EXISTS idx_dv_owner ON dola_videos(owner_token_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_dv_status ON dola_videos(status, id);
 CREATE INDEX IF NOT EXISTS idx_dv_created ON dola_videos(created_at DESC);
+
+-- 素材库：后台统一维护的提示词素材（可带参考图），供运营批量创建时复用。
+-- images 存 JSON 数组 [{ mime, dataBase64 }]，与前台素材结构对齐。
+CREATE TABLE IF NOT EXISTS dola_materials (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT NOT NULL DEFAULT '',
+  prompt     TEXT NOT NULL DEFAULT '',
+  images     TEXT NOT NULL DEFAULT '[]',
+  created_by INTEGER,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dm_updated ON dola_materials(updated_at DESC);
+
+-- 上游限流事件：用于后台运营审计与冷却面板。
+-- 只记录码、账号/任务引用和人类可读说明，不保存 cookie 或完整代理凭据。
+CREATE TABLE IF NOT EXISTS dola_rate_limit_events (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  code           TEXT NOT NULL DEFAULT '710022002',
+  account_id     INTEGER,
+  video_id       INTEGER,
+  exit_ip        TEXT,
+  cooldown_until TEXT,
+  detail         TEXT NOT NULL DEFAULT '',
+  created_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dola_rl_created ON dola_rate_limit_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dola_rl_account ON dola_rate_limit_events(account_id, id DESC);
 `;
 
 export let db = null;
@@ -296,6 +328,9 @@ export async function initDb() {
   db = await openDatabase();
   db.exec(SCHEMA);
   migrate();
+  db.exec(GENERATION_GUARD_SCHEMA);
+  db.exec(SUBMISSION_JOURNAL_SCHEMA);
+  db.exec(LOGIN_REGISTRY_SCHEMA);
   seed();
   return db;
 }
@@ -332,6 +367,7 @@ function migrate() {
     ['dola_videos', 'is_unwatermarked', 'INTEGER NOT NULL DEFAULT 0'],
     ['dola_videos', 'has_reference_images', 'INTEGER NOT NULL DEFAULT 0'],
     ['dola_videos', 'reference_image_count', 'INTEGER NOT NULL DEFAULT 0'],
+    ['dola_videos', 'strict_account', 'INTEGER NOT NULL DEFAULT 0'],
   ];
   for (const [table, column, def] of ALTERS) {
     try {
@@ -391,7 +427,13 @@ function seed() {
     ['dola_use_browser', 'false', '查额度时使用浏览器通道（需装 playwright）', 'dola'],
     ['dola_browser_concurrency', '3', '浏览器通道并发数（吃内存，别调大）', 'dola'],
     ['dola_gen_concurrency', '1', '视频生成并发数（不同账号可并行，同账号自动排队）', 'dola'],
+    ['dola_gen_min_submit_interval_sec', '60', '同一出口 IP 两次浏览器提交的最小间隔（秒），缓解 710022002', 'dola'],
     ['dola_gen_queue_limit', '6000', '视频生成队列容量（排队+运行任务，不是浏览器同时并发数）', 'dola'],
+    ['dola_ratelimit_cooldown_min', '30', '上游限流后的账号冷却时间（分钟）', 'dola'],
+    ['dola_autorotate_max_attempts', '3', '上游限流后自动换号重试的最大账号数（含首次，1=不换号）', 'dola'],
+    ['dola_replenish_min_accounts', '5', '号池补号提示：有效账号低于此数时提示补号', 'dola'],
+    ['dola_replenish_min_quota', '30', '号池补号提示：已确认剩余额度低于此数时提示补号（0=关闭额度判据）', 'dola'],
+    ['dola_submit_mode', 'browser', '视频提交通道：browser=浏览器模拟提交（默认）/ scheme-a=Abort取签名+页内重放提交（实验）', 'dola'],
     ['dola_convert_auto_zero', 'false', '转换后把账号额度清零（仅记账，不代表真的扣了 dola）', 'dola'],
     ['dola_auto_maintenance_enabled', 'true', '自动巡检账号和可查额度', 'dola'],
     ['dola_auto_cleanup_invalid', 'true', '自动隔离明确失效账号（保留 cookie，不硬删除）', 'dola'],
@@ -404,7 +446,7 @@ function seed() {
     ['gateway_key', '7d4aaa02d7ce44a0e99ebebd7e8f34abe7e28c5ae49b1424', '网关共享密钥（用户端要用它调后台）', 'gateway'],
     // 前台入口
     ['frontend_name', '前台', '前台入口名称', 'frontend'],
-    ['frontend_url', '', '前台地址（含 http:// 或 https://）', 'frontend'],
+    ['frontend_url', 'http://127.0.0.1:8787/', '前台地址（含 http:// 或 https://）', 'frontend'],
     ['frontend_open_mode', 'tab', '打开方式：tab=新标签页 / browser=服务器上开真实浏览器', 'frontend'],
     ['frontend_browser_visible', 'true', '真实浏览器是否显示窗口（关闭=后台静默打开）', 'frontend'],
   ];
@@ -412,6 +454,11 @@ function seed() {
     const exist = db.prepare('SELECT key FROM settings WHERE key=?').get(k);
     if (!exist) db.prepare('INSERT INTO settings (key,value,label,group_name,updated_at) VALUES (?,?,?,?,?)').run(k, v, label, g, now());
   }
+  // 2026-09-24：前台默认地址改为 http://127.0.0.1:8787/（mvp 用户面）。
+  // 只补空值，不覆盖用户已填的自定义地址；服务每次启动都会执行，幂等。
+  db.prepare(`UPDATE settings SET value=?, updated_at=?
+    WHERE key='frontend_url' AND (value IS NULL OR value='')`)
+    .run('http://127.0.0.1:8787/', now());
 
   // 示例内容（让用户一进来就有东西看）
   const cCount = db.prepare('SELECT COUNT(*) AS c FROM contents').get().c;
@@ -451,6 +498,12 @@ function seed() {
 export function getSetting(key, fallback = null) {
   const row = db.prepare('SELECT value FROM settings WHERE key=?').get(key);
   return row ? row.value : fallback;
+}
+
+/** Update one existing setting without creating arbitrary keys. */
+export function setSetting(key, value) {
+  const t = now();
+  return db.prepare('UPDATE settings SET value=?, updated_at=? WHERE key=?').run(String(value), t, key);
 }
 
 // 直接执行时建库

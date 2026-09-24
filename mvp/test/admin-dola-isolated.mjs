@@ -41,6 +41,35 @@ function privateFieldsAbsent(value) {
   for (const key of ['url', 'raw', 'account', 'cookie', 'cookies', 'local_path', 'watermarkedUrl', 'unwatermarkedUrl']) assert.equal(Object.hasOwn(value, key), false, key);
 }
 
+async function ownerSnapshot(f, id) {
+  return {
+    ledger: await fs.readFile(f.ledgerFile, 'utf8'),
+    task: JSON.stringify(f.state.tasks.get(id)),
+    points: [...f.state.points.values()],
+    creates: f.state.creates,
+    refunds: f.state.refunds,
+  };
+}
+
+async function assertOwnerUnchanged(f, id, before) {
+  const ledgerText = await fs.readFile(f.ledgerFile, 'utf8');
+  // Compare privately: assertion diagnostics must never print stored credentials.
+  assert.ok(ledgerText === before.ledger, 'Rejected delete must not rewrite the ownership/hidden ledger');
+  assert.ok(JSON.stringify(f.state.tasks.get(id)) === before.task, 'Rejected delete must not mutate the gateway task');
+  assert.deepEqual([...f.state.points.values()], before.points);
+  assert.equal(f.state.creates, before.creates);
+  assert.equal(f.state.refunds, before.refunds);
+  const ledger = JSON.parse(ledgerText);
+  assert.equal(ledger.tasks[id]?.tokenId, 1);
+  assert.equal(Object.hasOwn(ledger.hidden, id), false);
+  const status = await request(f, `/api/tasks/${id}`);
+  assert.equal(status.status, 200);
+  assert.equal(status.body.status, 'succeeded');
+  const listing = await request(f, '/api/tasks');
+  assert.equal(listing.status, 200);
+  assert.ok(listing.body.items.some(task => String(task.id) === String(id)), 'Owner must still see the task');
+}
+
 test('gate stays closed: no create, no billing; health declares unsupported images', async (t) => {
   const f = await fixture(t, { gate: false });
   const health = await request(f, '/api/health');
@@ -178,7 +207,67 @@ test('auth and owner isolation cover list, status, media, download and cancel', 
   for (const suffix of ['', '/media', '/download']) {
     assert.equal((await request(f, `/api/tasks/${created.taskId}${suffix}`, { headers: headers(USER_B) })).status, 404);
   }
+  const before = await ownerSnapshot(f, created.taskId);
   assert.equal((await request(f, `/api/tasks/${created.taskId}`, { method: 'DELETE', headers: headers(USER_B) })).status, 404);
+  await assertOwnerUnchanged(f, created.taskId, before);
+});
+
+test('admin-dola cancel auth, gateway and timeout errors never forget or hide owner state', async (t) => {
+  for (const [name, status, code] of [
+    ['unauthorized', 401], ['forbidden', 403], ['gateway-unavailable', 503],
+    ['timeout', 504, 'GATEWAY_TIMEOUT'], ['transport-error', undefined],
+  ]) {
+    await t.test(name, async (t) => {
+      const f = await fixture(t);
+      const { body: created } = await create(f);
+      await ready(f, created.taskId);
+      const before = await ownerSnapshot(f, created.taskId);
+      const cancel = t.mock.method(f.gateway.generation, 'cancel', async ({ token, taskId }) => {
+        assert.ok(token === USER_A, 'Cancellation must use the requesting owner identity');
+        assert.equal(taskId, created.taskId);
+        throw Object.assign(new Error('Synthetic cancel failure'), { status, code });
+      });
+      const result = await request(f, `/api/tasks/${created.taskId}`, { method: 'DELETE' });
+      assert.equal(result.status, status ?? 500);
+      assert.equal(result.body.ok, false);
+      assert.equal(cancel.mock.callCount(), 1, 'Do not retry ambiguous cancellation');
+      await assertOwnerUnchanged(f, created.taskId, before);
+    });
+  }
+});
+
+test('successful owner cancellation still hides only the requested task', async (t) => {
+  const f = await fixture(t);
+  const { body: created } = await create(f);
+  const { body: other } = await create(f);
+  await ready(f, created.taskId);
+  const result = await request(f, `/api/tasks/${created.taskId}`, { method: 'DELETE' });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.ok, true);
+  assert.equal(f.state.tasks.get(created.taskId).status, 'cancelled');
+  const ledger = JSON.parse(await fs.readFile(f.ledgerFile, 'utf8'));
+  assert.equal(Object.hasOwn(ledger.tasks, created.taskId), false);
+  assert.equal(Object.hasOwn(ledger.hidden, created.taskId), true);
+  assert.equal(ledger.tasks[other.taskId]?.tokenId, 1);
+  assert.equal(Object.hasOwn(ledger.hidden, other.taskId), false);
+  assert.equal((await request(f, `/api/tasks/${created.taskId}`)).status, 404);
+  const listing = await request(f, '/api/tasks');
+  assert.deepEqual(listing.body.items.map(task => String(task.id)), [other.taskId]);
+});
+
+test('legacy provider delete errors preserve the existing local-hide behavior', async (t) => {
+  const f = await fixture(t, { provider: 'mock', createClient: () => ({
+    login: async () => {}, getBalance: async () => 100,
+    createTask: async () => ({ taskId: 'synthetic-legacy-delete' }),
+    deleteTask: async () => { throw new Error('Synthetic legacy delete unavailable'); },
+  }) });
+  const { body: created } = await create(f);
+  const result = await request(f, `/api/tasks/${created.taskId}`, { method: 'DELETE' });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.ok, true);
+  const ledger = JSON.parse(await fs.readFile(f.ledgerFile, 'utf8'));
+  assert.equal(Object.hasOwn(ledger.tasks, created.taskId), false);
+  assert.equal(Object.hasOwn(ledger.hidden, created.taskId), true);
 });
 
 test('confirmed failed wait is explicit; admin remains billing authority', async (t) => {
@@ -270,6 +359,19 @@ test('create uses its own longer deadline; timeout is ambiguous and is never ret
   const short = createGateway({ url: f.gatewayUrl, key: FIXTURE_KEY, createTimeout: 10, fetchImpl: guardedFetch });
   await assert.rejects(short.generation.create({ token: USER_A, prompt: 'synthetic', seconds: 30, forceSeconds: 30 }), { code: 'GATEWAY_CREATE_TIMEOUT', status: 504 });
   assert.equal(f.state.creates, 2);
+});
+
+test('frontend create timeout outlasts the gateway creation budget', async () => {
+  const source = await fs.readFile(new URL('../web/index.html', import.meta.url), 'utf8');
+  // Read the exact create call without executing the page or making a request.
+  const calls = [...source.matchAll(/\bapi\(\s*(['"])\/api\/tasks\1\s*,\s*\{([^{}]*)/g)];
+  const createCalls = calls.filter(([, , options]) => /\bmethod\s*:\s*(['"])POST\1/.test(options));
+  assert.equal(createCalls.length, 1, 'Locate the single frontend POST /api/tasks request');
+  const match = /\btimeoutMs\s*:\s*([\d_]+)\b/.exec(createCalls[0][2]);
+  assert.ok(match, 'Frontend create must set an explicit numeric deadline');
+  const frontendTimeout = Number(match[1].replaceAll('_', ''));
+  assert.ok(frontendTimeout > CREATE_TIMEOUT_MS,
+    `Frontend create budget (${frontendTimeout}ms) must exceed gateway budget (${CREATE_TIMEOUT_MS}ms)`);
 });
 
 test('legacy wait only refunds a confirmed terminal failure, not local errors', async (t) => {

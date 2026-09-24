@@ -6,7 +6,9 @@
  */
 import { isGatewayArchiveUrl, parseMediaUrl } from './media-url.js';
 
-export const CREATE_TIMEOUT_MS = 90_000;
+// Profile verification + bounded 120s browser admission must finish before the
+// client gives up. This is not a retry allowance and cannot trigger resubmission.
+export const CREATE_TIMEOUT_MS = 180_000;
 
 export function createGateway({ url = '', key = '', timeout = 15000, createTimeout = CREATE_TIMEOUT_MS, mediaTimeout = 90_000, fetchImpl = globalThis.fetch } = {}) {
   const base = String(url || '').replace(/\/+$/, '');
@@ -105,17 +107,40 @@ export function createTaskLedger(file) {
   const dir = path.dirname(file);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-  let data = { tasks: {} };
+  let data = { tasks: {}, hidden: {} };
   try {
     if (fs.existsSync(file)) data = JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch { data = { tasks: {} }; }
+  } catch (e) {
+    // 读到坏文件时不能静默重置：账本是「哪个 task 属于哪个令牌」的唯一依据，
+    // 重置等于所有用户的任务列表集体消失。至少要把原因喊出来。
+    console.error(`[ledger] 读取失败，按空账本继续（原文件保留，未覆盖）：${file}`, e?.message || e);
+    data = { tasks: {}, hidden: {} };
+  }
   if (!data.tasks) data.tasks = {};
+  if (!data.hidden) data.hidden = {};
 
   let dirty = false;
+  let writeFailures = 0;
   const flush = () => {
     if (!dirty) return;
     dirty = false;
-    try { fs.writeFileSync(file, JSON.stringify(data)); } catch { /* 忽略写失败，别影响主流程 */ }
+    try {
+      // 原子写：先写临时文件再 rename。
+      // 直接 writeFileSync(file) 一旦在写一半时崩溃，会留下截断的 JSON，
+      // 下次启动被上面的 catch 判成坏文件 → 账本清零（fail-closed，用户列表全空）。
+      // 同目录 rename 在 POSIX 下是原子的，要么旧要么新，不会出现半截文件。
+      const tmp = `${file}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(data));
+      fs.renameSync(tmp, file);
+      writeFailures = 0;
+    } catch (e) {
+      // 不抛：不能因为记账失败就拖垮请求主流程。但必须吵，别静默吞。
+      dirty = true; // 保持脏标记，下一轮 interval 再试
+      writeFailures++;
+      if (writeFailures === 1 || writeFailures % 60 === 0) {
+        console.error(`[ledger] 写入失败（第 ${writeFailures} 次，会持续重试）：${file}`, e?.message || e);
+      }
+    }
   };
   const timer = setInterval(flush, 1000);
   timer.unref?.();
@@ -138,5 +163,9 @@ export function createTaskLedger(file) {
     },
     belongsTo(taskId, tokenId) { const v = data.tasks[String(taskId)]; return Boolean(v && v.tokenId === tokenId); },
     forget(taskId) { delete data.tasks[String(taskId)]; dirty = true; flush(); },
+    /** 工作台「删除」：admin-dola 列表以网关为准，本地账本 forget 不够，需显式隐藏 */
+    hide(taskId) { data.hidden[String(taskId)] = { at: new Date().toISOString() }; dirty = true; flush(); },
+    isHidden(taskId) { return Boolean(data.hidden[String(taskId)]); },
+    unhide(taskId) { delete data.hidden[String(taskId)]; dirty = true; flush(); },
   };
 }

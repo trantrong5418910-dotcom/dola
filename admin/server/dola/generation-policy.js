@@ -1,6 +1,15 @@
 /** Pure generation guards. No database, browser, account files or network access. */
+import { quotaObservation } from './account-observations.js';
 const badRequest = message => Object.assign(new Error(message), { status: 400 });
 export const SUPPORTED_VIDEO_SECONDS = Object.freeze([10, 15, 20, 30]);
+
+/** Only a fresh explicit receipt may prove zero quota. Unknown/stale is not zero;
+ * positive quota is not proof that it covers a particular model's price.
+ */
+export function hasConfirmedZeroVideoQuota(account, at = new Date().toISOString()) {
+  const observation = quotaObservation(account || {}, at);
+  return observation.state === 'confirmed' && observation.remaining === 0;
+}
 
 function duration(value) {
   if (!['number', 'string'].includes(typeof value) || String(value).trim() === '') {
@@ -47,6 +56,27 @@ export function hasLiveSession(profile) {
 }
 
 /**
+ * A page probe is admission evidence only when it proves the requested native
+ * duration itself. A shorter UI carrier plus a request rewrite is useful
+ * diagnostics, but it is not proof that the upstream accepts the target
+ * duration and must not create/charge a task.
+ */
+export function isVerifiedNativeCapability(result, seconds) {
+  const target = Number(seconds);
+  if (!SUPPORTED_VIDEO_SECONDS.includes(target) || !result || result.ok !== true
+      || result.state !== 'available' || result.seconds !== target) return false;
+  // 20/30 秒走改写路径：20s 载体 10s，30s 载体 15s（2 额度档），rewriteCarrier=true 即为有效
+  if (target === 20 || target === 30) {
+    const expectCarrier = target === 30 ? 15 : 10;
+    if (result.uiSeconds !== expectCarrier || result.native !== false || result.rewriteCarrier !== true) return false;
+  } else {
+    if (result.uiSeconds !== target || result.native !== true || result.rewriteCarrier !== false) return false;
+  }
+  const model = target === 15 ? 'seedance_v2.0' : 'seedance_v2.5';
+  return result.model === model;
+}
+
+/**
  * Validate one Seedance 2.5 / native duration generation request. This checks request shape,
  * not subscription, server acceptance or output duration; those are different facts.
  */
@@ -56,23 +86,35 @@ export function isNativeVideoRequest(body, expectedSeconds, targetModel = 'seeda
     if (!SUPPORTED_VIDEO_SECONDS.includes(seconds)) return false;
     if (typeof body !== 'string' || !body || body.length > 1024 * 1024) return false;
     const abilities = [];
+    const envelopes = new Set(['chat_ability', 'ability', 'abilities', 'payload', 'data',
+      'message', 'messages', 'body', 'params', 'param', 'request', 'requests', 'list']);
+    let visited = 0, decoded = body.length;
+    const decode = text => {
+      decoded += text.length;
+      if (decoded > 2 * 1024 * 1024) throw new RangeError('Request budget exceeded');
+      return JSON.parse(text);
+    };
     const visit = (value, depth = 0) => {
-      if (!value || typeof value !== 'object' || depth > 8) return;
-      if (Number(value.ability_type) === 17) {
+      if (++visited > 4096 || depth > 8) throw new RangeError('Request budget exceeded');
+      if (typeof value === 'string') { visit(decode(value), depth + 1); return; }
+      if (!value || typeof value !== 'object') return;
+      if (Array.isArray(value)) { for (const item of value) visit(item, depth + 1); return; }
+      if (Object.hasOwn(value, 'ability_type') || Object.hasOwn(value, 'ability_param')) {
+        if (![17, '17'].includes(value.ability_type)) throw new TypeError('Unexpected ability');
         const param = typeof value.ability_param === 'string'
-          ? JSON.parse(value.ability_param) : value.ability_param;
+          ? decode(value.ability_param) : value.ability_param;
         abilities.push(param);
+        return; // Never interpret a prompt/reference/metadata inside the parameters.
       }
       for (const [key, child] of Object.entries(value)) {
-        if (child && typeof child === 'object') visit(child, depth + 1);
-        else if (typeof child === 'string' && /ability|payload|data|message/i.test(key)) {
-          try { visit(JSON.parse(child), depth + 1); } catch { /* Plain text is not an ability. */ }
-        }
+        if (envelopes.has(key)) visit(child, depth + 1);
       }
     };
     visit(JSON.parse(body));
-    return abilities.length > 0 && abilities.every(param => param?.model === targetModel
-      && Number(param.duration) === seconds);
+    // One request must not silently turn into a multi-video batch. Duration must
+    // be an explicit scalar, never JS-coerced true/[10] or an object.
+    return abilities.length === 1 && abilities.every(param => param?.model === targetModel
+      && ['number', 'string'].includes(typeof param.duration) && Number(param.duration) === seconds);
   } catch { return false; }
 }
 

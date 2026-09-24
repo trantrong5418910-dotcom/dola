@@ -18,7 +18,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { parseCookies, fetchProfile, fetchSubscription, dolaFetch } from './provider.js';
+import { parseCookies, fetchProfile, fetchSubscription, dolaFetch, guardLogoutRequests } from './provider.js';
 
 const execFileP = promisify(execFile);
 
@@ -136,7 +136,7 @@ await ctx.addCookies(Object.entries(ck).map(([name, value]) => ({ name, value, d
 // ★ 拦住 dola 前端在限流时「自己登出自己」的请求。
 // 实测：提交撞上限流后前端会调 /passport/web/logout/，把会话销毁 ——
 // 每失败一次就烧掉一个账号。这里 abort 掉，限流就只是"这次没成功"。
-await ctx.route('**/passport/**/logout**', (r) => r.abort());
+await guardLogoutRequests(ctx);
 
 
 // 需要改时长时，在页面里注入 patch（等价于方悦扩展的 world:MAIN content script）

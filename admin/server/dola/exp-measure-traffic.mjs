@@ -15,7 +15,7 @@
  * 加 --submit 才会量完整一轮（含提交与轮询）。
  */
 import { initDb, db } from '../db.js';
-import { parseCookies, getPlaywright, DOLA_HEADERS } from './provider.js';
+import { parseCookies, getPlaywright, DOLA_HEADERS, guardLogoutRequests } from './provider.js';
 
 const argv = process.argv.slice(2);
 const flag = (n, d = null) => {
@@ -44,6 +44,7 @@ const persistent = Boolean(PROFILE_DIR);
 if (persistent) console.log(`（持久化 profile：${PROFILE_DIR}）`);
 
 await ctx.addCookies(Object.entries(parseCookies(acc.cookie)).map(([name, value]) => ({ name, value, domain: '.dola.com', path: '/' })));
+await guardLogoutRequests(ctx);
 
 const page = await ctx.newPage();
 

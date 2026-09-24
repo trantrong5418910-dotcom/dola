@@ -6,7 +6,7 @@ import { isIP } from 'node:net';
 
 const busy = (db, id) => db.prepare("SELECT id FROM dola_videos WHERE account_id=? AND status IN ('queued','submitting','generating','resolving') LIMIT 1").get(id);
 
-export function createGoogleAccountStore(db) {
+export function createGoogleAccountStore(db, { registry = null } = {}) {
   const find = email => db.prepare('SELECT * FROM dola_accounts WHERE lower(label)=?').all(normalizeEmail(email));
   const store = {
     lookupAccount(email) {
@@ -16,8 +16,11 @@ export function createGoogleAccountStore(db) {
       if (!row) return null;
       return { ...row, blocked: row.status === 'disabled' || Boolean(busy(db, row.id)) };
     },
-    storeAccount({ email, identity, cookies, profile, snapshot, ownerId, loginProxy, exitIp }) {
-      if (!matchesGoogleIdentity(identity, email) || !profile?.ok || !(profile.entityId || profile.id)
+    storeAccount({ email, identity, cookies, profile, snapshot, ownerId, loginProxy, exitIp, manual = false, sessionVerified = false, loginMethod = 'password' }) {
+      const identityValid = loginMethod === 'manual'
+        ? manual === true && identity == null && sessionVerified === true
+        : manual !== true && matchesGoogleIdentity(identity, email);
+      if (!identityValid || !profile?.ok || !(profile.entityId || profile.id)
           || missingRequired(cookies || {}).length) throw new Error('login_not_verified');
       const rows = find(email);
       if (rows.length > 1) throw new Error('ambiguous_account');
@@ -52,9 +55,11 @@ export function createGoogleAccountStore(db) {
           VALUES (?,?,?,?,?,?,'valid',?,?,?,?,?,?,?)`).run(normalizeEmail(email), cookie, hash, names.join(','), proxy, verifiedIp,
           profile.nickname || profile.userName || '', id, profile.membershipLevel || '', at, ownerId, at, at).lastInsertRowid);
       }
+      registry?.bind(normalizeEmail(email), accountId);
       db.prepare(`INSERT INTO audit_logs (user_id,username,action,target_type,target_id,detail,created_at)
         VALUES (?,?,'dola.google_login_import','dola_account',?,?,?)`)
-        .run(ownerId, 'google-login', String(accountId), 'Google 身份和 Dola 会话核验通过，未保存密码', at);
+        .run(ownerId, 'google-login', String(accountId), manual
+          ? '手动登录 Dola 会话核验通过；邮箱为用户标注，未保存密码' : 'Google 身份和 Dola 会话核验通过，未保存密码', at);
       return { id: accountId };
     },
   };

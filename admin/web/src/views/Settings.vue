@@ -104,6 +104,12 @@ const MAINTENANCE_HELP = {
   [MAINTENANCE_INTERVAL]: '可设置 15～1440 分钟，保存后按新间隔调度。',
   [GENERATION_CONCURRENCY]: '不同账号可并行生成；同一账号自动排队。这里控制实际浏览器工作进程，单机上限 20，默认保持 1；不要把它当成排队容量。',
   [GENERATION_QUEUE_LIMIT]: '允许同时存在的排队+运行任务数，最多 6000；不会同时启动 6000 个浏览器，实际执行数量仍由“视频生成并发数”控制。',
+  dola_gen_min_submit_interval_sec: '同一出口 IP 两次浏览器提交之间的保护间隔；遇到 710022002 时可适当拉长。',
+  dola_ratelimit_cooldown_min: '真实命中上游限流后，账号进入冷却的分钟数；不会把账号误判成失效。',
+  dola_autorotate_max_attempts: '上游限流后自动换号重试的最大账号数（含首次提交）；设为 1 等于不换号。',
+  dola_replenish_min_accounts: '号池有效账号低于此数时，账号池顶部显示补号提示。',
+  dola_replenish_min_quota: '号池已确认剩余额度低于此数时，账号池顶部显示补号提示；设为 0 则只按账号数判断。',
+  gateway_prompt_cooldown_seconds: '同一用户令牌重复提交相同提示词的保护时间；设为 0 可关闭。',
 };
 function validMaintenanceInterval(value) {
   const minutes = Number(value);
@@ -117,7 +123,10 @@ const BOOL_KEYS = [
 ];
 const NUMBER_KEYS = ['page_size', 'session_hours', 'dola_credits_per_point', 'dola_points_per_account',
   'dola_check_concurrency', 'dola_http_timeout', 'dola_browser_concurrency',
-  'dola_gen_concurrency', 'dola_gen_queue_limit', 'dola_auto_maintenance_interval_minutes'];
+  'dola_gen_concurrency', 'dola_gen_queue_limit', 'dola_gen_min_submit_interval_sec',
+  'dola_ratelimit_cooldown_min', 'dola_autorotate_max_attempts',
+  'dola_replenish_min_accounts', 'dola_replenish_min_quota',
+  'gateway_prompt_cooldown_seconds', 'dola_auto_maintenance_interval_minutes'];
 const ENUM_KEYS = {
   dola_convert_basis: [{ value: 'account', label: '按账号数计价' }, { value: 'credits', label: '按额度计价' }],
   frontend_open_mode: [{ value: 'tab', label: '新标签页直接跳转' }, { value: 'browser', label: '服务器上开真实浏览器' }],
@@ -125,7 +134,9 @@ const ENUM_KEYS = {
 const UNIT = {
   page_size: '条', session_hours: '小时',
   dola_credits_per_point: '额度', dola_points_per_account: '积分', dola_check_concurrency: '个',
-  dola_http_timeout: '秒', dola_browser_concurrency: '个', dola_gen_concurrency: '个', dola_gen_queue_limit: '个任务', dola_auto_maintenance_interval_minutes: '分钟',
+  dola_http_timeout: '秒', dola_browser_concurrency: '个', dola_gen_concurrency: '个', dola_gen_queue_limit: '个任务',
+  dola_gen_min_submit_interval_sec: '秒', dola_ratelimit_cooldown_min: '分钟', dola_autorotate_max_attempts: '个', dola_replenish_min_accounts: '个', dola_replenish_min_quota: '额度',
+  gateway_prompt_cooldown_seconds: '秒', dola_auto_maintenance_interval_minutes: '分钟',
 };
 const isEnum = (k) => Object.hasOwn(ENUM_KEYS, k);
 const enumOptions = (k) => ENUM_KEYS[k];

@@ -28,12 +28,14 @@ import { audit } from '../audit.js';
 import { chargeVideoTask, settleFailedVideoRefund } from '../dola/generation-billing.js';
 import { streamVideoFile } from '../dola/video-file.js';
 import {
-  createVideoTask, getVideoTask, listVideoTasks, cancelVideoTask,
+  createVideoTask, startVideoTask, getVideoTask, listVideoTasks, cancelVideoTask,
   toPublic, generationStatus, nativeFifteenSecondPoolStats,
   nativeThirtySecondPoolStats, referenceImagePoolStats, localFileOf,
 } from '../dola/generator.js';
 import { validateReferenceImages } from '../dola/reference-images.js';
 import { saveReferenceImages, cleanupReferenceImages } from '../dola/reference-image-store.js';
+import { findUnsettledPrompt } from '../dola/submission-journal.js';
+import { sanitizePreflightDiagnostic } from '../dola/preflight-diagnostics.js';
 
 const router = express.Router();
 
@@ -69,8 +71,12 @@ function promptReservationKey(ownerTokenId, prompt) {
  * 进程内 reservation 则补上两个并发请求都在账号体检阶段时的竞态窗口。
  */
 export function findRecentPromptDuplicate(ownerTokenId, prompt, nowMs = Date.now()) {
+  if (ownerTokenId == null) return null;
+  const unsettled = findUnsettledPrompt(db, ownerTokenId, prompt);
+  if (unsettled) return { id: unsettled.id, status: unsettled.status, createdAt: unsettled.created_at,
+    retryAfterSeconds: null, requiresReconciliation: true };
   const cooldown = promptCooldownSeconds();
-  if (cooldown <= 0 || ownerTokenId == null) return null;
+  if (cooldown <= 0) return null;
 
   const key = promptReservationKey(ownerTokenId, prompt);
   const cutoffMs = nowMs - cooldown * 1000;
@@ -251,6 +257,49 @@ router.post('/consume', (req, res) => {
 });
 
 /**
+ * 非任务类退款：加积分 + 写流水必须**同生共死**。
+ *
+ * 踩过的坑：这里原本是两条独立的 db.prepare().run()，没有事务。
+ * 只靠 `point_transactions(kind,ref)` 的唯一索引挡不住真正的风险 ——
+ * 唯一索引只能防「重复写流水」，防不住「加了积分、还没写流水就崩溃」：
+ *   ① UPDATE tokens 加回积分 ✅
+ *   ② 进程挂掉（或写盘失败）发生在两步之间
+ *   ③ 流水里没有这条 refund → 幂等判据查不到 → 调用方重试
+ *   ④ 再加一次积分 → **凭空多出积分，且不违反任何唯一约束**
+ * 资金正确性不靠概率，包进事务即可。
+ *
+ * 为什么手写 SAVEPOINT 而不是 better-sqlite3 的 db.transaction()：
+ * 见 db.js 的 wrap() —— db 是被包成 `{ exec, prepare }` 的，
+ * 底层驱动可能是 better-sqlite3，也可能是 node:sqlite 回退（没有 transaction()）。
+ * 所以全项目（generation-billing.js / submission-journal.js）统一走 SAVEPOINT。
+ */
+function atomic(db, work) {
+  db.exec('SAVEPOINT gateway_refund');
+  try {
+    const result = work();
+    db.exec('RELEASE SAVEPOINT gateway_refund');
+    return result;
+  } catch (error) {
+    db.exec('ROLLBACK TO SAVEPOINT gateway_refund');
+    db.exec('RELEASE SAVEPOINT gateway_refund');
+    throw error;
+  }
+}
+
+/** 加积分 + 记退款流水，同事务。返回最新余额。 */
+function postRefundLedger({ tokenId, tokenPrefix, delta, reason, ref, at }) {
+  return atomic(db, () => {
+    const updated = db.prepare('UPDATE tokens SET points = points + ?, updated_at = ? WHERE id = ?')
+      .run(delta, at, tokenId);
+    if (!updated.changes) throw Object.assign(new Error('退款失败：令牌不存在'), { status: 404 });
+    db.prepare(`INSERT INTO point_transactions (token_id, token_prefix, delta, kind, reason, ref, created_at)
+                VALUES (?,?,?,?,?,?,?)`)
+      .run(tokenId, tokenPrefix, delta, 'refund', reason, ref, at);
+    return db.prepare('SELECT points FROM tokens WHERE id = ?').get(tokenId).points;
+  });
+}
+
+/**
  * POST /api/gateway/refund —— 按 ref 退款
  * 生成失败时用户端调它（对齐上游"失败不扣费"的行为）。同样幂等；
  * 没找到对应的 consume 记录就直接拒绝，避免被拿来凭空加积分。
@@ -269,15 +318,39 @@ router.post('/refund', (req, res) => {
     return res.json({ ok: true, duplicated: true, refunded: already.delta, balance: cur?.points ?? null });
   }
 
-  const now = new Date().toISOString();
-  db.prepare('UPDATE tokens SET points = points + ?, updated_at = ? WHERE id = ?')
-    .run(consume.delta, now, consume.token_id);
-  db.prepare(`INSERT INTO point_transactions (token_id, token_prefix, delta, kind, reason, ref, created_at)
-              VALUES (?,?,?,?,?,?,?)`)
-    .run(consume.token_id, consume.token_prefix, consume.delta, 'refund',
-      note || '生成失败退款', ref, now);
+  // A client-side timeout is not a failed upstream generation. The dedicated
+  // failed-task settlement rechecks the row inside a transaction.
+  const video = db.prepare('SELECT * FROM dola_videos WHERE charge_ref=?').get(ref);
+  if (video) {
+    if (video.status !== 'failed' || video.owner_token_id !== consume.token_id) {
+      return res.status(409).json({ ok: false, code: 'GENERATION_REFUND_UNCONFIRMED',
+        message: '生成任务尚未确认失败，不能根据客户端超时退款；请查询原任务', refunded: false });
+    }
+    const result = settleFailedVideoRefund(db, video);
+    return res.json({ ok: true, duplicated: Boolean(result.duplicated), refunded: result.points || 0, balance: result.balance });
+  }
 
-  const balance = db.prepare('SELECT points FROM tokens WHERE id = ?').get(consume.token_id).points;
+  // 兜底分支：没有对应任务行（例如充值类 ref）也走同一把事务。
+  const now = new Date().toISOString();
+  let balance;
+  try {
+    balance = postRefundLedger({
+      tokenId: consume.token_id,
+      tokenPrefix: consume.token_prefix,
+      delta: consume.delta,
+      reason: note || '生成失败退款',
+      ref,
+      at: now,
+    });
+  } catch (e) {
+    // 撞唯一索引 = 另一个并发请求刚退过这笔，按幂等成功返回，别升级成 500。
+    if (String(e?.code || '').startsWith('SQLITE_CONSTRAINT')) {
+      const cur = db.prepare('SELECT points FROM tokens WHERE id = ?').get(consume.token_id);
+      return res.json({ ok: true, duplicated: true, refunded: consume.delta, balance: cur?.points ?? null });
+    }
+    throw e;
+  }
+
   res.json({ ok: true, duplicated: false, refunded: consume.delta, balance });
 });
 
@@ -338,70 +411,99 @@ function settleFailureRefund(row) {
   return settleFailedVideoRefund(db, row);
 }
 
-/** POST /api/gateway/gen —— 提交一次生成（扣积分 + 建任务） */
-router.post('/gen', async (req, res) => {
-  const raw = userTokenOf(req);
-  const prompt = String(req.body?.prompt || '').trim();
-  if (!raw) return res.status(400).json({ ok: false, message: '缺少 token' });
-  if (!prompt) return res.status(400).json({ ok: false, message: '缺少 prompt' });
+/** 网关建任务失败时的结构化错误：status/code/message + 透传给 HTTP 响应的附加字段。 */
+export class GatewayTaskError extends Error {
+  constructor({ status = 500, code = null, message = '任务提交失败', fields = {} } = {}) {
+    super(message);
+    this.name = 'GatewayTaskError';
+    this.status = status;
+    this.code = code;
+    this.fields = fields || {};
+  }
+}
 
-  const mode = String(req.body?.mode || 'standard').trim().toLowerCase();
+/**
+ * 提交一次生成（扣积分 + 建任务）：给 8787 工作台和后台批量创建共用的唯一入口。
+ *
+ * 链路顺序与原来 POST /api/gateway/gen 完全一致：
+ * 令牌校验 → 积分校验 → 提示词排重 → 参考图校验 → 账号预检（createVideoTask 内）
+ * → 队列限制 → 落库 → 保存参考图 → 扣积分（幂等）→ 启动 → 失败退款。
+ *
+ * @param {object} input
+ * @param {string} input.tokenValue 用户令牌原文
+ * @param {string} input.prompt
+ * @param {string} [input.mode='standard'] standard|expert
+ * @param {number} [input.seconds=10]
+ * @param {number|null} [input.forceSeconds=null]
+ * @param {string} [input.ratio='16:9']
+ * @param {Array} [input.images=[]] 参考图（base64 数组）
+ * @param {number|null} [input.accountId=null] 指定账号
+ * @param {boolean} [input.strictAccount=false]
+ * @param {number|null} [input.points=null] 每任务扣积分，默认取 gateway_points_per_task
+ * @returns {{taskId, status, chargedPoints, balance, chargeRef, account, skippedAccounts, prompt, tokenId, tokenPrefix}}
+ * @throws {GatewayTaskError}
+ */
+export async function submitGenerationTask(input = {}) {
+  const fail = (opts) => { throw new GatewayTaskError(opts); };
+  const tokenValue = String(input.tokenValue || '').trim();
+  const prompt = String(input.prompt || '').trim();
+  if (!tokenValue) fail({ status: 400, message: '缺少 token' });
+  if (!prompt) fail({ status: 400, message: '缺少 prompt' });
+
+  const mode = String(input.mode || 'standard').trim().toLowerCase();
   if (!['standard', 'expert'].includes(mode)) {
-    return res.status(400).json({ ok: false, code: 'UNSUPPORTED_MODE', message: 'mode 仅支持 standard 或 expert' });
+    fail({ status: 400, code: 'UNSUPPORTED_MODE', message: 'mode 仅支持 standard 或 expert' });
   }
-  const requestedSeconds = Number(req.body?.seconds ?? 10);
+  const requestedSeconds = Number(input.seconds ?? 10);
   if (requestedSeconds === 15 && mode !== 'expert') {
-    return res.status(400).json({ ok: false, code: 'EXPERT_MODE_REQUIRED', message: '15 秒视频只能在专家模式提交，任务未提交，也未扣积分' });
+    fail({ status: 400, code: 'EXPERT_MODE_REQUIRED', message: '15 秒视频只能在专家模式提交，任务未提交，也未扣积分' });
   }
 
-  const t = db.prepare('SELECT * FROM tokens WHERE value = ?').get(raw);
-  if (!t) return res.status(401).json({ ok: false, message: '访问令牌无效' });
-  if (t.status !== 'active') return res.status(403).json({ ok: false, message: `令牌状态为「${t.status}」，不能消费` });
+  const t = db.prepare('SELECT * FROM tokens WHERE value = ?').get(tokenValue);
+  if (!t) fail({ status: 401, message: '访问令牌无效' });
+  if (t.status !== 'active') fail({ status: 403, message: `令牌状态为「${t.status}」，不能消费` });
 
   if (t.expires_at && Date.parse(t.expires_at) <= Date.now()) {
-    return res.status(403).json({ ok: false, message: '访问令牌已过期' });
+    fail({ status: 403, message: '访问令牌已过期' });
   }
 
-  const points = Number(req.body?.points ?? numSetting('gateway_points_per_task', 1));
+  const points = Number(input.points ?? numSetting('gateway_points_per_task', 1));
   if (!Number.isInteger(points) || points <= 0) {
-    return res.status(400).json({ ok: false, message: 'points 必须是正整数' });
+    fail({ status: 400, message: 'points 必须是正整数' });
   }
-  if (t.points < points) return res.status(402).json({ ok: false, message: '积分不足，任务未提交', balance: t.points, need: points });
+  if (t.points < points) fail({ status: 402, message: '积分不足，任务未提交', fields: { balance: t.points, need: points } });
 
   // 上游对短时间重复相同提示词会触发限流；先挡在账号体检和扣积分之前。
   const duplicate = reservePrompt(t.id, prompt);
   if (duplicate) {
     const wait = duplicate.retryAfterSeconds;
-    return res.status(409).json({
-      ok: false,
-      code: 'PROMPT_COOLDOWN',
-      message: `相同提示词刚提交过，请等待约 ${wait} 秒后再试；本次未创建任务，也未扣积分`,
-      retryAfterSeconds: wait,
-      duplicateTaskId: duplicate.id,
+    fail({
+      status: 409,
+      code: duplicate.requiresReconciliation ? 'GENERATION_SUBMISSION_UNRESOLVED' : 'PROMPT_COOLDOWN',
+      message: duplicate.requiresReconciliation
+        ? '相同提示词的原任务仍待核对；不会重新提交、换号或扣积分，请先查询原任务'
+        : `相同提示词刚提交过，请等待约 ${wait} 秒后再试；本次未创建任务，也未扣积分`,
+      fields: { retryAfterSeconds: wait, duplicateTaskId: duplicate.id },
     });
   }
 
   // 参考图：先校验，再看号池是否就绪；两者都在建任务/扣积分之前。
   let inspectedImages = [];
   try {
-    inspectedImages = await validateReferenceImages(req.body?.images, { prompt });
+    inspectedImages = await validateReferenceImages(input.images, { prompt });
   } catch (error) {
     releasePromptReservation(t.id, prompt);
-    return res.status(error.status || 400).json({
-      ok: false,
-      code: error.code || 'REFERENCE_IMAGE_INVALID',
-      message: error.message,
-    });
+    fail({ status: error.status || 400, code: error.code || 'REFERENCE_IMAGE_INVALID', message: error.message });
   }
   if (inspectedImages.length) {
     const refPool = referenceImagePoolStats();
     if (!refPool.ready) {
       releasePromptReservation(t.id, prompt);
-      return res.status(409).json({
-        ok: false,
+      fail({
+        status: 409,
         code: 'REFERENCE_IMAGES_NOT_READY',
         message: '当前没有已确认支持参考图且代理隔离的可用账号，任务未提交，也未扣积分',
-        referenceImages: { ready: false, eligible: refPool.eligible },
+        fields: { referenceImages: { ready: false, eligible: refPool.eligible } },
       });
     }
   }
@@ -411,33 +513,43 @@ router.post('/gen', async (req, res) => {
   try {
     task = await createVideoTask({
       prompt,
-      ratio: req.body?.ratio || '16:9',
+      ratio: input.ratio || '16:9',
       mode,
-      seconds: req.body?.seconds ?? 10,
-      forceSeconds: req.body?.forceSeconds ?? null,
-      accountId: req.body?.accountId ?? null,
+      seconds: input.seconds ?? 10,
+      forceSeconds: input.forceSeconds ?? null,
+      accountId: input.accountId ?? null,
+      strictAccount: input.strictAccount === true,
       ownerTokenId: t.id,
       ownerPrefix: t.prefix,
       chargeRef: '',
       hasReferenceImages: inspectedImages.length > 0,
       referenceImageCount: inspectedImages.length,
+      deferStart: true,
     });
   } catch (e) {
     releasePromptReservation(t.id, prompt);
-    if (e.code === 'GENERATION_QUEUE_FULL') {
-      const status = generationStatus();
-      return res.status(429).json({
-        ok: false,
-        code: e.code,
-        message: e.message,
-        generation: {
-          activeTasks: status.activeTasks,
-          queueLimit: status.queueLimit,
-          queueAvailable: status.queueAvailable,
+    if (String(e.code || '').startsWith('GENERATION_PREFLIGHT_')) {
+      const diagnostic = sanitizePreflightDiagnostic(e.diagnostic);
+      fail({
+        status: e.status || 409, code: e.code, message: e.message,
+        fields: {
+          diagnostic,
+          preflightAudit: {
+            code: e.code,
+            seconds: [10, 15, 20, 30].includes(requestedSeconds) ? requestedSeconds : null,
+            mode, diagnostic, taskCreated: false, charged: false,
+          },
         },
       });
     }
-    return res.status(e.status || 500).json({ ok: false, message: e.message, code: e.code });
+    if (e.code === 'GENERATION_QUEUE_FULL') {
+      const status = generationStatus();
+      fail({
+        status: 429, code: e.code, message: e.message,
+        fields: { generation: { activeTasks: status.activeTasks, queueLimit: status.queueLimit, queueAvailable: status.queueAvailable } },
+      });
+    }
+    fail({ status: e.status || 500, code: e.code, message: e.message });
   }
   // 任务行已经落库，后续请求由数据库历史记录继续拦截；释放进程内 reservation，避免内存累积。
   releasePromptReservation(t.id, prompt);
@@ -448,7 +560,7 @@ router.post('/gen', async (req, res) => {
     } catch (error) {
       cancelVideoTask(task.id);
       await cleanupReferenceImages(task.id).catch(() => {});
-      return res.status(500).json({ ok: false, code: 'REFERENCE_IMAGE_STORE_FAILED', message: '参考图保存失败，任务已取消，未扣积分' });
+      fail({ status: 500, code: 'REFERENCE_IMAGE_STORE_FAILED', message: '参考图保存失败，任务已取消，未扣积分' });
     }
   }
 
@@ -456,24 +568,74 @@ router.post('/gen', async (req, res) => {
   let charge;
   try { charge = chargeVideoTask(db, { taskId: task.id, tokenId: t.id, points }); }
   catch (error) {
-    // createVideoTask schedules work with setImmediate; this synchronous settlement
-    // or cancellation completes before the worker can submit to Dola.
+    // No worker is scheduled yet: cancelled preparation must never submit to Dola.
     cancelVideoTask(task.id);
     await cleanupReferenceImages(task.id).catch(() => {});
-    return res.status(error.status || 500).json({ ok: false, message: error.status ? error.message : '计费未完成，任务已取消', balance: error.balance, need: points });
+    fail({
+      status: error.status || 500,
+      message: error.status ? error.message : '计费未完成，任务已取消',
+      fields: { balance: error.balance, need: points },
+    });
   }
   const { chargeRef, balance } = charge;
-  audit(req, 'gateway.gen.create', 'dola_video', String(task.id), {
-    prompt: prompt.slice(0, 80), points, account: task.account_label, skipped: task._skipped?.length ?? 0,
-  });
+  try {
+    if (!startVideoTask(task.id)) throw new Error('任务在准备期间已取消');
+  } catch {
+    cancelVideoTask(task.id);
+    settleFailedVideoRefund(db, { ...task, status: 'queued' }, { cancelledBeforeSubmit: true });
+    await cleanupReferenceImages(task.id).catch(() => {});
+    fail({ status: 409, message: '任务未能启动，已取消并核对退还内部积分；未提交生成' });
+  }
 
-  res.status(202).json({
-    ok: true, taskId: task.id, status: task.status,
+  const skippedAccounts = (task._skipped || []).map((s) => ({ id: s.id, label: s.label, reason: s.kind ?? String(s.code) }));
+  return {
+    taskId: task.id, status: task.status,
     chargedPoints: points, balance, chargeRef,
     account: task.account_label,
     // 体检过程中被剔除的失效账号（有值说明账号池在损耗，值得关注）
-    skippedAccounts: (task._skipped || []).map((s) => ({ id: s.id, label: s.label, reason: s.kind ?? String(s.code) })),
-  });
+    skippedAccounts,
+    prompt, mode, requestedSeconds, tokenId: t.id, tokenPrefix: t.prefix,
+  };
+}
+
+/** POST /api/gateway/gen —— 提交一次生成（扣积分 + 建任务） */
+router.post('/gen', async (req, res) => {
+  try {
+    const result = await submitGenerationTask({
+      tokenValue: userTokenOf(req),
+      prompt: req.body?.prompt,
+      mode: req.body?.mode,
+      seconds: req.body?.seconds,
+      forceSeconds: req.body?.forceSeconds,
+      ratio: req.body?.ratio,
+      images: req.body?.images,
+      accountId: req.body?.accountId,
+      strictAccount: req.body?.strictAccount,
+      points: req.body?.points,
+    });
+    audit(req, 'gateway.gen.create', 'dola_video', String(result.taskId), {
+      prompt: String(req.body?.prompt || '').slice(0, 80),
+      points: result.chargedPoints, account: result.account, skipped: result.skippedAccounts.length,
+    });
+    res.status(202).json({
+      ok: true, taskId: result.taskId, status: result.status,
+      chargedPoints: result.chargedPoints, balance: result.balance, chargeRef: result.chargeRef,
+      account: result.account,
+      skippedAccounts: result.skippedAccounts,
+    });
+  } catch (e) {
+    if (e instanceof GatewayTaskError) {
+      if (e.fields?.preflightAudit) {
+        audit(req, 'gateway.gen.preflight_rejected', 'generation_attempt', '', e.fields.preflightAudit);
+      }
+      const { preflightAudit, ...rest } = e.fields || {};
+      const body = { ok: false, message: e.message, ...rest };
+      // 原路由在没有 code 的分支里就不带 code 键，保持一致
+      if (e.code != null) body.code = e.code;
+      return res.status(e.status || 500).json(body);
+    }
+    return res.status(500).json({ ok: false, message: e.message });
+  }
 });
 
 /** GET /api/gateway/gen/:id —— 查进度；完成时**返回无水印直链** */
@@ -536,20 +698,26 @@ router.get('/gen/:id', (req, res) => {
  * 不能把文件目录直接暴露出去。所以支持 Range（浏览器拖进度条要靠它）。
  */
 router.get('/gen/:id/file', async (req, res) => {
-  const raw = userTokenOf(req);
-  if (!raw) return res.status(401).json({ ok: false, message: '缺少用户令牌' });
-  const row = getVideoTask(req.params.id);
-  if (!row) return res.status(404).json({ ok: false, message: '任务不存在' });
-  if (raw) {
-    const t = db.prepare('SELECT id FROM tokens WHERE value = ?').get(raw);
-    if (!t || row.owner_token_id !== t.id) {
-      return res.status(404).json({ ok: false, message: '任务不存在' });
+  try {
+    const raw = userTokenOf(req);
+    if (!raw) return res.status(401).json({ ok: false, message: '缺少用户令牌' });
+    const row = getVideoTask(req.params.id);
+    if (!row) return res.status(404).json({ ok: false, message: '任务不存在' });
+    if (raw) {
+      const t = db.prepare('SELECT id FROM tokens WHERE value = ?').get(raw);
+      if (!t || row.owner_token_id !== t.id) {
+        return res.status(404).json({ ok: false, message: '任务不存在' });
+      }
     }
+    const file = localFileOf(row);
+    if (row.status !== 'ready') return res.status(409).json({ ok: false, message: '成片尚未通过验收，暂不可下载' });
+    if (!file) return res.status(404).json({ ok: false, message: '该任务没有本地归档文件' });
+    return streamVideoFile(req, res, { file, filename: `${row.id}${row.is_unwatermarked ? '-nowatermark' : ''}.mp4`, isUnwatermarked: Boolean(row.is_unwatermarked) });
+  } catch (e) {
+    // Express 4 不捕获 async 抛错；流式传输中途出错时响应头可能已发出，此时不能再写 JSON
+    if (!res.headersSent) return res.status(502).json({ ok: false, message: '文件传输失败，请重试' });
+    try { res.end(); } catch { /* 忽略 */ }
   }
-  const file = localFileOf(row);
-  if (row.status !== 'ready') return res.status(409).json({ ok: false, message: '成片尚未通过验收，暂不可下载' });
-  if (!file) return res.status(404).json({ ok: false, message: '该任务没有本地归档文件' });
-  return streamVideoFile(req, res, { file, filename: `${row.id}${row.is_unwatermarked ? '-nowatermark' : ''}.mp4`, isUnwatermarked: Boolean(row.is_unwatermarked) });
 });
 
 /** GET /api/gateway/gen —— 按令牌列自己的任务 */

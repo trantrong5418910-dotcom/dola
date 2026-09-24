@@ -12,7 +12,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseCookies, getPlaywright, DOLA_HEADERS } from './provider.js';
+import { parseCookies, getPlaywright, DOLA_HEADERS, guardLogoutRequests } from './provider.js';
 
 const argv = process.argv.slice(2);
 const flag = (n, d = null) => {
@@ -49,6 +49,7 @@ console.log('关键字段:', ['sessionid', 'sessionid_ss', 'sid_guard', 'sid_tt'
 
 const cookieList = Object.entries(ck).map(([name, value]) => ({ name, value, domain: '.dola.com', path: '/' }));
 await ctx.addCookies(cookieList);
+await guardLogoutRequests(ctx);
 
 const page = await ctx.newPage();
 const consoleMsgs = [];

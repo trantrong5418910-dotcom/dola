@@ -721,7 +721,37 @@ server.once('close', () => { ledger.close?.(); userClients.clear(); userCache.cl
 return server;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+/**
+ * 判断"是不是有人在直接启动本文件"，决定要不要真的 listen。
+ *
+ * ★ 为什么要认 PM2：**PM2 fork 模式会把 `process.argv[1]` 指向它自己的容器**
+ *   （`.../pm2/lib/ProcessContainerFork.js`），而不是本文件路径。
+ *   于是 `import.meta.url === pathToFileURL(argv[1])` 永远不成立 —— 整个启动块被
+ *   **静默跳过**：进程活着（PM2 显示 online）、不报错、不打一行日志、**永不 listen**。
+ *   线上实测就是这个症状：8787 端口一直是空的，日志 0 字节。
+ *   所以还必须认 PM2 注入的 `pm_id`。
+ *
+ * ⚠️ 排查提醒：`/proc/<pid>/cmdline` 在 PM2 下**不可信**（PM2 在进程内改写 argv，
+ *   cmdline 仍显示原始命令），别拿它当"argv[1] 就是脚本路径"的证据 ——
+ *   要验证就写个最小复现丢进 PM2 跑一遍，打印 argv[1] 与 import.meta.url 比对。
+ *
+ * 保持原有契约：被 import（测试等）时**绝不** listen。
+ *
+ * @param {{argv1?: string, moduleUrl?: string, env?: Record<string,string>}} [o]
+ * @returns {boolean}
+ */
+export function shouldAutoStart({
+  argv1 = process.argv[1],
+  moduleUrl = import.meta.url,
+  env = process.env,
+} = {}) {
+  // PM2（fork / cluster 都一样）会注入 pm_id，此时一定是"被启动"语义
+  if (env.pm_id !== undefined && env.pm_id !== '') return true;
+  if (!argv1) return false;
+  return moduleUrl === pathToFileURL(path.resolve(argv1)).href;
+}
+
+if (shouldAutoStart()) {
   // Tests should import the factory. CLI users can disable all .env reads explicitly.
   if (!['0', 'false'].includes(process.env.MVP_LOAD_ENV)) loadEnv();
   const args = process.argv.slice(2);

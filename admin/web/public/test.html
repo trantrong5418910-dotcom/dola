@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>视频 API 工作台</title>
+  <link rel="icon" type="image/svg+xml" href="./favicon.svg">
+  <script>
+    (() => {
+      try {
+        const saved = localStorage.getItem('video-api-workbench-theme');
+        document.documentElement.dataset.theme = saved === 'dark' || saved === 'light'
+          ? saved
+          : (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+      } catch {
+        document.documentElement.dataset.theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      }
+    })();
+  </script>
+  <style>
+    :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:#172033;background:#f3f6fb;color-scheme:light;font-synthesis:none;text-rendering:optimizeLegibility}
+    *{box-sizing:border-box}body{margin:0;min-height:100vh}.topbar{height:68px;padding:0 max(22px,calc((100vw - 1440px)/2));display:flex;align-items:center;gap:14px;background:#14233b;color:#fff;box-shadow:0 5px 20px #10203920}.brand{display:grid;place-items:center;width:34px;height:34px;border-radius:11px;background:linear-gradient(135deg,#76a8ff,#7767e8);font-weight:800}.top-title{font-size:16px;font-weight:700}.top-sub{color:#aebbd0;font-size:12px;margin-left:3px}.spacer{flex:1}.origin{color:#b9c8dc;font-size:12px}.topbar a{color:#dce8fa;text-decoration:none;font-size:13px}.topbar a:hover{color:#fff}
+    main{max-width:1440px;margin:24px auto;padding:0 22px 40px}.notice{display:flex;gap:12px;align-items:flex-start;padding:13px 16px;border:1px solid #cbdcf9;background:#edf4ff;color:#334765;border-radius:12px;font-size:13px;line-height:1.6;margin-bottom:18px}.notice b{white-space:nowrap;color:#234a83}.layout{display:grid;grid-template-columns:minmax(320px,400px) minmax(0,1fr);gap:18px;align-items:start}.card{background:#fff;border:1px solid #e3e9f2;border-radius:14px;box-shadow:0 5px 20px #1b35510a}.composer{padding:22px}.card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:18px}.card h1,.card h2{margin:0;font-size:17px;letter-spacing:.1px}.card-head p{margin:6px 0 0;color:#7b8798;font-size:12px;line-height:1.5}.badge{border:1px solid #dce5f3;border-radius:999px;color:#59708f;padding:5px 9px;font-size:11px;white-space:nowrap}.field{margin:15px 0}.field label{display:flex;justify-content:space-between;align-items:center;margin-bottom:7px;font-size:13px;font-weight:650;color:#293750}.hint{font-weight:400;color:#8793a4;font-size:11px}.input,.select,.textarea{width:100%;border:1px solid #d8e0eb;border-radius:9px;background:#fff;color:#172033;font:inherit;font-size:13px;padding:10px 11px;outline:none;transition:border-color .15s,box-shadow .15s}.input:focus,.select:focus,.textarea:focus{border-color:#6b91ec;box-shadow:0 0 0 3px #6186e81a}.textarea{resize:vertical;min-height:135px;line-height:1.6}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.key-row{display:flex;gap:8px}.key-row .input{min-width:0}
+    /* 同一个 flex 行里，输入/下拉要能收缩、按钮不能被压扁 ——
+       否则「连接」「拉模型」会被挤成竖排两行（截图里实测到过）。
+       min-width:0 是必须的：flex 项默认 min-width:auto，不会缩到内容宽度以下。 */
+    .key-row .select{flex:1 1 0;min-width:0;width:auto}
+    .key-row .btn{flex:0 0 auto;white-space:nowrap}
+    .task-card .card-head{flex-wrap:wrap}
+    .task-card .statusbar{min-width:0;flex-wrap:wrap;justify-content:flex-end;row-gap:4px}
+    .task-card .tabbar{width:100%;align-items:center}.btn{border:0;border-radius:9px;padding:10px 13px;background:#416fe0;color:#fff;font:inherit;font-size:13px;font-weight:650;cursor:pointer;transition:filter .15s,transform .15s}.btn:hover{filter:brightness(1.06)}.btn:active{transform:translateY(1px)}.btn:disabled{opacity:.48;cursor:not-allowed;filter:none}.btn.secondary{color:#344762;background:#edf1f7}.btn.ghost{border:1px solid #dbe3ef;background:#fff;color:#4c607e}.btn.small{padding:7px 10px;font-size:12px}.btn.danger{background:#fff1f0;color:#ad352c;border:1px solid #ffd9d4}.token-note{margin-top:6px;color:#8a96a7;font-size:11px;line-height:1.5}.filebox{border:1px dashed #bdcce1;border-radius:10px;padding:12px;background:#fbfcfe}.filebox input{width:100%;font-size:12px;color:#53637a}.file-list{list-style:none;margin:9px 0 0;padding:0;display:grid;gap:5px}.file-list li{display:flex;justify-content:space-between;gap:8px;align-items:center;color:#53637a;font-size:11px}.file-list button{border:0;background:none;color:#a54842;cursor:pointer}.capability{min-height:44px;border-radius:9px;background:#f4f6fa;padding:10px 11px;color:#65758b;font-size:12px;line-height:1.6}.capability.warn{background:#fff8e7;color:#7c5b14}.capability.good{background:#edf9f1;color:#226a3c}.submit-row{display:flex;gap:9px;align-items:center;margin-top:17px}.submit-row .btn{flex:1;padding:12px}.point-note{color:#78869a;font-size:11px;line-height:1.45;margin-top:9px}
+    .right{display:grid;gap:18px}.statusbar{display:flex;align-items:center;gap:9px;color:#66758a;font-size:12px}.dot{width:8px;height:8px;border-radius:50%;background:#a7b2c1}.dot.good{background:#30aa67;box-shadow:0 0 0 3px #30aa671a}.dot.bad{background:#e0534e;box-shadow:0 0 0 3px #e0534e1a}.summary{display:flex;gap:8px;flex-wrap:wrap;margin-top:15px}.pill{background:#f3f6fa;border:1px solid #e4eaf2;border-radius:999px;padding:6px 9px;font-size:11px;color:#5d6e85}.task-card{padding:21px}.task-top{display:flex;align-items:flex-start;gap:14px}.task-id{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:700;color:#365ebc;font-size:13px}.task-status{margin-top:6px;font-size:14px;font-weight:650}.task-stage{color:#7c899a;font-size:12px;margin-top:5px}.task-actions{display:flex;gap:7px;margin-left:auto;flex-wrap:wrap;justify-content:flex-end}.error-box{display:none;margin-top:14px;padding:11px 12px;border:1px solid #ffd7d2;background:#fff5f3;color:#923c33;border-radius:9px;white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.55}.error-box.show{display:block}.error-box.good{border-color:#bfe3cc;background:#f1faf4;color:#226a3c}.meta-grid{display:grid;grid-template-columns:78px 1fr;gap:7px 12px;margin:18px 0 0;padding-top:14px;border-top:1px solid #edf0f5;font-size:12px}.meta-grid dt{color:#8792a0}.meta-grid dd{margin:0;color:#35445a;white-space:pre-wrap;word-break:break-word}.chat-head{display:flex;justify-content:space-between;align-items:center;margin:0 0 9px}.chat-head h3{margin:0;font-size:13px}.empty{padding:18px 0;color:#909bab;font-size:12px}.raw{margin-top:14px;border-top:1px solid #edf0f5;padding-top:12px}.raw summary{cursor:pointer;color:#67758a;font-size:12px}.raw pre{max-height:280px;overflow:auto;padding:12px;background:#f5f7fa;border-radius:8px;color:#49576b;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word}
+    .list-card{overflow:hidden}.list-head{display:flex;align-items:center;gap:10px;padding:17px 20px;border-bottom:1px solid #edf0f5}.list-head h2{margin-right:auto}.list-wrap{overflow:auto}.jobs{width:100%;border-collapse:collapse;min-width:680px}.jobs th,.jobs td{text-align:left;border-bottom:1px solid #edf0f5;padding:10px 13px;font-size:12px;vertical-align:top}.jobs th{color:#718096;background:#fbfcfe;font-weight:600}.jobs td{color:#35445a}.jobs tr:last-child td{border-bottom:0}.prompt-cell{max-width:350px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.job-id{font-family:ui-monospace,monospace;color:#3f62ae}.tag{display:inline-block;border-radius:999px;padding:4px 7px;background:#f0f3f8;color:#66758a;font-size:10px}.tag.ready{background:#e9f7ef;color:#287544}.tag.failed{background:#fff0ee;color:#ad3b32}.tag.running{background:#edf3ff;color:#365ebc}.row-btn{border:0;background:none;color:#416fe0;padding:3px 5px;font:inherit;font-size:11px;cursor:pointer}.row-btn.cancel{color:#ac4b42}.tabbar{display:flex;gap:6px;margin-left:auto}.tab{border:1px solid transparent;background:none;color:#748196;padding:6px 9px;border-radius:7px;font:inherit;font-size:12px;cursor:pointer}.tab.active{border-color:#dce5f3;background:#f2f5fa;color:#2f4f8b;font-weight:650}.hidden{display:none!important}
+    .theme-toggle{display:flex;align-items:center;gap:7px;border:1px solid #ffffff42;border-radius:8px;padding:8px 10px;background:transparent;color:#e2eafa;font:inherit;font-size:12px;cursor:pointer;white-space:nowrap}.theme-toggle:hover,.theme-toggle[aria-pressed="true"]{background:#ffffff16;border-color:#ffffff70}.theme-toggle:focus-visible{outline:3px solid #9dbbff;outline-offset:2px}
+    /* ── 工作台扩展组件 ───────────────────────────── */
+    .btn.small{padding:7px 10px;font-size:12px}
+    .btn.danger{background:#c34a3f}
+    /* 4 格统计条：展示本服务真实可得的四项状态。
+       数据取自需要令牌的 /v1/status，不暴露账号明细。
+       数字用 tabular-nums 对齐，避免刷新时宽度跳动。 */
+    .stat-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:16px}
+    .stat{border:1px solid #e6ecf5;background:#f7fafd;border-radius:11px;padding:10px 12px;min-width:0}
+    .stat b{display:block;font-size:18px;line-height:1.3;color:#26374f;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .stat span{display:block;margin-top:3px;font-size:11px;color:#7d8a9c;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .stat.ok b{color:#247a4a}.stat.warn b{color:#a76a12}.stat.bad b{color:#b23f38}
+    .pane{display:none}.pane.active{display:block}
+    .prog{height:6px;border-radius:999px;background:#e9eef6;overflow:hidden;margin-top:14px}
+    .prog i{display:block;height:100%;width:0;border-radius:999px;background:linear-gradient(90deg,#76a8ff,#4f6fe0);transition:width .3s}
+    .prog-note{margin:6px 0 0;font-size:11px;color:#8793a4;line-height:1.55}
+    .checkbox-row{display:flex;align-items:flex-start;gap:9px;margin:16px 0 0;padding:11px 12px;border:1px solid #e6ecf5;background:#f7fafd;border-radius:10px;font-size:12px;color:#3d4d64;line-height:1.55}
+    .checkbox-row input{flex:none;margin:2px 0 0}
+    .checkbox-row b{color:#26374f}
+    .jobs td.stage-cell,.jobs td.err{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .jobs td.err{color:#a8443b}
+    .jobs td.ops{white-space:nowrap}
+    .jobs .row-btn{margin-right:3px}
+    .jobs .row-btn.primary{color:#2f5bd0;font-weight:650}
+    .player{width:100%;margin-top:14px;border-radius:10px;background:#0d1725}
+    .upstream-note{margin:10px 0 0;font-size:11px;color:#8793a4;line-height:1.6}
+    code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;background:#edf1f7;border-radius:4px;padding:1px 4px}
+    /* ── 令牌登录 / 余额 / 卡密等能力所需的组件 ───────────────────── */
+    .top-balance{border:1px solid #ffffff2e;border-radius:8px;padding:8px 11px;color:#dce8fa;font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}
+    .top-btn{border:1px solid #ffffff42;border-radius:8px;padding:8px 11px;background:transparent;color:#e2eafa;font:inherit;font-size:12px;cursor:pointer;white-space:nowrap}
+    .top-btn:hover{background:#ffffff16;border-color:#ffffff70}
+    .top-btn:focus-visible{outline:3px solid #9dbbff;outline-offset:2px}
+    .top-btn:disabled{opacity:.45;cursor:not-allowed}
+    .remember-row{display:flex;align-items:flex-start;gap:8px;margin-top:9px;font-size:11px;color:#67758a;line-height:1.55;cursor:pointer}
+    .remember-row input{flex:none;margin:2px 0 0}
+    .mini-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}
+    .dlg{border:1px solid #dbe3ef;border-radius:14px;padding:0;width:min(660px,calc(100vw - 28px));background:#fff;color:#172033;box-shadow:0 24px 60px #10203933}
+    .dlg::backdrop{background:#0b1526a8}
+    .dlg-head{display:flex;align-items:center;gap:10px;padding:15px 18px;border-bottom:1px solid #edf0f5}
+    .dlg-head strong{font-size:15px}
+    .dlg-body{padding:16px 18px 18px;max-height:min(72vh,660px);overflow:auto}
+    .dlg-note{margin:0 0 12px;font-size:12px;color:#7b8798;line-height:1.6}
+    .dlg-actions{display:flex;gap:9px;justify-content:flex-end;margin-top:16px}
+    .batch-results{list-style:none;margin:12px 0 0;padding:0;display:grid;gap:6px;max-height:220px;overflow:auto}
+    .batch-results li{display:flex;gap:9px;align-items:baseline;font-size:12px;line-height:1.5;border-bottom:1px solid #f0f3f8;padding-bottom:5px}
+    .batch-results .ok{color:#226a3c}
+    .batch-results .bad{color:#ad352c}
+    .batch-results .idx{color:#8792a0;font-variant-numeric:tabular-nums;min-width:24px}
+    .material-list{list-style:none;margin:0;padding:0;display:grid;gap:9px}
+    .material-list li{border:1px solid #e6ecf5;background:#f7fafd;border-radius:10px;padding:11px 12px;font-size:12px;line-height:1.55}
+    .material-list .m-title{font-weight:650;color:#26374f}
+    .material-list .m-prompt{display:block;margin:5px 0 8px;color:#5d6e85;word-break:break-word}
+    .material-list .m-meta{display:block;margin-bottom:8px;font-size:11px;color:#8793a4}
+    .material-list .m-ops{display:flex;gap:7px;flex-wrap:wrap}
+    .jobs-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 12px}
+    .jobs-tools .input{width:auto;min-width:180px;flex:1 1 180px}
+    .jobs-tools .select{width:auto;flex:0 0 auto}
+    :root[data-theme="dark"]{color-scheme:dark;color:#e6edf7;background:#0e1522}
+    :root[data-theme="dark"] body{background:#0e1522;color:#e6edf7}
+    :root[data-theme="dark"] .topbar{background:#101a2a;box-shadow:0 5px 20px #0005;border-bottom:1px solid #27364b}
+    :root[data-theme="dark"] .notice{background:#17243a;border-color:#2e4565;color:#c5d2e5}
+    :root[data-theme="dark"] .notice b{color:#a9c6ff}
+    :root[data-theme="dark"] .card{background:#141e2d;border-color:#28364a;box-shadow:0 5px 20px #0002}
+    :root[data-theme="dark"] .card h1,:root[data-theme="dark"] .card h2{color:#edf2fa}
+    :root[data-theme="dark"] .card-head p{color:#9aa9bd}
+    :root[data-theme="dark"] .badge{border-color:#34445b;color:#b2c0d3}
+    :root[data-theme="dark"] .field label{color:#d5deeb}
+    :root[data-theme="dark"] .hint,:root[data-theme="dark"] .token-note{color:#94a3b8}
+    :root[data-theme="dark"] .input,:root[data-theme="dark"] .select,:root[data-theme="dark"] .textarea{background:#0d1725;border-color:#34445a;color:#e3ebf6}
+    :root[data-theme="dark"] .input::placeholder,:root[data-theme="dark"] .textarea::placeholder{color:#7f8ea3}
+    :root[data-theme="dark"] .input:focus,:root[data-theme="dark"] .select:focus,:root[data-theme="dark"] .textarea:focus{border-color:#789cf0;box-shadow:0 0 0 3px #6186e833}
+    :root[data-theme="dark"] .btn.secondary{background:#29384c;color:#dce6f4}
+    :root[data-theme="dark"] .btn.ghost{background:#172334;border-color:#34445a;color:#c5d2e4}
+    :root[data-theme="dark"] .btn.danger{background:#3b2428;border-color:#704047;color:#ffb9b0}
+    :root[data-theme="dark"] .filebox{background:#101a28;border-color:#465a74}
+    :root[data-theme="dark"] .filebox input,:root[data-theme="dark"] .file-list li{color:#b8c5d7}
+    :root[data-theme="dark"] .capability{background:#202b3b;color:#b1bfd1}
+    :root[data-theme="dark"] .capability.warn{background:#382f1e;color:#f1d08a}
+    :root[data-theme="dark"] .capability.good{background:#1b3429;color:#9fddb4}
+    :root[data-theme="dark"] .point-note{color:#9aa9bd}
+    :root[data-theme="dark"] .statusbar{color:#aab8ca}
+    :root[data-theme="dark"] .pill{background:#1b293a;border-color:#2e3e53;color:#c0cde0}
+    :root[data-theme="dark"] .task-id{color:#9bb8ff}
+    :root[data-theme="dark"] .task-status{color:#e0e8f3}
+    :root[data-theme="dark"] .task-stage{color:#9aa9bd}
+    :root[data-theme="dark"] .error-box{background:#382324;border-color:#754044;color:#ffc0b7}
+    :root[data-theme="dark"] .meta-grid{border-color:#2a374a}
+    :root[data-theme="dark"] .meta-grid dt{color:#99a8bb}
+    :root[data-theme="dark"] .meta-grid dd{color:#d4deeb}
+    :root[data-theme="dark"] .raw{border-color:#2a374a}
+    :root[data-theme="dark"] .raw summary{color:#aab8cb}
+    :root[data-theme="dark"] .raw pre{background:#0e1724;color:#c4d0e0}
+    :root[data-theme="dark"] .list-head,:root[data-theme="dark"] .jobs th,:root[data-theme="dark"] .jobs td{border-color:#2a374a}
+    :root[data-theme="dark"] .jobs th{background:#182435;color:#aab9cc}
+    :root[data-theme="dark"] .jobs td{color:#d0dbea}
+    :root[data-theme="dark"] .empty{color:#96a4b7}
+    :root[data-theme="dark"] .job-id,:root[data-theme="dark"] .row-btn{color:#9db8ff}
+    :root[data-theme="dark"] .tag{background:#293548;color:#c2cee0}
+    :root[data-theme="dark"] .tag.ready{background:#1c3a2b;color:#a4e0b6}
+    :root[data-theme="dark"] .tag.failed{background:#402629;color:#ffb7ad}
+    :root[data-theme="dark"] .tag.running{background:#203453;color:#a8c3ff}
+    :root[data-theme="dark"] .tab{color:#a0aec1}
+    :root[data-theme="dark"] .tab.active{background:#22334b;border-color:#3a5272;color:#d1dfff}
+    :root[data-theme="dark"] .filebox input::file-selector-button{background:#29384c;border:1px solid #40516a;border-radius:6px;color:#dce6f4;padding:5px 8px}
+    :root[data-theme="dark"] .file-list button{color:#ffaaa0}
+    :root[data-theme="dark"] .stat{border-color:#2a3a4f;background:#182333}
+    :root[data-theme="dark"] .stat b{color:#dbe6f4}
+    :root[data-theme="dark"] .stat span{color:#93a1b5}
+    :root[data-theme="dark"] .stat.ok b{color:#88d3a4}
+    :root[data-theme="dark"] .stat.warn b{color:#e5bc72}
+    :root[data-theme="dark"] .stat.bad b{color:#ffada3}
+    :root[data-theme="dark"] .prog{background:#22303f}
+    :root[data-theme="dark"] .prog-note{color:#93a1b5}
+    :root[data-theme="dark"] .checkbox-row{background:#182333;border-color:#2a3a4f;color:#c6d2e2}
+    :root[data-theme="dark"] .checkbox-row b{color:#e2eaf5}
+    :root[data-theme="dark"] .upstream-note{color:#93a1b5}
+    :root[data-theme="dark"] .jobs td.err{color:#ffada3}
+    :root[data-theme="dark"] .jobs .row-btn.primary{color:#9db8ff}
+    :root[data-theme="dark"] code{background:#22303f;color:#c9d6e6}
+    :root[data-theme="dark"] .btn.danger{background:#3b2428;color:#ffb9b0}
+    :root[data-theme="dark"] .top-balance{border-color:#3a5272;color:#d5e2f5}
+    :root[data-theme="dark"] .remember-row{color:#9aa9bd}
+    :root[data-theme="dark"] .dlg{background:#141e2d;border-color:#28364a;color:#e6edf7}
+    :root[data-theme="dark"] .dlg::backdrop{background:#050a13c4}
+    :root[data-theme="dark"] .dlg-head{border-color:#2a374a}
+    :root[data-theme="dark"] .dlg-note{color:#9aa9bd}
+    :root[data-theme="dark"] .batch-results li{border-color:#2a374a}
+    :root[data-theme="dark"] .batch-results .ok{color:#a4e0b6}
+    :root[data-theme="dark"] .batch-results .bad{color:#ffb7ad}
+    :root[data-theme="dark"] .batch-results .idx{color:#93a1b5}
+    :root[data-theme="dark"] .material-list li{background:#182333;border-color:#2a3a4f}
+    :root[data-theme="dark"] .material-list .m-title{color:#e2eaf5}
+    :root[data-theme="dark"] .material-list .m-prompt{color:#b1bfd1}
+    :root[data-theme="dark"] .material-list .m-meta{color:#93a1b5}
+    :root[data-theme="dark"] .error-box.good{border-color:#2f5b40;background:#152a1f;color:#a4e0b6}
+    @media(max-width:900px){main{margin-top:16px}.layout{grid-template-columns:1fr}.composer{padding:18px}.right{gap:14px}.topbar{padding:0 16px}.stat-strip{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    @media(max-width:520px){main{padding:0 12px 24px}.topbar{height:58px;gap:9px}.top-sub,.origin{display:none}.composer,.task-card{padding:16px}.row{gap:8px}.task-top{flex-wrap:wrap}.task-actions{width:100%;justify-content:flex-start;margin-left:0}.notice{font-size:12px}.notice b{white-space:normal}}
+  </style>
+  <style>
+    .notice-details{display:block}
+    .notice-details>summary{cursor:pointer;font-weight:700;color:#234a83;list-style:none}
+    .notice-details>summary::-webkit-details-marker{display:none}
+    .notice-details>summary::after{content:"展开";float:right;color:#617898;font-size:11px;font-weight:500}
+    .notice-details[open]>summary::after{content:"收起"}
+    .notice-details-body{margin-top:10px}
+    .notice-details-body p{margin:9px 0 0}
+    .notice-details-body p:first-child{margin-top:0}
+    .notice-file-mode a{color:#2459a6;font-weight:700;word-break:break-all}
+    :root[data-theme="dark"] .notice-details>summary{color:#a9c6ff}
+    :root[data-theme="dark"] .notice-details>summary::after{color:#aabbd4}
+    :root[data-theme="dark"] .notice-file-mode a{color:#b4ccff}
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand" aria-hidden="true">V</div>
+    <div><div class="top-title">视频 API 工作台</div><div class="top-sub">创建任务、跟踪状态、获取成片</div></div>
+    <div class="spacer"></div>
+    <span class="top-balance" id="topBalance" title="当前令牌余额（读 /v1/status，不是本地记账）">积分 —</span>
+    <button id="redeemBtn" class="top-btn" type="button" title="输入卡密兑换积分（POST /v1/redeem）">兑换积分</button>
+    <button id="themeToggle" class="theme-toggle" type="button" aria-label="深色模式" aria-pressed="false" title="切换深色模式"><span aria-hidden="true">☾</span><span>深色模式</span></button>
+    <span class="origin" id="originLabel"></span>
+    <button id="logoutBtn" class="top-btn hidden" type="button" title="断开当前令牌并清空本页数据（服务端任务与积分不受影响）">退出</button>
+    <a id="adminLink" href="/dola">管理后台</a>
+  </header>
+  <main>
+    <details class="notice notice-details">
+      <summary>工作台能力说明</summary>
+      <div class="notice-details-body">
+        <p><b>能做什么</b><span>测连通 / 拉模型 / 加入任务 / 立即刷新 / 取消任务 / 清除任务 / 刷新列表 / 全部提交上游 / 清空任务记录，外加任务列表每行的「提交上游 · 取消 · 获取状态 · 清除」和「当前任务 / 任务列表」双页签。</span></p>
+        <p><b>安全与能力边界</b><span>「测连通」走的是需要令牌的 <code>/v1/status</code>，不会返回账号明细；任务记录同时承担计费与退款凭据，因此「清除」采用软删除、保留账务依据；服务端只允许启动排队中的任务，失败或已取消的任务会显示为不可启动。</span></p>
+        <p><b>从旧工作台过来</b><span>本页已完整承接原用户工作台的能力：令牌登录、余额、卡密兑换、批量创建、素材库、任务筛选。数据始终在同一个后台，任务与积分按令牌可直接查到，无需迁移。</span></p>
+      </div>
+    </details>
+    <div id="fileModeNotice" class="notice notice-file-mode hidden" role="alert"><b>请通过正式网址打开</b><span>当前页面是本地文件预览，无法连接后台或读取任务。请通过工作台的正式网址访问以使用完整功能。</span></div>
+    <div class="notice"><b>令牌安全</b><span>只输入你自己的用户令牌。默认<b>不落盘</b> —— 令牌只在当前页面内存中使用，刷新即失效；只有显式勾选「在本机记住令牌」时才会写进浏览器 localStorage（公共电脑上不要勾）。所有请求只发往当前网站。创建任务会扣除令牌积分，并可能消耗上游生成额度。</span></div>
+    <div class="layout">
+      <section class="card composer" aria-labelledby="composerTitle">
+        <div class="card-head"><div><h1 id="composerTitle">新建视频任务</h1><p>兼容本地 V1 接口的 JSON 与图片 multipart 请求。</p></div><span class="badge">同源请求</span></div>
+        <div class="field">
+          <label for="apiKey">用户令牌 <span class="hint">Bearer</span></label>
+          <div class="key-row"><input id="apiKey" class="input" type="password" autocomplete="off" spellcheck="false" placeholder="粘贴 dv_ 开头的用户令牌"><button id="connect" class="btn secondary" type="button">连接</button></div>
+          <label class="remember-row" for="rememberToken">
+            <input id="rememberToken" type="checkbox">
+            <span>在本机记住令牌（勾选后刷新页面会自动重连；令牌以明文存在浏览器 localStorage，<b>公共电脑上不要勾</b>）</span>
+          </label>
+          <div class="token-note">默认不落盘：不勾选时令牌只在当前页面内存里。不要粘贴管理员登录密钥。</div>
+        </div>
+        <div class="field">
+          <label for="model">模型 <span class="hint">可手动重拉</span></label>
+          <div class="key-row"><select id="model" class="select" disabled><option>连接令牌后加载</option></select><button id="pullModels" class="btn ghost small" type="button" disabled>拉模型</button></div>
+        </div>
+        <div class="row">
+          <div class="field"><label for="seconds">时长</label><select id="seconds" class="select" disabled></select></div>
+          <div class="field"><label for="ratio">画幅</label><select id="ratio" class="select"><option value="16:9">16:9 横屏</option><option value="9:16">9:16 竖屏</option><option value="1:1">1:1 方形</option><option value="3:4">3:4 竖版</option><option value="4:3">4:3 横版</option><option value="21:9">21:9 宽银幕</option></select></div>
+        </div>
+        <div class="field"><label for="prompt">提示词 <span class="hint">必填</span></label><textarea id="prompt" class="textarea" maxlength="12000" placeholder="描述主体、动作、镜头和画面风格"></textarea></div>
+        <div class="field"><label for="images">参考图片 <span class="hint">可选，最多 9 张</span></label><div class="filebox"><input id="images" type="file" accept="image/*" multiple><ul id="fileList" class="file-list"></ul></div>
+          <div class="mini-actions">
+            <button id="saveMaterial" class="btn ghost small" type="button" title="把当前提示词、画幅与参考图存成本机素材（只存在这个浏览器里）">存为素材</button>
+            <button id="openMaterials" class="btn ghost small" type="button" title="打开本机素材库：选用 / 删除">素材库</button>
+          </div>
+        </div>
+        <div id="capability" class="capability">连接后显示令牌余额、时长能力与参考图就绪情况。</div>
+        <label class="checkbox-row" for="autoStart">
+          <input id="autoStart" type="checkbox" checked>
+          <span><b>创建后立即提交上游</b>（对应接口的 <code>auto_start</code>）<br>取消勾选则只建任务：积分先冻结、状态停在「排队中」，之后可在「任务列表」里用行内<b>提交上游</b>或<b>全部提交上游</b>再发车。</span>
+        </label>
+        <div class="submit-row"><button id="create" class="btn" type="button" disabled>加入任务</button><button id="batchCreate" class="btn secondary" type="button" disabled title="一次提交多条提示词，逐条创建">批量创建</button></div>
+        <div id="costNote" class="point-note">创建前会再次确认积分与上游消耗。</div>
+      </section>
+
+      <div class="right">
+        <section class="card task-card" aria-labelledby="taskTitle">
+          <div class="card-head">
+            <div><h2 id="taskTitle">任务</h2><p>只轮询当前这一条任务，每 15 秒一次；任务列表不自动刷新。</p></div>
+            <div class="statusbar"><span id="statusDot" class="dot"></span><span id="connectionState">尚未连接</span></div>
+          </div>
+          <div class="tabbar" style="margin:0 0 6px">
+            <button id="tabRun" class="tab active" type="button">当前任务</button>
+            <button id="tabJobs" class="tab" type="button">任务列表</button>
+            <span style="flex:1"></span>
+            <button id="ping" class="btn ghost small" type="button">测连通</button>
+          </div>
+
+          <div id="pane-run" class="pane active">
+            <div id="summary" class="stat-strip"></div>
+            <div class="task-top" style="margin-top:18px">
+              <div><div id="taskId" class="task-id">暂无任务</div><div id="taskStatus" class="task-status">输入用户令牌并连接后即可使用</div><div id="taskStage" class="task-stage"></div></div>
+              <div class="task-actions">
+                <button id="refreshCurrent" class="btn small secondary" type="button" disabled>立即刷新</button>
+                <button id="cancelCurrent" class="btn small danger hidden" type="button">取消任务</button>
+                <button id="clearCurrent" class="btn small ghost" type="button" disabled>清除任务</button>
+                <a id="download" class="btn small hidden" download>下载成片</a>
+              </div>
+            </div>
+            <div class="prog" aria-hidden="true"><i id="progressBar"></i></div>
+            <p class="prog-note" id="progressNote">阶段进度按状态估算，不是上游回报的百分比 —— 本服务不保留上游的逐条进度事件。</p>
+            <video id="player" class="player" controls playsinline hidden></video>
+            <div id="taskError" class="error-box"></div>
+            <dl id="taskMeta" class="meta-grid"><dt>提示词</dt><dd>—</dd><dt>模型与时长</dt><dd>—</dd><dt>画幅</dt><dd>—</dd><dt>成片</dt><dd>—</dd><dt>流水</dt><dd>—</dd></dl>
+            <p class="upstream-note">这里只展示任务的状态、阶段、失败原因与成片归档情况。本服务的任务行不保存上游的逐条对话事件，因此不会出现一条看起来像上游对话的日志。</p>
+            <details class="raw"><summary>任务原始 JSON</summary><pre id="rawJson">连接后可读取你自己的任务数据。</pre></details>
+          </div>
+
+          <div id="pane-jobs" class="pane">
+            <div class="list-head" style="padding:0 0 14px">
+              <h2 style="margin-right:auto">我的任务</h2>
+              <span id="jobsCount" class="hint">尚未加载</span>
+              <button id="refreshJobs" class="btn small secondary" type="button" disabled>刷新列表</button>
+              <button id="startQueued" class="btn small ghost" type="button" disabled>全部提交上游</button>
+              <button id="clearJobs" class="btn small ghost" type="button" disabled>清空任务记录</button>
+            </div>
+            <div class="jobs-tools">
+              <input id="jobSearch" class="input" type="search" placeholder="按任务号 / 提示词 / 状态 / 错误筛选（只筛当前已加载的这一页）" aria-label="筛选任务">
+              <select id="jobLimit" class="select" aria-label="每页条数">
+                <option value="20">每页 20 条</option>
+                <option value="50">每页 50 条</option>
+                <option value="100">每页 100 条</option>
+              </select>
+            </div>
+            <div class="list-wrap">
+              <table class="jobs"><thead><tr><th>ID</th><th>状态</th><th>阶段</th><th>时长</th><th>提示词</th><th>错误</th><th>操作</th></tr></thead><tbody id="jobRows"><tr><td colspan="7" class="empty">连接令牌后加载任务。</td></tr></tbody></table>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <!-- ── 弹窗：卡密兑换 / 批量创建 / 素材库 ──────────────────────────────── -->
+  <dialog id="redeemDlg" class="dlg" aria-labelledby="redeemTitle">
+    <div class="dlg-head"><strong id="redeemTitle">兑换积分</strong><span class="spacer"></span><button class="btn ghost small" data-dlg-close="redeemDlg" type="button">关闭</button></div>
+    <div class="dlg-body">
+      <p class="dlg-note">输入以 <code>card_</code> 开头的卡密。每张卡只能兑换一次，积分直接充到<b>当前令牌</b>上 —— 接口不接受指定别人的账户，兑换成功后这里会立刻刷新余额。</p>
+      <div class="key-row">
+        <input id="cardInput" class="input" type="text" autocomplete="off" spellcheck="false" placeholder="card_xxxxxxxx">
+        <button id="redeemSubmit" class="btn" type="button" data-act="redeem">确认兑换</button>
+      </div>
+      <div id="redeemResult" class="error-box"></div>
+    </div>
+  </dialog>
+
+  <dialog id="batchDlg" class="dlg" aria-labelledby="batchTitle">
+    <div class="dlg-head"><strong id="batchTitle">批量创建视频</strong><span class="spacer"></span><button class="btn ghost small" data-dlg-close="batchDlg" type="button">关闭</button></div>
+    <div class="dlg-body">
+      <div class="field"><label for="batchPrompts">提示词 <span class="hint">每行一个，最多 20 行，重复行会被去掉</span></label><textarea id="batchPrompts" class="textarea" rows="8" placeholder="每行写一个视频描述，例如：&#10;海边日落，镜头缓慢横移&#10;雨夜街头，霓虹倒影"></textarea></div>
+      <div class="row">
+        <div class="field"><label for="batchSeconds">时长</label><select id="batchSeconds" class="select"></select></div>
+        <div class="field"><label for="batchRatio">画幅</label><select id="batchRatio" class="select"></select></div>
+      </div>
+      <label class="checkbox-row" for="batchAutoStart">
+        <input id="batchAutoStart" type="checkbox" checked>
+        <span><b>创建后立即提交上游</b>（与单条创建用的是同一个 <code>auto_start</code> 语义）</span>
+      </label>
+      <p class="dlg-note" id="batchCost"></p>
+      <div class="prog" aria-hidden="true"><i id="batchBar"></i></div>
+      <ul id="batchResults" class="batch-results"></ul>
+      <div id="batchError" class="error-box"></div>
+      <div class="dlg-actions"><button class="btn ghost" data-dlg-close="batchDlg" type="button">取消</button><button id="batchSubmit" class="btn" type="button" data-act="batch">开始批量创建</button></div>
+    </div>
+  </dialog>
+
+  <dialog id="materialDlg" class="dlg" aria-labelledby="materialTitle">
+    <div class="dlg-head"><strong id="materialTitle">素材库</strong><span class="spacer"></span><button class="btn ghost small" data-dlg-close="materialDlg" type="button">关闭</button></div>
+    <div class="dlg-body">
+      <p class="dlg-note">素材（提示词 + 画幅 + 参考图）只保存在<b>当前浏览器</b>的 localStorage，不会上传到服务器，也不跟着令牌漫游 —— 换浏览器或清缓存就没了。参考图按 base64 存，占本地空间较多，只存真正会复用的那几条。</p>
+      <ul id="materialList" class="material-list"></ul>
+      <div id="materialEmpty" class="empty">还没有素材。填好提示词后点「存为素材」。</div>
+    </div>
+  </dialog>
+
+  <script src="./test.js" defer></script>
+</body>
+</html>

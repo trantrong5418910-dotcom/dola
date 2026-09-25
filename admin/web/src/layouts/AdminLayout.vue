@@ -70,12 +70,21 @@
             </el-dropdown-menu>
           </template>
         </el-dropdown>
+
+        <!-- 全局忙碌进度条：有请求在飞时在 header 下沿滑一条，慢操作时不至于让人以为没点生效 -->
+        <div v-show="isBusy" class="busy-bar" :title="busyText"><i /></div>
       </el-header>
 
       <el-main class="main">
         <router-view v-slot="{ Component }">
           <transition name="fade" mode="out-in">
-            <component :is="Component" />
+            <!--
+              keep-alive：切菜单不再销毁重建，表单填一半切走再切回不丢、滚动位置不丢、
+              也不重新发一轮请求。include 只列「安全可缓存」的页面，理由见 KEEP_ALIVE 注释。
+            -->
+            <keep-alive :include="KEEP_ALIVE">
+              <component :is="Component" />
+            </keep-alive>
           </transition>
         </router-view>
       </el-main>
@@ -90,6 +99,34 @@ import { ElMessage, ElMessageBox } from 'element-plus';
 import { api } from '../api.js';
 import { state, toggleTheme, logout, can } from '../store.js';
 import { menuItems } from '../router.js';
+import { isBusy, busyText } from '../busy.js';
+
+/**
+ * 哪些页面可以被 keep-alive 缓存。
+ *
+ * ⚠️ 两个前提，缺一个就会出问题：
+ *   1. 被缓存的组件必须有 name（<script setup> 默认没有，要在文件里写
+ *      `defineOptions({ name: 'Users' })`）。名字对不上就**静默不缓存**，不报错。
+ *   2. 页面里如果自己挂了轮询定时器，必须自己处理启停 —— 组件被缓存后
+ *      onUnmounted 不再触发，定时器会在后台一直跑，白烧服务端。
+ *      （DolaGenerationAnalytics.vue 已经按这个要求改好了，可以当样板。）
+ *
+ * 下面这 11 个页面都是「只读或慢改、没有自家定时器」，缓存是安全的。
+ */
+const KEEP_ALIVE = [
+  'Dashboard', 'Users', 'Roles', 'Content', 'Tokens',
+  'Cards', 'Materials', 'Settings', 'Logs', 'Profile',
+  // 代理池：纯手动刷新，没有轮询定时器，缓存安全
+  'ProxyPool',
+  // 成片库：有「扫描凭证倒计时」一个定时器，但已经按 keep-alive 的规矩处理好了
+  // —— 倒计时按截止时刻算而非累减，且 onDeactivated 停表、onActivated 重算。
+  // 缓存它的实际收益很大：扫描会话是唯一有出站成本的动作，切个菜单就重扫一遍很浪费。
+  'MediaLibrary',
+];
+
+// 待启用（各自补一行 defineOptions 就能加进来）：
+//   'Dola'    — 页面内有 3 处轮询定时器，需先加 onActivated/onDeactivated 启停
+//   'Proxies' — 该文件尚未提交，等它的改动落定后再加
 
 const route = useRoute();
 const router = useRouter();
@@ -185,6 +222,24 @@ async function onCommand(cmd) {
   display: flex; align-items: center; gap: 14px;
   border-bottom: 1px solid var(--el-border-color-light);
   background: var(--el-bg-color);
+  position: relative;
+}
+/* 全局忙碌进度条：贴在 header 下沿，2px 高，不占布局空间 */
+.busy-bar {
+  position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
+  overflow: hidden; background: var(--el-color-primary-light-8);
+}
+.busy-bar i {
+  display: block; width: 34%; height: 100%;
+  background: var(--el-color-primary);
+  animation: busy-slide 1.1s ease-in-out infinite;
+}
+@keyframes busy-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(330%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .busy-bar i { animation: none; width: 100%; }
 }
 .collapse-btn, .icon-btn { cursor: pointer; font-size: 18px; color: var(--el-text-color-regular); display: inline-flex; }
 .fe-btn { display: inline-flex; align-items: center; gap: 5px; }

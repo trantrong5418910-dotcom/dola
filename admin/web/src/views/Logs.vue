@@ -43,6 +43,9 @@
 </template>
 
 <script setup>
+// keep-alive 靠组件名匹配 include，<script setup> 默认没有 name，
+// 少了这一行缓存会**静默失效**（不报错、也不生效）。
+defineOptions({ name: 'Logs' });
 import { onMounted, reactive, ref } from 'vue';
 import { Download, Refresh, Search } from '@element-plus/icons-vue';
 import { api, qs } from '../api.js';

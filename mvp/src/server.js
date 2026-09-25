@@ -85,7 +85,12 @@ let gatewayHealth = null;
 const PER_USER_PROVIDER = PROVIDER === 'admin-dola';
 const SUPPORTED_SECONDS = Object.freeze(PER_USER_PROVIDER ? [10, 15, 20, 30] : [FIXED_SECONDS]);
 const EXPERT_SECONDS = Object.freeze(PER_USER_PROVIDER ? [15] : []);
-const DEFAULT_SECONDS = FIXED_SECONDS;
+// admin-dola 下 15/30 秒都要后台有「已确认原生能力 + 代理隔离」的账号才放行
+// （expertSecondsReady / fixedSecondsReady）。两者都没就绪时，默认 30 秒会让
+// 「创建视频任务」在创建前就被 409 挡掉 —— 工作台一打开就是不能提交的状态。
+// 10 秒是唯一不需要额外能力闸门的档位，所以作为该 provider 的默认值。
+// 单租户 provider 只支持 FIXED_SECONDS，保持原行为不变。
+const DEFAULT_SECONDS = PER_USER_PROVIDER ? 10 : FIXED_SECONDS;
 
 /** key = 用户令牌；值 = 已绑定该令牌的 VideoClient（须早于 syncAdminDolaCapabilityFlags） */
 const userClients = new Map();

@@ -317,7 +317,11 @@
 <script>
 const $ = (s) => document.querySelector(s);
 const main = $('#main');
-const DEFAULT_SECONDS = 30;
+// 后台 15/30 秒要「原生能力已确认 + 代理已隔离」才放行（expertSecondsReady /
+// fixedSecondsReady）。两者都没就绪时默认 30 秒会让「创建视频任务」按钮一进页面
+// 就是禁用的 —— 所以默认落在 10 秒（唯一不需要额外能力闸门的档位）。
+// 单租户 provider 只支持 30 秒时，下面 activeSeconds() 会自动回退到 options[0]。
+const DEFAULT_SECONDS = 10;
 const FALLBACK_SECONDS = [30];
 const FALLBACK_EXPERT_SECONDS = [];
 const DEFAULT_MODE = 'standard';
@@ -327,7 +331,7 @@ const FORCE_LOGIN_KEY = 'video_workbench_force_login';
 const THEME_KEY = 'video_workbench_theme';
 const ZH = { queued: '排队中', processing: '处理中', succeeded: '已成功', failed: '已失败', unknown: '未知' };
 
-const state = { page: 'tasks', tasks: [], taskSearch: '', taskPage: 1, session: null, health: null, serverNow: null, serverNowAt: null, serverClockTimer: null, mode: DEFAULT_MODE, seconds: DEFAULT_SECONDS, durationPlan: '30', materials: [], materialKey: 'video_workbench_materials_local', materialSearch: '', editingMaterialId: null, editingMaterialImages: [], selectedImages: [], currentVideoUrl: null, toastTimer: null };
+const state = { page: 'tasks', tasks: [], taskSearch: '', taskPage: 1, session: null, health: null, serverNow: null, serverNowAt: null, serverClockTimer: null, mode: DEFAULT_MODE, seconds: DEFAULT_SECONDS, durationPlan: '10', materials: [], materialKey: 'video_workbench_materials_local', materialSearch: '', editingMaterialId: null, editingMaterialImages: [], selectedImages: [], currentVideoUrl: null, toastTimer: null };
 const polling = { timer: null, running: false, stopped: true, epoch: 0, failures: 0, controller: null, balancePending: false };
 const taskRequests = new Map();
 let refreshPromise = null;
@@ -496,7 +500,7 @@ function durationOptionMarkup(selectedPlan = state.durationPlan || '30') {
     { value: '20', label: '20秒', show: availableSeconds().includes(20) },
     { value: '30', label: '30秒（原生单次，非×2）', show: availableSeconds().includes(30) },
   ].filter((item) => item.show);
-  const current = items.some((item) => item.value === plan) ? plan : (items.find((item) => item.value === '30')?.value || items[0]?.value || '30');
+  const current = items.some((item) => item.value === plan) ? plan : (items.find((item) => item.value === '10')?.value || items.find((item) => item.value === '30')?.value || items[0]?.value || '10');
   state.durationPlan = current;
   state.seconds = secondsFromPlan(current);
   return items.map((item) => `<option value="${item.value}" ${item.value === current ? 'selected' : ''}>${item.label}</option>`).join('');
@@ -626,7 +630,7 @@ function renderTasksPage() {
 }
 
 function renderCreatePage() {
-  if (!['10', '15', '15x2', '20', '30'].includes(String(state.durationPlan || ''))) state.durationPlan = availableSeconds().includes(30) ? '30' : (availableSeconds().includes(10) ? '10' : '15');
+  if (!['10', '15', '15x2', '20', '30'].includes(String(state.durationPlan || ''))) state.durationPlan = availableSeconds().includes(10) ? '10' : (availableSeconds().includes(30) ? '30' : String(availableSeconds()[0] || '10'));
   const seconds = activeSeconds();
   state.seconds = seconds;
   const ready = durationReady(seconds);

@@ -3,7 +3,7 @@ import { state, can, ensureBootstrap } from './store.js';
 
 /**
  * meta.perm 必须和 server/rbac.js 里的权限点一致；
- * meta.icon 是 Element Plus 图标组件名（在 Layout 里注册过）。
+ * meta.icon 是 Element Plus 图标组件名（在 main.js 全量注册过）。
  */
 const routes = [
   { path: '/login', name: 'login', component: () => import('./views/Login.vue'), meta: { public: true, title: '登录' } },
@@ -19,6 +19,9 @@ const routes = [
       { path: 'tokens', name: 'tokens', component: () => import('./views/Tokens.vue'), meta: { title: '访问令牌', perm: 'token:list', icon: 'Postcard' } },
       { path: 'cards', name: 'cards', component: () => import('./views/Cards.vue'), meta: { title: '充值卡', perm: 'card:list', icon: 'Tickets' } },
       { path: 'dola', name: 'dola', component: () => import('./views/Dola.vue'), meta: { title: 'dola 账号池', perm: 'dola:list', icon: 'Cloudy' } },
+      { path: 'proxies', name: 'proxies', component: () => import('./views/Proxies.vue'), meta: { title: '代理管理', perm: 'dola:list', icon: 'Share' } },
+      { path: 'proxy-pool', name: 'proxy-pool', component: () => import('./views/ProxyPool.vue'), meta: { title: '代理池', perm: 'dola:list', icon: 'Connection' } },
+      { path: 'media', name: 'media', component: () => import('./views/MediaLibrary.vue'), meta: { title: '成片库', perm: 'dola:list', icon: 'Film' } },
       { path: 'materials', name: 'materials', component: () => import('./views/Materials.vue'), meta: { title: '素材库', perm: 'material:list', icon: 'Picture' } },
       { path: 'settings', name: 'settings', component: () => import('./views/Settings.vue'), meta: { title: '系统设置', perm: 'setting:view', icon: 'Setting' } },
       { path: 'logs', name: 'logs', component: () => import('./views/Logs.vue'), meta: { title: '操作日志', perm: 'log:list', icon: 'List' } },

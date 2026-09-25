@@ -67,7 +67,7 @@
 </template>
 
 <script setup>
-import { onMounted, onUnmounted, ref } from 'vue';
+import { onActivated, onDeactivated, onMounted, onUnmounted, ref } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { api, qs } from '../api.js';
 import { can } from '../store.js';
@@ -89,9 +89,29 @@ async function refresh(silent = false) {
     if (!disposed && id === requestId) error.value = '统计读取失败，请刷新；已有数字可能已过期。';
   } finally { if (!disposed && id === requestId) loading.value = false; }
 }
-async function poll() {
-  if (!loading.value) await refresh(true);
-  if (!disposed) timer = setTimeout(poll, 30000);
+/**
+ * 30 秒轮询的启停。
+ *
+ * 为什么要单独抽 start/stop（而不是原来那样直接 setTimeout）：
+ * 本组件挂在 Dashboard 里，而 Dashboard 现在被 keep-alive 缓存了 ——
+ * 组件被缓存后 onUnmounted **不再触发**，原来那句 `onUnmounted(clearTimeout)`
+ * 就永远等不到，30 秒轮询会在后台一直跑下去，白烧服务端。
+ * 所以改成 onDeactivated 停、onActivated 续。
+ *
+ * startPolling 是幂等的（已在跑就直接返回），
+ * 这样即使 onMounted 和 onActivated 都被触发也不会叠成两条定时器。
+ */
+function startPolling() {
+  if (disposed || timer) return;
+  timer = setTimeout(async () => {
+    timer = null;              // ★ 先置空，否则下面 startPolling 会被自己这个残留 id 挡住
+    if (!loading.value) await refresh(true);
+    startPolling();
+  }, 30000);
+}
+function stopPolling() {
+  clearTimeout(timer);
+  timer = null;
 }
 async function probe(row) {
   try {
@@ -105,8 +125,18 @@ async function probe(row) {
   } catch { /* API wrapper displays the error. */ }
   finally { probing.value = ''; }
 }
-onMounted(() => { refresh(); timer = setTimeout(poll, 30000); });
-onUnmounted(() => { disposed = true; clearTimeout(timer); });
+/** parked：区分「首次挂载」和「从缓存里回来」。只有真的被停过才需要补一次刷新，
+ *  这样首次进入页面不会因为 onMounted + onActivated 各拉一次而重复请求。 */
+let parked = false;
+onMounted(() => { refresh(); startPolling(); });
+onActivated(() => {
+  if (!parked) return;
+  parked = false;
+  refresh(true);      // 静默补一次，别让用户看到离开期间已经过期的数字
+  startPolling();
+});
+onDeactivated(() => { parked = true; stopPolling(); });
+onUnmounted(() => { disposed = true; stopPolling(); });
 </script>
 
 <style scoped>

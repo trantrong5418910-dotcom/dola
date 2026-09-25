@@ -38,6 +38,18 @@
         <el-table-column label="积分" width="80" sortable :sort-method="(a, b) => a.points - b.points">
           <template #default="{ row }"><span class="points">{{ row.points }}</span></template>
         </el-table-column>
+        <!--
+          日上限：三态必须在界面上能一眼分清（跟随全局 / 不限 / N），
+          因为它们的行为完全不同 —— 混在一起显示时，「这个令牌到底受不受全局限制」
+          只能靠猜，而猜错的代价是额度被静默放开或静默卡死。
+        -->
+        <el-table-column label="日上限" width="84">
+          <template #default="{ row }">
+            <span v-if="row.daily_points_limit === null || row.daily_points_limit === undefined" class="muted">跟随全局</span>
+            <span v-else-if="row.daily_points_limit === 0" class="no-limit">不限</span>
+            <span v-else class="points">{{ row.daily_points_limit }}</span>
+          </template>
+        </el-table-column>
         <el-table-column label="状态" width="86">
           <template #default="{ row }">
             <el-tag size="small" :type="statusType(row.status)">{{ statusLabel(row.status) }}</el-tag>
@@ -48,8 +60,8 @@
             <span :class="{ expired: isExpired(row) }">{{ row.expires_at ? fmt(row.expires_at) : '永久' }}</span>
           </template>
         </el-table-column>
-        <el-table-column prop="created_by_name" label="创建人" width="80" />
-        <el-table-column label="创建时间" width="120">
+        <el-table-column prop="created_by_name" label="创建人" width="70" show-overflow-tooltip />
+        <el-table-column label="创建时间" width="112">
           <template #default="{ row }">{{ fmt(row.created_at) }}</template>
         </el-table-column>
         <!--
@@ -69,6 +81,7 @@
                     v-if="can('token:update') && row.status !== 'revoked'"
                     :command="row.status === 'active' ? 'disable' : 'enable'"
                   >{{ row.status === 'active' ? '停用' : '启用' }}</el-dropdown-item>
+                  <el-dropdown-item v-if="can('token:update')" command="daily_limit" divided>每日上限</el-dropdown-item>
                   <el-dropdown-item v-if="can('token:update') && row.status !== 'revoked'" command="revoke" divided>撤销</el-dropdown-item>
                   <el-dropdown-item v-if="can('token:delete')" command="delete" divided>删除</el-dropdown-item>
                 </el-dropdown-menu>
@@ -108,6 +121,15 @@
           <el-input-number v-model="genForm.expiresInDays" :min="0" :max="3650" />
           <span class="hint">0 = 永不过期</span>
         </el-form-item>
+        <el-form-item label="每日上限">
+          <el-select v-model="genForm.limitMode" style="width: 150px">
+            <el-option label="跟随全局设置" value="global" />
+            <el-option label="不限（覆盖全局）" value="unlimited" />
+            <el-option label="自定义" value="custom" />
+          </el-select>
+          <el-input-number v-if="genForm.limitMode === 'custom'" v-model="genForm.dailyPointsLimit" :min="1" :max="1000000" :step="10" class="limit-input" />
+          <span class="hint">{{ limitModeHint(genForm.limitMode) }}</span>
+        </el-form-item>
         <el-form-item label="备注"><el-input v-model="genForm.note" placeholder="可选" /></el-form-item>
       </el-form>
       <template #footer>
@@ -146,10 +168,40 @@
         <el-button type="primary" :loading="saving" @click="savePoints">确认</el-button>
       </template>
     </el-dialog>
+
+    <!-- 每日上限 -->
+    <el-dialog v-model="limitDlg" title="每日积分上限" width="480px">
+      <p class="muted">
+        「<b>{{ current?.name || current?.prefix }}</b>」的每日积分上限。
+        按<b>服务器本地日</b>结算；生成失败会退款，退款不占额度。
+        当前当日用量可在用户端 <code>GET /v1/status</code> 的 <code>daily</code> 字段看到。
+      </p>
+      <el-radio-group v-model="limitMode" class="mt">
+        <el-radio value="global">跟随全局设置</el-radio>
+        <el-radio value="unlimited">不限（覆盖全局）</el-radio>
+        <el-radio value="custom">自定义</el-radio>
+      </el-radio-group>
+      <div v-if="limitMode === 'custom'" class="mt">
+        <el-input-number v-model="limitValue" :min="1" :max="1000000" :step="10" />
+        <span class="hint">积分 / 天</span>
+      </div>
+      <el-alert
+        v-if="limitMode === 'unlimited'"
+        class="mt" type="warning" :closable="false" show-icon
+        title="设为「不限」会让这个令牌完全不受全局日上限约束。只建议给内部测试号用。"
+      />
+      <template #footer>
+        <el-button @click="limitDlg = false">取消</el-button>
+        <el-button type="primary" :loading="saving" @click="saveLimit">确认</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
+// keep-alive 靠组件名匹配 include，<script setup> 默认没有 name，
+// 少了这一行缓存会**静默失效**（不报错、也不生效）。
+defineOptions({ name: 'Tokens' });
 import { computed, onMounted, reactive, ref } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { ArrowDown, CopyDocument, Download, Plus, Search } from '@element-plus/icons-vue';
@@ -164,7 +216,10 @@ const saving = ref(false);
 const query = reactive({ page: 1, pageSize: 20, keyword: '', status: '' });
 
 const genDlg = ref(false);
-const genForm = reactive({ count: 1, points: 100, name: '', note: '', expiresInDays: 0 });
+const genForm = reactive({
+  count: 1, points: 100, name: '', note: '', expiresInDays: 0,
+  limitMode: 'global', dailyPointsLimit: 50,
+});
 const resultDlg = ref(false);
 const resultItems = ref([]);
 const revealDlg = ref(false);
@@ -172,6 +227,31 @@ const revealValue = ref('');
 const pointsDlg = ref(false);
 const current = ref(null);
 const pointsDelta = ref(0);
+const limitDlg = ref(false);
+const limitMode = ref('global');
+const limitValue = ref(50);
+
+/**
+ * 三态 ↔ 后端值的唯一映射点。
+ *
+ * ⚠️ 千万别用 `Number(mode) || null` 这类写法：`0`（不限）是 falsy，
+ *    会被吞成 `null`（跟随全局），于是「不限」这个选项**点了没反应**。
+ *    与后端 `parseDailyPointsLimit` 是同一套语义，改一边必须改另一边。
+ */
+const LIMIT_MODES = ['global', 'unlimited', 'custom'];
+const limitToPayload = (mode, value) => {
+  if (mode === 'global') return null;
+  if (mode === 'unlimited') return 0;
+  return Number(value) || 1;
+};
+const payloadToLimitMode = (v) => {
+  if (v === null || v === undefined) return 'global';
+  if (Number(v) === 0) return 'unlimited';
+  return 'custom';
+};
+function limitModeHint(mode) {
+  return { global: '用系统设置里的全局日上限', unlimited: '不受全局限制', custom: '单独给这个令牌设上限' }[mode] || '';
+}
 
 const STATUS = { active: '启用', disabled: '停用', revoked: '已撤销' };
 const statusLabel = (s) => STATUS[s] || s;
@@ -223,17 +303,49 @@ async function load() {
 function reload() { query.page = 1; load(); }
 
 function openGenerate() {
-  Object.assign(genForm, { count: 1, points: 100, name: '', note: '', expiresInDays: 0 });
+  Object.assign(genForm, {
+    count: 1, points: 100, name: '', note: '', expiresInDays: 0,
+    limitMode: 'global', dailyPointsLimit: 50,
+  });
   genDlg.value = true;
 }
 
 async function doGenerate() {
   saving.value = true;
   try {
-    const res = await api.post('/api/tokens/generate', { ...genForm });
+    // 显式展开需要的字段，不要把 limitMode 这个纯 UI 字段一起发给后端。
+    const res = await api.post('/api/tokens/generate', {
+      count: genForm.count,
+      points: genForm.points,
+      name: genForm.name,
+      note: genForm.note,
+      expiresInDays: genForm.expiresInDays,
+      dailyPointsLimit: limitToPayload(genForm.limitMode, genForm.dailyPointsLimit),
+    });
     resultItems.value = res.items;
     genDlg.value = false;
     resultDlg.value = true;
+    load();
+  } finally { saving.value = false; }
+}
+
+/** 打开「每日上限」弹窗，并把当前三态回显出来。 */
+function openLimit(row) {
+  current.value = row;
+  limitMode.value = payloadToLimitMode(row.daily_points_limit);
+  limitValue.value = Number(row.daily_points_limit) > 0 ? Number(row.daily_points_limit) : 50;
+  limitDlg.value = true;
+}
+
+async function saveLimit() {
+  saving.value = true;
+  try {
+    await api.post(`/api/tokens/${current.value.id}/action`, {
+      action: 'daily_limit',
+      dailyPointsLimit: limitToPayload(limitMode.value, limitValue.value),
+    });
+    ElMessage.success(`已更新「${current.value.name || current.value.prefix}」的每日上限`);
+    limitDlg.value = false;
     load();
   } finally { saving.value = false; }
 }
@@ -276,9 +388,10 @@ async function remove(row) {
   load();
 }
 
-/** 「更多」下拉的路由：停用/启用 → action，删除 → remove */
+/** 「更多」下拉的路由：每日上限 → 弹窗，删除 → remove，其余 → action */
 function rowMenu(row, cmd) {
   if (cmd === 'delete') return remove(row);
+  if (cmd === 'daily_limit') return openLimit(row);
   return action(row, cmd);
 }
 
@@ -317,9 +430,12 @@ onMounted(load);
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .mono-box :deep(textarea) { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .points { font-weight: 600; color: #e6a23c; }
+.no-limit { color: var(--el-color-warning); font-weight: 600; }
 .expired { color: var(--el-color-danger); }
 .muted { color: var(--el-text-color-secondary); font-size: 13px; }
 .hint { margin-left: 10px; font-size: 12px; color: var(--el-text-color-secondary); }
+.limit-input { margin-left: 10px; }
+.mt .el-radio { margin-right: 16px; }
 .tip { margin-bottom: 16px; }
 .mt { margin-top: 8px; }
 </style>

@@ -366,12 +366,17 @@ test('frontend create timeout outlasts the gateway creation budget', async () =>
   // Read the exact create call without executing the page or making a request.
   const calls = [...source.matchAll(/\bapi\(\s*(['"])\/api\/tasks\1\s*,\s*\{([^{}]*)/g)];
   const createCalls = calls.filter(([, , options]) => /\bmethod\s*:\s*(['"])POST\1/.test(options));
-  assert.equal(createCalls.length, 1, 'Locate the single frontend POST /api/tasks request');
-  const match = /\btimeoutMs\s*:\s*([\d_]+)\b/.exec(createCalls[0][2]);
-  assert.ok(match, 'Frontend create must set an explicit numeric deadline');
-  const frontendTimeout = Number(match[1].replaceAll('_', ''));
-  assert.ok(frontendTimeout > CREATE_TIMEOUT_MS,
-    `Frontend create budget (${frontendTimeout}ms) must exceed gateway budget (${CREATE_TIMEOUT_MS}ms)`);
+  // 前端有**两处** POST /api/tasks：单条创建（创作页）与批量创建（批量弹窗）。
+  // 早先这里断言 `length === 1`，于是被误判成「重复提交」——其实两条路径都要各自
+  // 满足同一个约束，所以改成「每一处都必须带一个比网关预算更长的显式 deadline」。
+  assert.ok(createCalls.length >= 1, 'Locate the frontend POST /api/tasks requests');
+  for (const [, , options] of createCalls) {
+    const match = /\btimeoutMs\s*:\s*([\d_]+)\b/.exec(options);
+    assert.ok(match, `Frontend create must set an explicit numeric deadline: ${options.trim()}`);
+    const frontendTimeout = Number(match[1].replaceAll('_', ''));
+    assert.ok(frontendTimeout > CREATE_TIMEOUT_MS,
+      `Frontend create budget (${frontendTimeout}ms) must exceed gateway budget (${CREATE_TIMEOUT_MS}ms)`);
+  }
 });
 
 test('legacy wait only refunds a confirmed terminal failure, not local errors', async (t) => {

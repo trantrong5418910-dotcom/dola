@@ -49,6 +49,9 @@
 </template>
 
 <script setup>
+// keep-alive 靠组件名匹配 include，<script setup> 默认没有 name，
+// 少了这一行缓存会**静默失效**（不报错、也不生效）。
+defineOptions({ name: 'Profile' });
 import { reactive, ref } from 'vue';
 import { ElMessage } from 'element-plus';
 import { api } from '../api.js';

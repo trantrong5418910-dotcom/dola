@@ -246,6 +246,12 @@
                 <el-option label="未校验" value="unknown" />
                 <el-option label="已停用" value="disabled" />
               </el-select>
+              <el-select v-model="query.source" placeholder="全部来源" clearable style="width: 140px" @change="reload">
+                <el-option v-for="s in summary.sources || []" :key="s" :label="s" :value="s" />
+              </el-select>
+              <el-select v-model="query.group" placeholder="全部分组" clearable style="width: 140px" @change="reload">
+                <el-option v-for="g in summary.groups || []" :key="g" :label="g" :value="g" />
+              </el-select>
               <el-button :icon="Search" @click="reload">查询</el-button>
             </div>
             <div class="spacer" />
@@ -254,14 +260,35 @@
                 删除{{ selected.length ? `（${selected.length}）` : '' }}
               </el-button>
               <el-button v-if="can('dola:check')" :icon="CircleCheck" @click="runJob('dola_check')">批量校验</el-button>
+              <el-button v-if="can('dola:create')" type="warning" plain @click="runJob('dola_hello_probe')">发送“你好”探测</el-button>
               <el-button v-if="can('dola:check')" :icon="Money" @click="runJob('dola_credits')">批量查额度</el-button>
               <el-button v-if="can('dola:check')" plain @click="runJob('dola_native_15s')">批量探测 15 秒</el-button>
               <el-button v-if="can('dola:check')" plain @click="runJob('dola_native_30s')">批量探测 30 秒</el-button>
               <el-button v-if="can('dola:check')" plain @click="runJob('dola_reference_images')">批量探测参考图</el-button>
+              <el-button v-if="can('dola:update')" :disabled="!selected.length" plain @click="batchRecover">批量恢复{{ selected.length ? `（${selected.length}）` : '' }}</el-button>
+              <el-button v-if="can('dola:update')" :disabled="!selected.length" plain @click="batchResetQuota">重置额度{{ selected.length ? `（${selected.length}）` : '' }}</el-button>
+              <el-button v-if="can('dola:update')" :disabled="!selected.length" plain @click="groupDlg = true">批量分组</el-button>
+              <el-button v-if="can('dola:create')" plain @click="openStress">压力测试</el-button>
               <el-button v-if="can('dola:convert')" :icon="Switch" @click="openConvert">计价换算</el-button>
         <el-button v-if="can('dola:update') && (summary.validNoProxy || summary.missingExitIp || summary.sharedExitIpRows)" :icon="Refresh" plain @click="openProxyRepair">修复出口</el-button>
               <DolaGoogleLogin v-if="can('dola:import')" @completed="Promise.allSettled([load(), refreshProvider()])" />
               <el-button v-if="can('dola:import')" type="primary" :icon="Upload" @click="importDlg = true">批量导入 Cookie</el-button>
+            </div>
+          </div>
+
+          <!-- 号池统计（对标 dola-pool 顶栏）：满额/半额只计「有效、未冷却、额度已确认」的账号 -->
+          <div class="pool-meta">
+            <div class="stat-chips">
+              <el-tag effect="plain">全部 {{ summary.total ?? 0 }}</el-tag>
+              <el-tag type="success" effect="plain">有效 {{ summary.valid ?? 0 }}</el-tag>
+              <el-tag type="success">满额 {{ summary.fullQuota ?? 0 }}</el-tag>
+              <el-tag type="warning">半额 {{ summary.halfQuota ?? 0 }}</el-tag>
+              <el-tag type="warning" effect="plain">冷却 {{ summary.cooling ?? 0 }}</el-tag>
+              <el-tag type="danger" effect="plain">异常 {{ summary.invalid ?? 0 }}</el-tag>
+              <el-tag type="info" effect="plain">剩余额度 {{ summary.quotaRemaining ?? '—' }} 点<template v-if="summary.quotaVideos?.producible != null"> ≈可出 {{ summary.quotaVideos.producible }} 条</template></el-tag>
+            </div>
+            <div v-if="summary.quotaReset" class="reset-line muted">
+              额度重置：{{ summary.quotaReset.tz }} 每天 {{ summary.quotaReset.hour }}:00<template v-if="summary.quotaReset.nextResetAt">（下次 {{ fmt(summary.quotaReset.nextResetAt) }}）</template>
             </div>
           </div>
 
@@ -301,6 +328,11 @@
               </template>
             </el-table-column>
 
+            <!-- 分组：运营自定，用于筛选和批量管理 -->
+            <el-table-column label="组" width="96" show-overflow-tooltip>
+              <template #default="{ row }"><span :class="row.group_name ? '' : 'muted'">{{ row.group_name || '未分组' }}</span></template>
+            </el-table-column>
+
             <!-- 状态：主行状态标签，副行会员 + 最后校验时间 -->
             <el-table-column label="状态" width="132">
               <template #default="{ row }">
@@ -314,6 +346,16 @@
                     </el-tag>
                   </span>
                   <span class="sub">{{ relTime(row.last_check_at) }}</span>
+                  <!-- 登录态是其余能力探测的**前提**：输入框都没出现时，15/30 秒的结论没有意义，
+                       所以这一行排在最前面。
+                       三个词刻意互不重叠，且都控制在 7 字以内 —— 列宽只有 132px，
+                       写「未确认·已暂停选号」会被截断成「登录态：未确认·已…」，
+                       最该看清的一行反而看不全（实测踩到）。详情交给 tooltip。 -->
+                  <span class="sub" :class="row.login_state === 'unavailable' ? 'login-blocked' : ''"
+                    :title="row.login_note || '尚未确认登录态（未做只读探测）'">
+                    登录态：{{ row.login_state === 'available' ? '正常'
+                      : (row.login_state === 'unavailable' ? '已停选' : '未探测') }}
+                  </span>
                   <span class="sub native-capability" :title="row.native_15s_note || '尚未做原生 15 秒页面探测'">
                     15秒：{{ row.native_15s_state === 'available' ? '已确认' : (row.native_15s_state === 'unavailable' ? '未提供' : '待探测') }}
                   </span>
@@ -378,10 +420,14 @@
                       <el-dropdown-menu>
                         <el-dropdown-item v-if="can('dola:check')" command="credits">查额度</el-dropdown-item>
                         <el-dropdown-item v-if="can('dola:update')" command="set_credits">录入额度</el-dropdown-item>
+                        <el-dropdown-item v-if="can('dola:create')" command="testGenerate">测试生成</el-dropdown-item>
+                        <el-dropdown-item v-if="can('dola:update') && row.cooldown_until && new Date(row.cooldown_until) > new Date()" command="recover">解除冷却</el-dropdown-item>
+                        <el-dropdown-item v-if="can('dola:update')" command="resetQuota">重置额度</el-dropdown-item>
                         <el-dropdown-item v-if="can('dola:check')" command="probe">接口探测</el-dropdown-item>
                         <el-dropdown-item v-if="can('dola:check')" command="native15">检查原生 15 秒</el-dropdown-item>
                         <el-dropdown-item v-if="can('dola:check')" command="native30">检查原生 30 秒</el-dropdown-item>
                         <el-dropdown-item v-if="can('dola:check')" command="referenceImages">检查参考图上传</el-dropdown-item>
+                        <el-dropdown-item v-if="can('dola:create')" command="helloProbe">发送“你好”探测</el-dropdown-item>
                         <el-dropdown-item command="toggle" divided v-if="can('dola:update')">
                           {{ row.status === 'disabled' ? '启用' : '停用' }}
                         </el-dropdown-item>
@@ -475,6 +521,7 @@
               并发 {{ provider.generation.running ?? 0 }}/{{ provider.generation.concurrency ?? 1 }} ·
               队列 {{ provider.generation.activeTasks ?? 0 }}/{{ provider.generation.queueLimit ?? 6000 }}
             </span>
+            <el-button v-if="can('dola:create')" plain @click="openApiWorkbench">V1 API 工作台</el-button>
             <el-button v-if="can('dola:create')" type="primary" @click="openBatchGen">批量创建</el-button>
             <el-button :icon="Refresh" :loading="generationLoading" @click="loadGeneration">刷新</el-button>
           </div>
@@ -658,6 +705,7 @@
         <el-form-item label="命名前缀">
           <el-input v-model="importForm.labelPrefix" placeholder="如：账号 → 账号001、账号002…" />
         </el-form-item>
+        <el-form-item label="账号来源"><el-input v-model="importForm.source" placeholder="可选，如：渠道A / 某批次（用于来源筛选）" /></el-form-item>
         <el-form-item label="备注"><el-input v-model="importForm.note" placeholder="可选，如：某渠道 / 某批次" /></el-form-item>
       </el-form>
       <el-alert v-if="importResult" :type="importResult.invalid ? 'warning' : 'success'" :closable="false" class="mt">
@@ -671,6 +719,86 @@
       <template #footer>
         <el-button @click="importDlg = false">关闭</el-button>
         <el-button type="primary" :loading="saving" @click="doImport">开始导入</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- ============ 单账号测试生成（会消耗真实额度，走网关链路扣积分） ============ -->
+    <el-dialog v-model="testGenDlg" title="测试生成" width="560px" :close-on-click-modal="false">
+      <el-alert type="warning" :closable="false" show-icon class="tip"
+        title="将在该账号上提交一条真实生成任务，消耗该账号额度和所选令牌积分，且不触发限流自动换号（测的就是这个号本身）。" />
+      <el-form label-width="90px" class="mt">
+        <el-form-item label="账号"><b>{{ testGenForm.label }}</b></el-form-item>
+        <el-form-item label="用户令牌" required>
+          <el-select v-model="testGenForm.tokenId" placeholder="选择要扣积分的用户令牌" filterable style="width: 100%">
+            <el-option v-for="t in tokenOptions" :key="t.id" :value="t.id"
+              :label="`${t.name || '令牌'}（${t.prefix}…，余 ${t.points} 分）`" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="时长">
+          <el-radio-group v-model="testGenForm.seconds">
+            <el-radio :label="10">10 秒</el-radio>
+            <el-radio :label="15">15 秒</el-radio>
+            <el-radio :label="20">20 秒</el-radio>
+            <el-radio :label="30">30 秒</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="提示词">
+          <el-input v-model="testGenForm.prompt" type="textarea" :rows="3" placeholder="可选，默认「测试生成（账号…, N 秒）」" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="testGenDlg = false">取消</el-button>
+        <el-button type="primary" :loading="testGenBusy" @click="doTestGenerate">提交测试</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- ============ 压力测试（批量提交真实任务，测号池吞吐） ============ -->
+    <el-dialog v-model="stressDlg" title="压力测试" width="560px" :close-on-click-modal="false">
+      <el-alert type="warning" :closable="false" show-icon class="tip"
+        title="按数量顺序提交真实生成任务进队列，由编排器按并发设置消费。不绑定账号，走正常选号与限流换号链路。" />
+      <el-form label-width="90px" class="mt">
+        <el-form-item label="用户令牌" required>
+          <el-select v-model="stressForm.tokenId" placeholder="选择要扣积分的用户令牌" filterable style="width: 100%">
+            <el-option v-for="t in tokenOptions" :key="t.id" :value="t.id"
+              :label="`${t.name || '令牌'}（${t.prefix}…，余 ${t.points} 分）`" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="任务数量">
+          <el-input-number v-model="stressForm.count" :min="1" :max="20" />
+          <span class="muted ml">条（1～20）</span>
+        </el-form-item>
+        <el-form-item label="时长">
+          <el-radio-group v-model="stressForm.seconds">
+            <el-radio :label="10">10 秒</el-radio>
+            <el-radio :label="15">15 秒</el-radio>
+            <el-radio :label="20">20 秒</el-radio>
+            <el-radio :label="30">30 秒</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="提示词前缀">
+          <el-input v-model="stressForm.prompt" placeholder="可选，默认「压力测试」，每条自动加 #i/N 后缀" />
+        </el-form-item>
+        <el-form-item label="预估消耗">
+          <span>约 <b class="points">{{ stressCost }}</b> 积分（按 2 点/条估算）+ 号池约 <b>{{ stressForm.count }}</b> 条额度</span>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="stressDlg = false">取消</el-button>
+        <el-button type="primary" :loading="stressBusy" @click="doStressTest">开始压测</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- ============ 批量分组 ============ -->
+    <el-dialog v-model="groupDlg" title="批量分组" width="440px">
+      <el-form label-width="90px">
+        <el-form-item label="分组">
+          <el-input v-model="groupForm.group" placeholder="如：渠道A / 测试组（留空 = 移出分组）" maxlength="32" show-word-limit />
+        </el-form-item>
+        <el-form-item label="范围"><span>选中的 {{ selected.length }} 个账号</span></el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="groupDlg = false">取消</el-button>
+        <el-button type="primary" :loading="groupBusy" @click="doBatchGroup">确定</el-button>
       </template>
     </el-dialog>
 
@@ -909,7 +1037,7 @@ const selected = ref([]);
 const total = ref(0);
 const loading = ref(false);
 const saving = ref(false);
-const query = reactive({ page: 1, pageSize: 20, keyword: '', status: '' });
+const query = reactive({ page: 1, pageSize: 20, keyword: '', status: '', group: '', source: '' });
 let accountRequestId = 0;
 
 const provider = ref({ settings: {} });
@@ -934,7 +1062,7 @@ const limitForm = reactive({
 });
 
 const importDlg = ref(false);
-const importForm = reactive({ raw: '', labelPrefix: '', note: '' });
+const importForm = reactive({ raw: '', labelPrefix: '', note: '', source: '' });
 const importResult = ref(null);
 
 const proxyDlg = ref(false);
@@ -998,6 +1126,18 @@ const revealDlg = ref(false);
 const revealValue = ref('');
 const noticeOpen = ref(false);   // 顶部说明默认收起
 
+// ---- 新增：测试生成 / 压力测试 / 批量分组 ----
+const testGenDlg = ref(false);
+const testGenBusy = ref(false);
+const testGenForm = reactive({ id: null, label: '', tokenId: null, seconds: 10, prompt: '' });
+const stressDlg = ref(false);
+const stressBusy = ref(false);
+const stressForm = reactive({ tokenId: null, count: 5, seconds: 10, prompt: '' });
+const stressCost = computed(() => Number(stressForm.count || 0) * 2); // 按 15 秒档 2 点/条估算
+const groupDlg = ref(false);
+const groupBusy = ref(false);
+const groupForm = reactive({ group: '' });
+
 const STATUS = { valid: '有效', invalid: '失效', unknown: '未校验', disabled: '已停用' };
 const statusLabel = (s) => STATUS[s] || s;
 const statusType = (s) => ({ valid: 'success', invalid: 'danger', unknown: 'info', disabled: 'warning' }[s] || 'info');
@@ -1014,6 +1154,7 @@ const maintenanceJob = computed(() => {
 });
 const maintenanceBusy = computed(() => maintenanceLoading.value || Boolean(maintenanceJob.value) || Boolean(isJobRunning(activeJob.value)));
 function jobTypeLabel(job) {
+  if (job.type === 'dola_hello_probe') return '发送“你好”探测';
   if (job.type === 'dola_native_15s') return '原生 15 秒探测';
   if (job.type === 'dola_native_30s') return '原生 30 秒探测';
   if (job.type === 'dola_reference_images') return '参考图上传探测';
@@ -1347,6 +1488,18 @@ function onBatchSecondsChange() {
   if (batchGenForm.seconds === 15) batchGenForm.mode = 'expert';
 }
 
+/**
+ * 令牌下拉的公共加载入口。
+ *
+ * ⚠️ 以前只有「批量生成」和「兑换」两个弹窗会去拉 /api/tokens/options，
+ * 而「测试生成」「压力测试」直接用 tokenOptions.value —— 只要没先开过那两个弹窗，
+ * 下拉框就必然是空的，选不了令牌（表现为忽好忽坏的幽灵 bug）。
+ * 现在凡是要点选令牌的弹窗，统一先走这里。
+ */
+async function loadTokenOptions() {
+  try { tokenOptions.value = (await api.get('/api/tokens/options')).items; } catch { /* 无权限 */ }
+}
+
 async function openBatchGen() {
   batchGenForm.prompts = '';
   batchGenForm.tokenId = null;
@@ -1358,7 +1511,11 @@ async function openBatchGen() {
   batchGenForm.points = null;
   batchGenResult.value = null;
   batchGenDlg.value = true;
-  try { tokenOptions.value = (await api.get('/api/tokens/options')).items; } catch { /* 无权限 */ }
+  await loadTokenOptions();
+}
+
+function openApiWorkbench() {
+  window.open(`${window.location.origin}/test.html`, '_blank', 'noopener,noreferrer');
 }
 
 async function submitBatchGen() {
@@ -1531,10 +1688,14 @@ async function runJob(type) {
   const useSelected = selected.value.length > 0;
   const label = jobTypeLabel({ type });
   const capabilityProbe = type === 'dola_native_15s' || type === 'dola_native_30s' || type === 'dola_reference_images';
-  const target = useSelected ? `选中的 ${selected.value.length} 个账号` : (capabilityProbe ? '全部有效且已绑定代理的账号' : '全部账号');
-  const detail = capabilityProbe
-    ? '这是串行只读页面探测：不填写提示词、不发送任务、不消耗生成额度；已确认的账号会自动跳过。参考图探测只认明确的图片文件控件。'
-    : '';
+  const helloProbe = type === 'dola_hello_probe';
+  const target = useSelected ? `选中的 ${selected.value.length} 个账号`
+    : (helloProbe ? '全部未停用账号' : (capabilityProbe ? '全部有效且已绑定代理的账号' : '全部账号'));
+  const detail = helloProbe
+    ? '会为每个账号新建一条普通 Dola 对话并发送固定文本“你好”，会留下聊天记录且可能消耗上游文本对话额度；视频生成请求会被拦截，不会创建视频任务或扣后台积分。只在本次手动任务中发送，不进入定时巡检。'
+    : (capabilityProbe
+      ? '这是串行只读页面探测：不填写提示词、不发送任务、不消耗生成额度；已确认的账号会自动跳过。参考图探测只认明确的图片文件控件。'
+      : '');
   try {
     await ElMessageBox.confirm(
       `${target}执行「${label}」？${detail ? `\n\n${detail}` : ''}`,
@@ -1557,6 +1718,15 @@ async function rowAction(row, action) {
 }
 
 async function rowMenu(row, cmd) {
+  if (cmd === 'helloProbe') {
+    try {
+      await ElMessageBox.confirm(
+        `给「${primaryName(row)}」新建一条普通对话并发送“你好”？会留下聊天记录且可能消耗上游文本对话额度；视频生成请求会被拦截。`,
+        '发送你好探测', { type: 'warning', confirmButtonText: '发送并探测', cancelButtonText: '取消' },
+      );
+    } catch { return; }
+    return rowAction(row, 'hello_probe');
+  }
   if (cmd === 'credits' || cmd === 'probe') {
     // 这两个原来在操作列上是独立按钮，现在收进「更多」
     return cmd === 'probe' ? probe(row) : rowAction(row, 'credits');
@@ -1565,6 +1735,19 @@ async function rowMenu(row, cmd) {
   if (cmd === 'native30') return probeNative(row, 30);
   if (cmd === 'referenceImages') return probeReferenceImages(row);
   if (cmd === 'set_credits') return openSetCredits(row);
+  if (cmd === 'testGenerate') return openTestGenerate(row);
+  if (cmd === 'recover') {
+    try { await ElMessageBox.confirm(`解除「${primaryName(row)}」的限流冷却？之后可立即参与选号。`, '解除冷却', { type: 'warning' }); } catch { return; }
+    await api.post(`/api/dola/accounts/${row.id}/action`, { action: 'recover' });
+    ElMessage.success('已解除冷却');
+    return load();
+  }
+  if (cmd === 'resetQuota') {
+    try { await ElMessageBox.confirm(`把「${primaryName(row)}」的剩余额度重置为每日总额？`, '重置额度', { type: 'warning' }); } catch { return; }
+    await api.post(`/api/dola/accounts/${row.id}/action`, { action: 'reset_quota' });
+    ElMessage.success('已重置额度');
+    return load();
+  }
   if (cmd === 'reset_counted') {
     try { await ElMessageBox.confirm(`撤销「${row.label}」的已计价标记？之后可以重新计价（换算流水保留）。`, '撤销计价', { type: 'warning' }); } catch { return; }
     await api.post(`/api/dola/accounts/${row.id}/action`, { action: 'reset_counted' });
@@ -1598,6 +1781,89 @@ async function bulkRemove() {
   const r = await api.del('/api/dola/accounts', { ids });
   ElMessage.success(`已删除 ${r.deleted} 个${r.skipped ? `，跳过 ${r.skipped} 个（有换算记录）` : ''}`);
   load();
+}
+
+/** 批量恢复：解除选中账号的限流冷却（对标 dola-pool「批量恢复」） */
+async function batchRecover() {
+  if (!selected.value.length) return;
+  try { await ElMessageBox.confirm(`解除选中的 ${selected.value.length} 个账号的限流冷却？之后可立即参与选号。`, '批量恢复', { type: 'warning' }); } catch { return; }
+  const r = await api.post('/api/dola/accounts/batch-recover', { ids: selected.value.map((x) => x.id) });
+  ElMessage.success(`已解除 ${r.updated} 个${r.skipped ? `，${r.skipped} 个不在冷却中` : ''}`);
+  load();
+}
+
+/** 重置额度：把选中账号的剩余额度拨回每日总额（对标 dola-pool「重置额度」） */
+async function batchResetQuota() {
+  if (!selected.value.length) return;
+  try { await ElMessageBox.confirm(`把选中的 ${selected.value.length} 个账号剩余额度重置为每日总额？`, '重置额度', { type: 'warning' }); } catch { return; }
+  const r = await api.post('/api/dola/accounts/batch-reset-quota', { ids: selected.value.map((x) => x.id) });
+  ElMessage.success(`已重置 ${r.updated} 个账号的额度`);
+  load();
+}
+
+/** 批量分组 */
+async function doBatchGroup() {
+  if (!selected.value.length) return;
+  groupBusy.value = true;
+  try {
+    const r = await api.post('/api/dola/accounts/batch-group', { ids: selected.value.map((x) => x.id), group: groupForm.group });
+    ElMessage.success(`已更新 ${r.updated} 个账号的分组`);
+    groupDlg.value = false;
+    load();
+  } finally { groupBusy.value = false; }
+}
+
+/** 单账号测试生成（对标 dola-pool「测试生成」）：打开弹窗选令牌 */
+async function openTestGenerate(row) {
+  testGenForm.id = row.id;
+  testGenForm.label = primaryName(row);
+  testGenForm.seconds = 10;
+  testGenForm.prompt = '';
+  testGenDlg.value = true;
+  await loadTokenOptions();
+  testGenForm.tokenId = tokenOptions.value?.[0]?.id ?? null;
+}
+async function doTestGenerate() {
+  if (!testGenForm.tokenId) return ElMessage.warning('先选择用户令牌（测试生成走网关链路扣积分）');
+  try {
+    await ElMessageBox.confirm(
+      `在账号「${testGenForm.label}」上提交一条 ${testGenForm.seconds} 秒测试生成？将消耗该账号的真实额度和令牌积分，且不触发限流自动换号。`,
+      '测试生成', { type: 'warning' });
+  } catch { return; }
+  testGenBusy.value = true;
+  try {
+    const r = await api.post(`/api/dola/accounts/${testGenForm.id}/test-generate`, {
+      tokenId: testGenForm.tokenId, seconds: testGenForm.seconds, prompt: testGenForm.prompt,
+    });
+    testGenDlg.value = false;
+    ElMessage.success(`已提交测试任务 #${r.taskId}`);
+    loadGeneration();
+  } finally { testGenBusy.value = false; }
+}
+
+/** 压力测试（对标 dola-pool「压力测试」）：打开弹窗配数量 */
+async function openStress() {
+  stressForm.count = 5;
+  stressForm.seconds = 10;
+  stressForm.prompt = '';
+  stressDlg.value = true;
+  await loadTokenOptions();
+  stressForm.tokenId = tokenOptions.value?.[0]?.id ?? null;
+}
+async function doStressTest() {
+  if (!stressForm.tokenId) return ElMessage.warning('先选择用户令牌（压力测试走网关链路扣积分）');
+  try {
+    await ElMessageBox.confirm(
+      `提交 ${stressForm.count} 条 ${stressForm.seconds} 秒压测任务？预计消耗令牌约 ${stressCost.value} 积分、号池约 ${stressForm.count} 条额度。`,
+      '压力测试', { type: 'warning' });
+  } catch { return; }
+  stressBusy.value = true;
+  try {
+    const r = await api.post('/api/dola/stress-test', { ...stressForm });
+    ElMessage.success(`压测提交完成：成功 ${r.okCount} / 失败 ${r.failCount}`);
+    stressDlg.value = false;
+    loadGeneration();
+  } finally { stressBusy.value = false; }
 }
 
 /** 打开任务窗口并开始轮询 */
@@ -1706,7 +1972,7 @@ async function openConvert() {
   convertForm.tokenId = null;
   convertPreview.value = null;
   convertDlg.value = true;
-  try { tokenOptions.value = (await api.get('/api/tokens/options')).items; } catch { /* 无权限 */ }
+  await loadTokenOptions();
 }
 
 async function doConvert(dryRun) {
@@ -1819,6 +2085,9 @@ onUnmounted(() => {
 .label { font-size: 12px; color: var(--el-text-color-secondary); }
 .num { font-size: 22px; font-weight: 700; line-height: 1.35; font-variant-numeric: tabular-nums; }
 .sub { font-size: 11.5px; color: var(--el-text-color-secondary); opacity: .85; line-height: 1.5; }
+/* 登录态未确认 = 该号已被排除在选号之外（不是"账号坏了"）。
+   用 warning 而不是 danger：这是一种待复核的暂停态，不是终态失效。 */
+.login-blocked { color: var(--el-color-warning); opacity: 1; font-weight: 600; }
 .tabs :deep(.el-tabs__header) { margin-bottom: 14px; }
 /* 固定操作列需要不透明底色，窄屏滚动时不能透出后面的说明文字。 */
 :deep(.el-table .row-danger > td.el-table__cell) {
@@ -1851,6 +2120,10 @@ onUnmounted(() => {
 .replenish-banner { margin-bottom: 12px; }
 .replenish-body { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .replenish-actions { display: inline-flex; gap: 8px; flex-shrink: 0; }
+/* 号池统计行：满额/半额/可出条数 + 额度重置时区（对标 dola-pool 顶栏） */
+.pool-meta { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.stat-chips { display: inline-flex; gap: 8px; flex-wrap: wrap; }
+.reset-line { font-size: 12px; }
 /* 出口代理标识：小到不抢戏，但"直连"必须能一眼看见 */
 .px-tag {
   display: inline-block; margin-left: 6px; padding: 0 5px;

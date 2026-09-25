@@ -27,7 +27,17 @@ export function createGateway({ url = '', key = '', timeout = 15000, createTimeo
       });
       const j = await r.json().catch((error) => { if (ctrl.signal.aborted) throw error; return {}; });
       if (!r.ok) {
-        throw Object.assign(new Error(j.message || `网关返回 HTTP ${r.status}`), { status: r.status, raw: j });
+        // ⚠️ `code` 必须一起透传。控制面用 `code` 区分"同一个 HTTP 状态下的不同原因"，
+        //    只给 `status` 会让用户面只能靠 message 文案猜。
+        //    实例：额度拒绝是 `429 + code=DAILY_POINTS_LIMIT`（"今天别试了"），
+        //    而 429 也可能是上游限流（"稍等重试"）—— 两者的处理方式完全不同，
+        //    丢掉 code 就只能把 message 拿去匹配中文，改一次文案就崩。
+        //    超时分支（下面）本来就有 code，这里补齐才算一致。
+        throw Object.assign(new Error(j.message || `网关返回 HTTP ${r.status}`), {
+          status: r.status,
+          code: j.code || null,
+          raw: j,
+        });
       }
       return j;
     } catch (e) {

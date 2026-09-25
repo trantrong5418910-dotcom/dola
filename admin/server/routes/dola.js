@@ -24,13 +24,17 @@ import {
 } from '../dola/provider.js';
 import { proxyOf, proxyUrlOf } from '../dola/proxy.js';
 import { accountHealth, creditBalanceFromHits, quotaObservation, summarizeQuota } from '../dola/account-observations.js';
-import { isVerifiedNativeCapability } from '../dola/generation-policy.js';
-import { cancelVideoTask, generationStatus, getVideoTask, resolvePendingSubmission } from '../dola/generator.js';
+import { isVerifiedNativeCapability, requireGenerationProxy } from '../dola/generation-policy.js';
+import { sendHelloProbeViaBrowser } from '../dola/hello-probe.js';
+import { cancelVideoTask, generationStatus, getVideoTask, resolvePendingSubmission, generationRouteView } from '../dola/generator.js';
 import { listPendingSubmissions, listBlockedAccounts, countPendingSubmissions } from '../dola/submission-journal.js';
 import { settleFailedVideoRefund } from '../dola/generation-billing.js';
 import { referenceImageEvidenceNote } from '../dola/reference-images.js';
-import { generationAnalytics } from '../dola/generation-analytics.js';
+import { generationAnalytics, classifyFailure } from '../dola/generation-analytics.js';
 import { listGenerationGuards, clearGenerationGuard } from '../dola/generation-guards.js';
+import { chainTextSnapshot } from '../dola/chain-text-rules.js';
+import { accountRotationView } from '../dola/proxy-epoch.js';
+import { ALERT_THRESHOLDS, buildAlerts, collectMetrics } from '../metrics.js';
 import { submitGenerationTask, GatewayTaskError } from './gateway.js';
 
 const router = express.Router();
@@ -48,6 +52,50 @@ const boolSetting = (k, d = false) => getSetting(k, d ? 'true' : 'false') === 't
 const autoMaintenanceEnabled = () => process.env.DOLA_AUTO_MAINTENANCE === 'false'
   ? false
   : boolSetting('dola_auto_maintenance_enabled', true);
+
+/**
+ * 每日额度重置信息（对标 dola-pool 顶栏「额度重置：Asia/Tokyo 每天 0:00（下次 …）」）。
+ *
+ * 上游按配置时区的当地时间每日 `dola_quota_reset_hour` 点重置免费额度。
+ * 这里只做「下次重置时刻」的计算与展示；quotaObservation 的「今日是否新鲜」
+ * 仍沿用 UTC 日界（改动会影响现有测试与统计口径，如需切换再单独做）。
+ */
+function zonedParts(date, tz) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  }).formatToParts(date);
+  const p = {};
+  for (const x of parts) p[x.type] = x.value;
+  return { y: +p.year, m: +p.month, d: +p.day, h: +p.hour % 24, min: +p.minute, s: +p.second };
+}
+/** 把「某时区墙钟时间」换算成 UTC Date（迭代逼近，处理 DST）。 */
+function zonedWallToUtc(y, m, d, h, mi, s, tz) {
+  const target = Date.UTC(y, m - 1, d, h, mi, s);
+  let utc = target;
+  for (let i = 0; i < 3; i++) {
+    const z = zonedParts(new Date(utc), tz);
+    utc += target - Date.UTC(z.y, z.m - 1, z.d, z.h, z.min, z.s);
+  }
+  return new Date(utc);
+}
+function quotaResetInfo(at = new Date()) {
+  const tz = String(getSetting('dola_quota_reset_tz', 'Asia/Tokyo') || 'Asia/Tokyo').trim() || 'Asia/Tokyo';
+  let hour = Number(getSetting('dola_quota_reset_hour', '0'));
+  if (!Number.isInteger(hour) || hour < 0 || hour > 23) hour = 0;
+  let nextResetAt = null;
+  try {
+    const z = zonedParts(at, tz);
+    let { y, m, d } = z;
+    const passed = z.h > hour || (z.h === hour && (z.min > 0 || z.s > 0));
+    if (passed) {
+      const tmp = new Date(Date.UTC(y, m - 1, d) + 86400000);
+      y = tmp.getUTCFullYear(); m = tmp.getUTCMonth() + 1; d = tmp.getUTCDate();
+    }
+    nextResetAt = zonedWallToUtc(y, m, d, hour, 0, 0, tz).toISOString();
+  } catch { nextResetAt = null; }
+  return { tz, hour, nextResetAt };
+}
 
 /**
  * Read-only proxy isolation summary. The exit IP itself never leaves this
@@ -243,6 +291,51 @@ registerJobHandler('dola_check', async (accountId, ctx = {}) => {
   };
 });
 
+/** Explicit chat probe: one ordinary “你好” message, never part of scheduled maintenance. */
+registerJobHandler('dola_hello_probe', async (accountId) => {
+  const acc = db.prepare('SELECT * FROM dola_accounts WHERE id=?').get(accountId);
+  if (!acc) return { ok: false, message: '账号不存在' };
+  if (acc.status === 'disabled') return { ok: false, message: '账号已停用，跳过' };
+  if (db.prepare("SELECT id FROM dola_videos WHERE account_id=? AND status IN ('queued','submitting','generating','resolving') LIMIT 1").get(accountId)) {
+    return { ok: false, message: '账号正在生成，跳过本次发送' };
+  }
+
+  const cookies = accountCookies(acc);
+  const missing = missingRequired(cookies);
+  let result;
+  if (missing.length) {
+    result = { state: 'unavailable', message: `缺少关键 Cookie：${missing.join(', ')}，未发送` };
+  } else {
+    const proxyUrl = proxyUrlOf(acc);
+    try {
+      requireGenerationProxy(proxyUrl);
+      result = await sendHelloProbeViaBrowser(cookies, {
+        accountId,
+        proxyUrl,
+        proxy: proxyOf(acc),
+      });
+    } catch (error) {
+      result = { state: 'unknown', message: `${error.message || '代理不可用'}，未发送` };
+    }
+  }
+
+  const at = now();
+  const loginState = result.state === 'available' ? 'available'
+    : result.state === 'unavailable' ? 'unavailable' : 'unknown';
+  const nextStatus = result.state === 'available' ? 'valid'
+    : result.state === 'unavailable' ? 'invalid' : null;
+  const definitive = result.state === 'available' || result.state === 'unavailable';
+  const loginFields = definitive ? 'login_state=?, login_at=?, login_note=?,' : '';
+  const written = db.prepare(`UPDATE dola_accounts SET status=COALESCE(?,status), ${loginFields}
+      last_check_at=?, last_error=?, updated_at=?
+    WHERE id=? AND cookie_hash=? AND proxy=? AND status <> 'disabled'`)
+    .run(nextStatus, ...(definitive ? [loginState, at, String(result.message || '').slice(0, 500)] : []), at,
+      result.state === 'available' ? '' : String(result.message || '').slice(0, 500), at,
+      accountId, acc.cookie_hash, acc.proxy);
+  if (!written.changes) return { ok: false, message: '账号信息已更新或已停用，丢弃本次探测结果' };
+  return { ok: result.state === 'available', message: result.message || '探测结果未知' };
+});
+
 /** 查额度：先纯 HTTP 试，拿不到再按配置走浏览器通道 */
 registerJobHandler('dola_credits', async (accountId) => readAccountCredits(accountId));
 
@@ -379,7 +472,85 @@ router.get('/provider', requirePerm('dola:list'), async (req, res) => {
 
 router.get('/generation-analytics', requirePerm('dola:list'), (req, res) => {
   try {
-    res.json({ ...generationAnalytics(db, { hours: req.query.hours, timezone: req.query.timezone }), guards: listGenerationGuards(db) });
+    res.json({
+      ...generationAnalytics(db, { hours: req.query.hours, timezone: req.query.timezone }),
+      guards: listGenerationGuards(db),
+      // 上游文本分类计数 + 协议漂移告警（见 dola/chain-text-rules.js）。
+      // 放在这个接口是因为这里本来就是「生成统计与复核」的入口，运维不用再找第二个地方。
+      chainText: chainTextSnapshot(),
+    });
+  } catch (error) {
+    if (error.status === 400) return res.status(400).json({ ok: false, message: error.message });
+    throw error;
+  }
+});
+
+// 聚合告警（对照参考站 /admin/alerts）：把散落各处的告警信号收成一处。
+//
+// 为什么需要：协议漂移在 chainText 里、号池容量在 /route 里、代理健康在 proxy-pool 的响应里、
+// 任务卡住只有日志里有 —— 排障时要开四个地方对着看，等于没有告警面。
+// 这里只做**聚合与判定**，不新增任何数据采集（口径全部来自 metrics.js 的同一份快照，
+// 所以 /metrics 与这个接口永远一致）。
+router.get('/alerts', requirePerm('dola:list'), (req, res) => {
+  try {
+    const snapshot = collectMetrics({ db, chainTextSnapshot, generationStatus });
+    const alerts = buildAlerts(snapshot);
+    res.json({
+      ok: true,
+      collectedAt: snapshot.collectedAt,
+      // 活跃告警放最前，运维一眼看到"现在有没有事"
+      active: alerts.filter((a) => a.active),
+      alerts,
+      thresholds: ALERT_THRESHOLDS,
+      metricsEndpoint: '/metrics',
+    });
+  } catch (error) {
+    // ⚠️ 采集失败时**必须**报错，绝不能"没有告警 = 一切正常"地回一个 active:[]。
+    //    那会把"我自己坏了"伪装成"系统很健康"，是告警面上最危险的失败模式
+    //    （和 /metrics 采集失败返回 500 而不是 200+半份指标同一个道理）。
+    console.error('[alerts] 采集失败：', error);
+    res.status(500).json({ ok: false, message: `告警采集失败：${error.message}` });
+  }
+});
+
+// 路由决策（对照参考站 /admin/route）：为什么选这个号、为什么没选那个号。
+// 纯读接口，不加任何调度复杂度 —— 但把排障从「翻日志猜」变成「查一次」。
+//
+// ⚠️ 「出口还能用多久」的补全放在**这里**、而不是 generationRouteView 里面：
+//    那个函数被 `test/generator-isolated.mjs` 用"剥掉 import 的源码切片"跑，
+//    往它里面加 import 就必须同步改沙箱，否则报错信息会指向调度逻辑
+//    （"限流账号应进入冷却"之类），完全看不出是少了沙箱绑定。
+function withAccountRotation(view) {
+  if (!view || !Array.isArray(view.ranked)) return view;
+  let proxyByAccount = new Map();
+  try {
+    proxyByAccount = new Map(db.prepare('SELECT id, proxy FROM dola_accounts').all()
+      .map((a) => [Number(a.id), String(a.proxy || '')]));
+  } catch {
+    return view;  // 读不到就当没有：这个补充字段不该让整个排障接口挂掉
+  }
+  return {
+    ...view,
+    ranked: view.ranked.map((row) => ({
+      ...row,
+      // ⚠️ `estimate:true` 是诚实的：算出来的到期时间只是**上界**，
+      //    `stale` 只表示"该重新探测了"，**不是**"已经轮换"（见 dola/proxy-epoch.js）。
+      rotation: accountRotationView({ proxy: proxyByAccount.get(Number(row.id)) }, { database: db }),
+    })),
+  };
+}
+
+router.get('/route', requirePerm('dola:list'), (req, res) => {
+  try {
+    const seconds = req.query.seconds == null ? null : Number(req.query.seconds);
+    if (seconds != null && ![10, 15, 20, 30].includes(seconds)) {
+      return res.status(400).json({ ok: false, message: 'seconds 仅支持 10、15、20 或 30' });
+    }
+    res.json(withAccountRotation(generationRouteView({
+      seconds,
+      requireReferenceImages: req.query.reference === '1' || req.query.reference === 'true',
+      limit: req.query.limit,
+    })));
   } catch (error) {
     if (error.status === 400) return res.status(400).json({ ok: false, message: error.message });
     throw error;
@@ -402,13 +573,23 @@ router.post('/accounts/:id/generation-guard-probe', requirePerm('dola:check'), a
     const options = { timeout: 60000, proxy: proxyOf(acc), proxyUrl: proxyUrlOf(acc) };
     const result = scope === 'reference-images'
       ? await probeReferenceImageViaBrowser(accountCookies(acc), options)
-      : await probeNativeVideoViaBrowser(accountCookies(acc), { ...options, seconds: Number(scope.split(':')[1]) });
+      // ★ 登录防护没有 durations 段，scope.split(':')[1] 会是 NaN —— 必须单独分支。
+      //   解除凭据 = 真的拿到创作面板。用最短的原生档位（10 秒）去证：
+      //   它是最普遍支持的档位，也正好对应线上主要负载（全部任务都是 10 秒）。
+      : scope === 'login'
+        ? await probeNativeVideoViaBrowser(accountCookies(acc), { ...options, seconds: 10 })
+        : await probeNativeVideoViaBrowser(accountCookies(acc), { ...options, seconds: Number(scope.split(':')[1]) });
     const cleared = clearGenerationGuard(db, guard, acc, result);
     audit(req, 'dola.generation_guard_probe', 'dola_account', id, `scope=${scope}; cleared=${cleared}`);
     return res.json({ ok: true, cleared, state: !cleared && result.state === 'available' ? 'unknown' : result.state,
-      message: cleared ? '只读复核通过，已解除该能力保护；未提交视频，不保证额度或实际成片成功'
-        : result.rewriteCarrier === true ? '只确认了较短时长的页面控件，不能证明目标时长能力；保留失败保护，未提交视频'
-        : '未完成能力确认或账号状态已变化，保留保护；未提交视频' });
+      message: cleared
+        ? (scope === 'login'
+          ? '只读复核通过：已确认页面处于登录态且创作输入框可用，已解除登录保护；未提交视频，不保证额度或实际成片成功'
+          : '只读复核通过，已解除该能力保护；未提交视频，不保证额度或实际成片成功')
+        : scope === 'login'
+          ? '未确认登录态（创作输入框仍未出现）或账号状态已变化，保留登录保护；未提交视频'
+          : result.rewriteCarrier === true ? '只确认了较短时长的页面控件，不能证明目标时长能力；保留失败保护，未提交视频'
+            : '未完成能力确认或账号状态已变化，保留保护；未提交视频' });
   } catch {
     return res.status(502).json({ ok: false, message: '只读复核未完成，保护保持生效；未提交视频' });
   } finally { guardProbes.delete(id); }
@@ -471,10 +652,12 @@ router.post('/generation-tasks/batch', requirePerm('dola:create'), async (req, r
       });
       results.push({ prompt, ok: true, taskId: r.taskId, status: r.status, balance: r.balance });
     } catch (e) {
+      const diagnostic = e instanceof GatewayTaskError ? e.fields?.diagnostic : null;
       results.push({
         prompt, ok: false,
         error: e.message || '提交失败',
         code: e instanceof GatewayTaskError ? (e.code || null) : 'SUBMIT_ERROR',
+        ...(diagnostic ? { diagnostic } : {}),
       });
     }
   }
@@ -699,7 +882,8 @@ router.post('/maintenance/run', requirePerm('dola:check'), (req, res) => {
 
 /** POST /api/dola/accounts/import —— 批量粘贴导入 */
 router.post('/accounts/import', requirePerm('dola:import'), (req, res) => {
-  const { raw = '', items = null, labelPrefix = '', note = '' } = req.body || {};
+  const { raw = '', items = null, labelPrefix = '', note = '', source = '' } = req.body || {};
+  const accountSource = String(source || '').trim().slice(0, 64);
   const list = [];
 
   if (Array.isArray(items) && items.length) {
@@ -726,8 +910,8 @@ router.post('/accounts/import', requirePerm('dola:import'), (req, res) => {
   if (!list.length) return res.status(400).json({ ok: false, message: '没解析到任何账号' });
 
   const stmt = db.prepare(`INSERT INTO dola_accounts
-    (label,account_hint,cookie,cookie_hash,cookie_names,status,note,imported_by,created_at,updated_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?)`);
+    (label,account_hint,cookie,cookie_hash,cookie_names,status,note,source,imported_by,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
 
   /**
    * 「同一个账号重新导入 = 刷新它的 cookie」。
@@ -746,7 +930,8 @@ router.post('/accounts/import', requirePerm('dola:import'), (req, res) => {
         native_15s_state='unknown', native_15s_at=NULL, native_15s_note='',
         native_30s_state='unknown', native_30s_at=NULL, native_30s_note='',
         reference_image_state='unknown', reference_image_at=NULL, reference_image_note='',
-        note=COALESCE(NULLIF(?, ''), note), updated_at=?
+        note=COALESCE(NULLIF(?, ''), note),
+        source=COALESCE(NULLIF(?, ''), source), updated_at=?
     WHERE id=?`);
 
   let inserted = 0, skipped = 0, invalid = 0, refreshed = 0;
@@ -766,7 +951,7 @@ router.post('/accounts/import', requirePerm('dola:import'), (req, res) => {
     // ① 同一账号 → 原地刷新
     if (existByLabel) {
       refreshStmt.run(JSON.stringify(cookies), hash, names.join(','), existByLabel.status === 'disabled' ? 'disabled' : 'unknown', '',
-        note, now(), existByLabel.id);
+        note, accountSource, now(), existByLabel.id);
       refreshedIds.push(existByLabel.id);
       refreshed++;
       continue;
@@ -781,7 +966,7 @@ router.post('/accounts/import', requirePerm('dola:import'), (req, res) => {
     const label = actualLabel || `${labelPrefix || '账号'}${String(inserted + skipped + invalid + 1).padStart(3, '0')}`;
     const info = stmt.run(label, '', JSON.stringify(cookies), hash, names.join(','),
       missing.length ? 'invalid' : 'unknown',
-      note, req.user.id, now(), now());
+      note, accountSource, req.user.id, now(), now());
     createdIds.push(info.lastInsertRowid);
     inserted++;
     if (missing.length) problems.push(`${label} 缺少 ${missing.join(',')}`);
@@ -831,7 +1016,7 @@ function replenishAdvice(summary) {
 
 /** GET /api/dola/accounts */
 router.get('/accounts', requirePerm('dola:list'), (req, res) => {
-  const { page = 1, pageSize = 20, keyword = '', status = '' } = req.query;
+  const { page = 1, pageSize = 20, keyword = '', status = '', group = '', source = '' } = req.query;
   const where = [];
   const params = [];
   if (keyword) {
@@ -839,6 +1024,8 @@ router.get('/accounts', requirePerm('dola:list'), (req, res) => {
     params.push(`%${keyword}%`, `%${keyword}%`, `%${keyword}%`, `%${keyword}%`);
   }
   if (status) { where.push('status = ?'); params.push(status); }
+  if (group) { where.push('group_name = ?'); params.push(group); }
+  if (source) { where.push('source = ?'); params.push(source); }
   const w = where.length ? ` WHERE ${where.join(' AND ')}` : '';
 
   const total = db.prepare(`SELECT COUNT(*) AS c FROM dola_accounts${w}`).get(...params).c;
@@ -877,7 +1064,33 @@ router.get('/accounts', requirePerm('dola:list'), (req, res) => {
       SUM(CASE WHEN proxy IS NOT NULL AND proxy <> '' THEN 1 ELSE 0 END) AS withProxy,
       SUM(CASE WHEN status='valid' AND (proxy IS NULL OR proxy = '') THEN 1 ELSE 0 END) AS validNoProxy
     FROM dola_accounts`).get(now());
-  Object.assign(summary, summarizeQuota(db.prepare(`SELECT status,cooldown_until,quota_remaining,quota_at,quota_source FROM dola_accounts`).all()));
+  const quotaRows = db.prepare(`SELECT status,cooldown_until,quota_remaining,quota_total,quota_at,quota_source FROM dola_accounts`).all();
+  Object.assign(summary, summarizeQuota(quotaRows));
+  // 满额 / 半额：只统计「有效、未冷却、额度已确认」的账号。
+  // 满额 = 剩余额度 >= 每日总额；半额 = 有剩余但没满。
+  const at = now();
+  let fullQuota = 0, halfQuota = 0;
+  for (const r of quotaRows) {
+    if (r.status !== 'valid') continue;
+    if (r.cooldown_until && r.cooldown_until > at) continue;
+    const obs = quotaObservation(r, at);
+    if (obs.state !== 'confirmed') continue;
+    const total = Number(r.quota_total) || 0;
+    if (total > 0 && obs.remaining >= total) fullQuota++;
+    else if (obs.remaining > 0) halfQuota++;
+  }
+  Object.assign(summary, {
+    fullQuota,
+    halfQuota,
+    // 剩余额度可出条数：按 15 秒档 2 点/条估算（与用户选择的 2 额度档一致）。
+    quotaVideos: {
+      pointsPerVideo: 2,
+      producible: summary.quotaRemaining != null ? Math.floor(summary.quotaRemaining / 2) : null,
+    },
+    groups: db.prepare(`SELECT DISTINCT group_name AS g FROM dola_accounts WHERE group_name <> '' ORDER BY g`).all().map((r) => r.g),
+    sources: db.prepare(`SELECT DISTINCT source AS s FROM dola_accounts WHERE source <> '' ORDER BY s`).all().map((r) => r.s),
+    quotaReset: quotaResetInfo(),
+  });
   Object.assign(summary, proxyExitSummary());
   Object.assign(summary, { replenish: replenishAdvice(summary) });
 
@@ -921,6 +1134,12 @@ router.post('/accounts/:id/probe', requirePerm('dola:check'), async (req, res) =
   }
 });
 
+/**
+ * 30 秒的探测允许走「上游合成」档位（页面自己把某档标成 `30s (15s ×2)`）。
+ * 这条路径只在设置 dola_upstream_concat=true 时才认，见 upstreamConcatEnabled()。
+ */
+const upstreamConcatEnabled = () => boolSetting('dola_upstream_concat', false);
+
 /** Read-only page capability checks; never part of automatic session maintenance. */
 const NATIVE_PROBE_CONFIG = Object.freeze({
   15: {
@@ -935,7 +1154,12 @@ const NATIVE_PROBE_CONFIG = Object.freeze({
     jobType: 'dola_native_30s',
     probe: probeNativeThirtySecondViaBrowser,
     auditName: 'dola.native_30s_probe',
-    successNote: '已确认页面 15 秒载体可用（Seedance 2.5，2 额度档，请求改写 duration=30）',
+    allowUpstreamConcat: true,
+    // 备注按**实际来源**写，不要把两种 30 秒混成一句话：
+    // 载体改写是我们把 15s 请求改成 30s；上游合成是页面自己就标着 30 秒。
+    successNote: result => result?.source === 'upstream_concat'
+      ? '已确认页面提供上游合成档位（30s = 15s ×2，拆段与首尾相接均在上游完成，本服务不做本地拼接）'
+      : '已确认页面 15 秒载体可用（Seedance 2.5，2 额度档，请求改写 duration=30）',
   },
 });
 
@@ -973,6 +1197,8 @@ async function probeNativeCapability(accountId, seconds) {
 
   const cookies = accountCookies(acc);
   const missing = missingRequired(cookies);
+  // 只有 30 秒档位 + 设置开启时，才允许把「上游合成」当成可用证据。
+  const concatAllowed = Boolean(config.allowUpstreamConcat) && upstreamConcatEnabled();
   let result;
   if (missing.length) {
     result = { ok: false, state: 'unknown', error: '缺少关键 cookie，未进行能力判定' };
@@ -985,23 +1211,53 @@ async function probeNativeCapability(accountId, seconds) {
         // 传下去让探测复用该账号的持久化 profile —— 命中缓存后热启动只要 ~0.36MB，
         // 否则每次冷启动 12MB，走 5Mbps 静态 IP 时必然超时、结果被记成 unknown。
         accountId: id,
+        allowUpstreamConcat: concatAllowed,
       });
-    } catch {
+    } catch (e) {
+      // 诊断日志：这里原先是裸 catch，会把真实异常一口吞掉，
+      // 页面只剩一句笼统的「页面、登录状态或网络未能完成只读能力探测」，永远查不到根因。
+      console.error(`[probe] ${seconds}s capability probe threw for account ${id}: name=${e?.name || 'unknown'} code=${e?.code || 'none'} message=${String(e?.message || e).slice(0, 300)}`);
       result = { ok: false, state: 'unknown', error: '页面、登录状态或网络未能完成只读能力探测' };
     }
   }
 
-  const nativeVerified = isVerifiedNativeCapability(result, config.seconds);
+  const nativeVerified = isVerifiedNativeCapability(result, config.seconds, { allowUpstreamConcat: concatAllowed });
   const state = nativeVerified ? 'available'
     : result?.state === 'unavailable' ? 'unavailable' : 'unknown';
-  const note = String(nativeVerified ? config.successNote
-    : (result?.error || '本次未完成能力判定')).slice(0, 300);
+  /**
+   * ★ 登录态（对照参考站 §4 的 logged_in 字段 / unsigned 独立状态）。三态、绝不猜：
+   *   'available'   探针真的认出了创作面板 → 已登录（探针顺便覆盖了登录态，不用再单跑一次）
+   *   'unavailable' 页面**已经加载**、但创作输入框始终没出现（"未确认已登录的创作页面"）→ 未登录
+   *   null          证据不足（页面根本没打开 / 控件没加载完 / 其它）→ 保持原值不动
+   *
+   * ⚠️ 判据用 classifyFailure 而不是 result.reason：**一个真相来源**，探测链路和任务链路同口径。
+   *    不能用 reason==='VIDEO_PAGE_NOT_READY' —— 实测（#408）探针整体超时时外层会把
+   *    reason 覆写成 VIDEO_PREPARATION_TIMEOUT，把更具体的"输入框没出现"盖掉，于是漏判。
+   *    文案「未确认已登录的创作页面」只出自 native-capability.js:156 一处抛出点，
+   *    且不含「创作条…未完成加载」（那种输入框已出现 = 已登录），所以按文案判是精确的。
+   *
+   * ⚠️ 必须排除「页面没打开」：2026-09-25 实测，代理会话失效时也报同一句话，
+   *    拿它写 unavailable 会把**可用账号**（实测 #420）封掉。这就是 provider.js 保留导航异常的意义。
+   */
+  const loginState = nativeVerified ? 'available'
+    : (result?.pageLoaded !== false && classifyFailure(result?.error || '').code === 'login') ? 'unavailable'
+      : null;
+  // 备注里带上结构化 reason：只看中文长句分不清「时长控件没加载完」和「登录没确认」，
+  // 而这两件事该修的地方完全不同（对照参考站 §11 把「登录握手」单列一类日志）。
+  const successNote = typeof config.successNote === 'function' ? config.successNote(result) : config.successNote;
+  const note = String(nativeVerified ? successNote
+    : `${result?.error || '本次未完成能力判定'}${result?.reason ? `［${result.reason}］` : ''}`).slice(0, 300);
   const capabilityColumn = `native_${config.seconds}s`;
+  const loginSet = loginState ? `, login_state=?, login_at=?, login_note=?` : '';
   const updated = db.prepare(`UPDATE dola_accounts
-    SET ${capabilityColumn}_state=?, ${capabilityColumn}_at=?, ${capabilityColumn}_note=?, updated_at=?
+    SET ${capabilityColumn}_state=?, ${capabilityColumn}_at=?, ${capabilityColumn}_note=?, updated_at=?${loginSet}
     WHERE id=? AND cookie_hash=? AND proxy=? AND status <> 'disabled'`)
-    .run(state, now(), note, now(), id, acc.cookie_hash, acc.proxy).changes > 0;
-  return { status: 200, ok: nativeVerified, seconds: config.seconds, state, message: note, updated, label: acc.label };
+    .run(state, now(), note, now(),
+      ...(loginState ? [loginState, now(), loginState === 'available'
+        ? '只读探测已确认创作面板可用（登录态正常）'
+        : '页面已加载但创作输入框未出现，已暂停选号并等待只读复核'] : []),
+      id, acc.cookie_hash, acc.proxy).changes > 0;
+  return { status: 200, ok: nativeVerified, seconds: config.seconds, state, loginState, message: note, updated, label: acc.label };
 }
 
 /**
@@ -1035,7 +1291,9 @@ async function probeReferenceImageCapability(accountId) {
         proxy: proxyOf(acc),
         proxyUrl: proxyUrlOf(acc),
       });
-    } catch {
+    } catch (e) {
+      // 诊断日志：同上，参考图探测的裸 catch 也会吞掉真实异常。
+      console.error(`[probe] reference-image capability probe threw for account ${id}: name=${e?.name || 'unknown'} code=${e?.code || 'none'} message=${String(e?.message || e).slice(0, 300)}`);
       result = { ok: false, state: 'unknown', error: '页面、登录状态或网络未能完成只读能力探测' };
     }
   }
@@ -1172,6 +1430,37 @@ router.post('/accounts/proxy/verify', requirePerm('dola:update'), async (req, re
     // ⚠️ 一定要把 cause 带出来。fetch 会把底层错误包成笼统的 "fetch failed"，
     //    不看 cause 就只能靠猜（实测被这个坑掉过一次：真正原因是
     //    `invalid onRequestStart method`，两份 undici 版本不匹配）。
+    res.json({ ok: false, message: describeFetchError(e) });
+  }
+});
+
+/**
+ * POST /api/dola/accounts/:id/proxy/verify-persist —— 核验账号当前代理并写回出口 IP
+ *
+ * 与 /accounts/proxy/verify 的区别：verify 只测不存（配代理前预检用），
+ * 这个是给「已配置代理但 exit_ip 为空」的账号补核验：测到出口 IP 就写进 exit_ip，
+ * 列表的「待核验」状态才会更新。不改代理本身，不重配 SID。
+ */
+router.post('/accounts/:id/proxy/verify-persist', requirePerm('dola:update'), async (req, res) => {
+  const id = Number(req.params.id);
+  const acc = db.prepare('SELECT id, label, proxy FROM dola_accounts WHERE id=?').get(id);
+  if (!acc) return res.status(404).json({ ok: false, message: '账号不存在' });
+  const proxy = String(acc.proxy || '').trim();
+  if (!proxy) return res.status(400).json({ ok: false, message: '该账号未配置代理' });
+  try {
+    const { fetchVia } = await import('../dola/proxy.js');
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(new Error('代理探测超时 20s')), 20000);
+    try {
+      const r = await fetchVia('https://ipinfo.io/json', { signal: ctrl.signal }, proxy);
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.ip) return res.json({ ok: false, status: r.status, ip: j.ip ?? null, message: '出口检测失败' });
+      db.prepare('UPDATE dola_accounts SET exit_ip=?, updated_at=? WHERE id=?')
+        .run(String(j.ip), now(), id);
+      audit(req, 'dola.verify_proxy', 'dola_account', id, `${acc.label} 核验出口 ${j.ip}（${j.country || ''}${j.city || ''}）`);
+      res.json({ ok: true, ip: j.ip, country: j.country ?? null, region: j.region ?? null, city: j.city ?? null });
+    } finally { clearTimeout(timer); }
+  } catch (e) {
     res.json({ ok: false, message: describeFetchError(e) });
   }
 });
@@ -1414,10 +1703,14 @@ router.post('/accounts/proxy/assign', requirePerm('dola:update'), async (req, re
 const ACCOUNT_ACTION_PERMS = {
   check: ['dola:check', 'dola:update'],
   credits: ['dola:check', 'dola:update'],
+  hello_probe: ['dola:create'],
   reset_counted: ['dola:convert', 'dola:update'],
   disable: ['dola:update'],
   enable: ['dola:update'],
   set_credits: ['dola:update'],
+  set_group: ['dola:update'],
+  recover: ['dola:update'],
+  reset_quota: ['dola:update'],
 };
 const hasAnyPerm = (req, codes) => {
   const perms = req.user?.permissions || [];
@@ -1448,6 +1741,14 @@ router.post('/accounts/:id/action', requireAuth, async (req, res) => {
     return res.json({ ok: true, job });
   }
 
+  if (action === 'hello_probe') {
+    const active = db.prepare("SELECT id FROM jobs WHERE type='dola_hello_probe' AND status IN ('queued','running') LIMIT 1").get();
+    if (active) return res.status(409).json({ ok: false, message: `你好探测任务 #${active.id} 正在运行` });
+    const job = createJob({ type: 'dola_hello_probe', ids: [id], concurrency: 1, userId: req.user.id });
+    audit(req, 'dola.hello_probe', 'job', job.id, `单账号普通聊天探测：${acc.label}`);
+    return res.json({ ok: true, job });
+  }
+
   /**
    * 手动录入额度。
    * 存在的理由：自动查额度依赖尚未实测出来的字段；在你确认字段之前，
@@ -1472,6 +1773,40 @@ router.post('/accounts/:id/action', requireAuth, async (req, res) => {
     db.prepare('UPDATE dola_accounts SET counted_at=NULL, updated_at=? WHERE id=?').run(now(), id);
     audit(req, 'dola.reset_counted', 'dola_account', id, `${acc.label} 撤销计价标记（原 ${acc.counted_at}）`);
     return res.json({ ok: true });
+  }
+
+  /** 设置账号分组（运营自定，最长 32 字；空字符串 = 移出分组） */
+  if (action === 'set_group') {
+    const group = String(req.body?.group ?? '').trim().slice(0, 32);
+    db.prepare('UPDATE dola_accounts SET group_name=?, updated_at=? WHERE id=?').run(group, now(), id);
+    audit(req, 'dola.set_group', 'dola_account', id, `${acc.label} 分组「${acc.group_name || '未分组'}」→「${group || '未分组'}」`);
+    return res.json({ ok: true, group });
+  }
+
+  /**
+   * 手动解除限流冷却（对标 dola-pool「批量恢复」）。
+   * 只清 cooldown_until + last_error，不动 status —— 账号本身没坏过，
+   * 冷却只是「暂时别用它」。会写审计。
+   */
+  if (action === 'recover') {
+    if (!acc.cooldown_until) return res.status(400).json({ ok: false, message: '该账号不在冷却中' });
+    db.prepare('UPDATE dola_accounts SET cooldown_until=NULL, last_error=?, updated_at=? WHERE id=?')
+      .run('', now(), id);
+    audit(req, 'dola.recover', 'dola_account', id, `${acc.label} 手动解除冷却（原冷却至 ${acc.cooldown_until}）`);
+    return res.json({ ok: true });
+  }
+
+  /**
+   * 重置每日额度（对标 dola-pool「重置额度」）。
+   * 把 quota_remaining 拨回 quota_total，来源记 manual_reset。
+   * 注意：这只是本地记录的拨回，不代表上游真的重置了 —— 跨天后以生成回执为准。
+   */
+  if (action === 'reset_quota') {
+    const total = Number(acc.quota_total) || 0;
+    db.prepare(`UPDATE dola_accounts SET quota_remaining=?, quota_at=?, quota_source='manual_reset', updated_at=? WHERE id=?`)
+      .run(total, now(), now(), id);
+    audit(req, 'dola.reset_quota', 'dola_account', id, `${acc.label} 重置额度 ${acc.quota_remaining ?? '-'} → ${total}（手动重置）`);
+    return res.json({ ok: true, quota_remaining: total });
   }
 
   return res.status(400).json({ ok: false, message: `不支持的动作：${action}` });
@@ -1506,15 +1841,142 @@ router.delete('/accounts', requirePerm('dola:delete'), (req, res) => {
   res.json({ ok: true, deleted, skipped: ids.length - deleted });
 });
 
+/**
+ * POST /api/dola/accounts/batch-group —— 批量设置分组 {ids:[], group:''}
+ * 空字符串 = 移出分组。
+ */
+router.post('/accounts/batch-group', requirePerm('dola:update'), (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number).filter(Boolean) : [];
+  if (!ids.length) return res.status(400).json({ ok: false, message: '没有选中任何账号' });
+  const group = String(req.body?.group ?? '').trim().slice(0, 32);
+  const stmt = db.prepare('UPDATE dola_accounts SET group_name=?, updated_at=? WHERE id=?');
+  let updated = 0;
+  for (const id of ids) updated += stmt.run(group, now(), id).changes;
+  audit(req, 'dola.bulk_set_group', 'dola_account', ids.join(','), `批量分组 →「${group || '未分组'}」（${updated} 个）`);
+  res.json({ ok: true, updated, group });
+});
+
+/**
+ * POST /api/dola/accounts/batch-recover —— 批量解除限流冷却 {ids:[]}
+ * 对标 dola-pool「批量恢复」。只清 cooldown_until + last_error，不动 status。
+ */
+router.post('/accounts/batch-recover', requirePerm('dola:update'), (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number).filter(Boolean) : [];
+  if (!ids.length) return res.status(400).json({ ok: false, message: '没有选中任何账号' });
+  const stmt = db.prepare(`UPDATE dola_accounts SET cooldown_until=NULL, last_error='', updated_at=?
+    WHERE id=? AND cooldown_until IS NOT NULL`);
+  let updated = 0;
+  for (const id of ids) updated += stmt.run(now(), id).changes;
+  audit(req, 'dola.bulk_recover', 'dola_account', ids.join(','), `批量解除冷却 ${updated} 个`);
+  res.json({ ok: true, updated, skipped: ids.length - updated });
+});
+
+/**
+ * POST /api/dola/accounts/batch-reset-quota —— 批量重置每日额度 {ids:[]}
+ * 对标 dola-pool「重置额度」。quota_remaining 拨回 quota_total，来源记 manual_reset。
+ */
+router.post('/accounts/batch-reset-quota', requirePerm('dola:update'), (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number).filter(Boolean) : [];
+  if (!ids.length) return res.status(400).json({ ok: false, message: '没有选中任何账号' });
+  const stmt = db.prepare(`UPDATE dola_accounts SET quota_remaining=quota_total, quota_at=?, quota_source='manual_reset', updated_at=? WHERE id=?`);
+  let updated = 0;
+  for (const id of ids) updated += stmt.run(now(), now(), id).changes;
+  audit(req, 'dola.bulk_reset_quota', 'dola_account', ids.join(','), `批量重置额度 ${updated} 个`);
+  res.json({ ok: true, updated });
+});
+
+/**
+ * POST /api/dola/accounts/:id/test-generate —— 单账号测试生成（对标 dola-pool「测试生成」）
+ * body: { tokenId?, token?, prompt?, seconds? }
+ *
+ * ⚠️ 会消耗真实额度和用户令牌积分。走网关链路（A 方案），任务强制绑定该账号
+ * （strictAccount=true），不触发自动换号 —— 测的就是这个号本身。
+ */
+router.post('/accounts/:id/test-generate', requirePerm('dola:create'), async (req, res) => {
+  const id = Number(req.params.id);
+  const acc = db.prepare('SELECT id, label, status FROM dola_accounts WHERE id=?').get(id);
+  if (!acc) return res.status(404).json({ ok: false, message: '账号不存在' });
+
+  const tokenId = req.body?.tokenId != null ? Number(req.body.tokenId) : null;
+  let tokenValue = String(req.body?.token || '').trim();
+  if (Number.isInteger(tokenId) && tokenId > 0) {
+    const row = db.prepare('SELECT value FROM tokens WHERE id=?').get(tokenId);
+    if (!row) return res.status(400).json({ ok: false, message: '所选用户令牌不存在' });
+    tokenValue = String(row.value || '');
+  }
+  if (!tokenValue) return res.status(400).json({ ok: false, message: '请提供用户令牌（测试生成走网关链路扣积分）' });
+
+  const seconds = [10, 15, 20, 30].includes(Number(req.body?.seconds)) ? Number(req.body.seconds) : 10;
+  const prompt = String(req.body?.prompt || '').trim().slice(0, 500) || `测试生成（账号 ${acc.label || id}，${seconds} 秒）`;
+  try {
+    const r = await submitGenerationTask({
+      tokenValue, prompt, seconds, images: [],
+      accountId: id, strictAccount: true,
+    });
+    audit(req, 'dola.test_generate', 'dola_account', id, `${acc.label} 测试生成 ${seconds}s，任务 ${r.taskId}`);
+    res.json({ ok: true, taskId: r.taskId, status: r.status });
+  } catch (e) {
+    res.status(400).json({ ok: false, message: e.message || '提交失败', code: e.code || null });
+  }
+});
+
+/**
+ * POST /api/dola/stress-test —— 压力测试（对标 dola-pool「压力测试」）
+ * body: { tokenId?, token?, count, seconds?, prompt? }
+ *
+ * ⚠️ 会消耗真实额度和用户令牌积分：count 条任务按顺序提交进队列，
+ * 由生成编排器按并发设置消费。不绑定账号，走正常选号+限流换号链路，
+ * 测的是整个号池的吞吐。count 上限 20（与批量创建一致）。
+ */
+router.post('/stress-test', requirePerm('dola:create'), async (req, res) => {
+  const count = Number(req.body?.count);
+  if (!Number.isInteger(count) || count < 1 || count > 20) {
+    return res.status(400).json({ ok: false, message: '压测数量须为 1～20 的整数' });
+  }
+  const tokenId = req.body?.tokenId != null ? Number(req.body.tokenId) : null;
+  let tokenValue = String(req.body?.token || '').trim();
+  if (Number.isInteger(tokenId) && tokenId > 0) {
+    const row = db.prepare('SELECT value FROM tokens WHERE id=?').get(tokenId);
+    if (!row) return res.status(400).json({ ok: false, message: '所选用户令牌不存在' });
+    tokenValue = String(row.value || '');
+  }
+  if (!tokenValue) return res.status(400).json({ ok: false, message: '请提供用户令牌（压力测试走网关链路扣积分）' });
+
+  const seconds = [10, 15, 20, 30].includes(Number(req.body?.seconds)) ? Number(req.body.seconds) : 10;
+  const promptBase = String(req.body?.prompt || '').trim().slice(0, 200) || '压力测试';
+  const results = [];
+  for (let i = 0; i < count; i++) {
+    const prompt = `${promptBase} #${i + 1}/${count}`;
+    try {
+      const r = await submitGenerationTask({ tokenValue, prompt, seconds, images: [] });
+      results.push({ ok: true, taskId: r.taskId, status: r.status });
+    } catch (e) {
+      results.push({ ok: false, error: e.message || '提交失败' });
+    }
+  }
+  const okCount = results.filter((r) => r.ok).length;
+  audit(req, 'dola.stress_test', 'dola_video', '', `压力测试提交 ${count} 条（${seconds}s），成功 ${okCount}`);
+  res.json({ ok: true, results, okCount, failCount: count - okCount });
+});
+
 // ================================================================ 任务
 
 /** POST /api/dola/jobs  { type, ids? | all:true, concurrency? } */
-router.post('/jobs', requirePerm('dola:check'), (req, res) => {
+router.post('/jobs', (req, res, next) => {
+  const needed = req.body?.type === 'dola_hello_probe' ? ['dola:create'] : ['dola:check'];
+  if (!hasAnyPerm(req, needed)) return res.status(403).json({ ok: false, message: `没有权限：${needed.join(' / ')}` });
+  next();
+}, (req, res) => {
   const type = String(req.body?.type || '');
   const nativeSeconds = type === 'dola_native_15s' ? 15 : (type === 'dola_native_30s' ? 30 : null);
   const referenceImages = type === 'dola_reference_images';
-  if (!['dola_check', 'dola_credits', 'dola_native_15s', 'dola_native_30s', 'dola_reference_images'].includes(type)) {
+  const helloProbe = type === 'dola_hello_probe';
+  if (!['dola_check', 'dola_credits', 'dola_native_15s', 'dola_native_30s', 'dola_reference_images', 'dola_hello_probe'].includes(type)) {
     return res.status(400).json({ ok: false, message: `不支持的任务类型：${type}` });
+  }
+  if (helloProbe) {
+    const active = db.prepare("SELECT id FROM jobs WHERE type='dola_hello_probe' AND status IN ('queued','running') LIMIT 1").get();
+    if (active) return res.status(409).json({ ok: false, message: `你好探测任务 #${active.id} 正在运行` });
   }
   let ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number).filter(Boolean) : [];
   if (req.body?.all) {
@@ -1530,6 +1992,8 @@ router.post('/jobs', requirePerm('dola:check'), (req, res) => {
   // 浏览器通道很吃内存，并发单独限
   const defaultConc = nativeSeconds || referenceImages
     ? 1
+    : helloProbe
+      ? 1
     : (type === 'dola_credits' && getSetting('dola_use_browser', 'false') === 'true'
       ? numSetting('dola_browser_concurrency', 3)
       : numSetting('dola_check_concurrency', 5));
@@ -1537,7 +2001,9 @@ router.post('/jobs', requirePerm('dola:check'), (req, res) => {
   const job = createJob({
     type,
     ids,
-    concurrency: nativeSeconds || referenceImages
+    concurrency: helloProbe
+      ? 1
+      : nativeSeconds || referenceImages
       ? Math.min(2, Math.max(1, Number(req.body?.concurrency) || defaultConc))
       : (Number(req.body?.concurrency) || defaultConc),
     userId: req.user.id,

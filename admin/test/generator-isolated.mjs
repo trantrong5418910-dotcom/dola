@@ -17,6 +17,8 @@ import { createGenerationWireGate } from '../server/dola/generation-wire.js';
 import * as journal from '../server/dola/submission-journal.js';
 import { identifyGenerationRequest, createGenerationAckObserver } from '../server/dola/generation-ack.js';
 import { GENERATION_GUARD_SCHEMA, hasGenerationGuard, recordGenerationGuard } from '../server/dola/generation-guards.js';
+// 真函数（不是 stub）：见下面 box 里 upstreamPrompt 的注入说明。
+import { upstreamPrompt as realUpstreamPrompt } from '../server/dola/prompt-wrap.js';
 
 const source = readFileSync(new URL('../server/dola/generator.js', import.meta.url), 'utf8');
 const code = source.replace(/^import[\s\S]*?;\n/gm, '').replace(/\bexport /g, '')
@@ -25,16 +27,20 @@ const flush = async () => { for (let i = 0; i < 30; i++) await Promise.resolve()
 const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; };
 const liveProfile = () => ({ ok: true, status: 200, code: 0, membershipLevel: 'pro', hasActiveSubscription: true, entityId: 'synthetic-dola' });
 const artifact = () => ({ path: '/synthetic-only/not-a-real-file.mp4', bytes: 4096 });
+/** 提示词包装测试用的固定前缀（wrap:true 时生效）。 */
+const WRAP_PREFIX = 'WRAP_PREFIX_ONLY';
 
-function fixture(t, { owner = null, seconds = 30 } = {}) {
+function fixture(t, { owner = null, seconds = 30, wrap = false } = {}) {
   const db = new Database(':memory:');
   t.after(() => db.close());
   db.exec(`CREATE TABLE dola_videos (
     id INTEGER PRIMARY KEY,account_id,account_label,conversation_id,prompt,ratio,seconds,force_seconds,status,stage,
     watermarked_url,unwatermarked_url,unwatermark_note,is_unwatermarked,local_path,local_bytes,duration_sec,bytes,error,
-    owner_token_id,owner_prefix,charge_ref,has_reference_images,reference_image_count,strict_account,created_by,created_at,updated_at,finished_at);
+    owner_token_id,owner_prefix,charge_ref,has_reference_images,reference_image_count,strict_account,created_by,created_at,updated_at,finished_at,
+    cleared_at TEXT);
     CREATE TABLE dola_accounts (id INTEGER PRIMARY KEY,label,cookie,status,proxy,cookie_hash,sec_user_id,membership,
     cooldown_until,last_used_at,updated_at,last_check_at,last_error,quota_remaining,quota_source,quota_at,exit_ip,
+    login_state TEXT NOT NULL DEFAULT 'unknown', login_at TEXT, login_note TEXT NOT NULL DEFAULT '',
     native_15s_state TEXT NOT NULL DEFAULT 'available', native_15s_at TEXT, native_15s_note TEXT NOT NULL DEFAULT '',
     native_30s_state TEXT NOT NULL DEFAULT 'available', native_30s_at TEXT, native_30s_note TEXT NOT NULL DEFAULT '',
     reference_image_state TEXT NOT NULL DEFAULT 'available', reference_image_at TEXT, reference_image_note TEXT NOT NULL DEFAULT '');
@@ -44,15 +50,20 @@ function fixture(t, { owner = null, seconds = 30 } = {}) {
     VALUES (1,'synthetic-account','SYNTHETIC_ONLY','valid','http://proxy.example.invalid:8080','synthetic-hash','synthetic-dola','pro','192.0.2.10','available')`).run();
   db.prepare(`INSERT INTO dola_videos (id,account_id,prompt,seconds,force_seconds,status,owner_token_id,charge_ref)
     VALUES (1,1,'synthetic-only',?,?,'queued',?,'')`).run(seconds, seconds === 30 ? 30 : null, owner);
-  const calls = { profile: 0, preflight: 0, submit: 0, chain: 0, resolve: 0, archive: 0, probe: 0, containerProbe: 0, cookies: 0, refunds: [] };
+  const calls = { profile: 0, preflight: 0, submit: 0, chain: 0, resolve: 0, archive: 0, probe: 0, containerProbe: 0, cookies: 0, refunds: [], prompts: [] };
   db.exec(GENERATION_GUARD_SCHEMA);
   db.exec(journal.SUBMISSION_JOURNAL_SCHEMA);
   const immediate = [];
   const overrides = {
     profile: async () => liveProfile(),
-    preflight: async (_cookies, options) => ({ ok: true, state: 'available', seconds: options.seconds,
-      uiSeconds: options.seconds, native: true, rewriteCarrier: false,
-      model: options.seconds === 15 ? 'seedance_v2.0' : 'seedance_v2.5' }),
+    preflight: async (_cookies, options) => {
+      const s = options.seconds;
+      const uiSeconds = s === 30 ? 15 : s === 20 ? 10 : s;
+      const rewriteCarrier = uiSeconds !== s;
+      return { ok: true, state: 'available', seconds: s,
+        uiSeconds, native: !rewriteCarrier, rewriteCarrier,
+        model: s === 15 ? 'seedance_v2.0' : 'seedance_v2.5' };
+    },
     submit: async () => ({ conversationId: '1234567890123', cap: [] }),
     chain: async () => ({ ok: true, text: 'https://media.example.invalid/synthetic-output.mp4', json: {} }),
     resolve: async () => ({ videos: [], attempts: [] }),
@@ -77,6 +88,42 @@ function fixture(t, { owner = null, seconds = 30 } = {}) {
     pullChain: async (...args) => { calls.chain++; assert.equal(args[2].proxy, 'http://proxy.example.invalid:8080'); return overrides.chain(...args); },
     extractUnwatermarked: async (...args) => { calls.resolve++; return overrides.resolve(...args); },
     parseVideoQuotaReceipt: () => ({}), DOLA_HEADERS: {},
+    // prompt-wrap.js 的入口（提示词前缀/中缀/后缀包装）。
+    // ⚠️ 同上：这个 harness 会把 generator.js 的**所有 import 行剥掉**再由本 box 提供依赖，
+    //    漏一个，被切的代码里就是 ReferenceError。这次正是踩在这里 —— 漏掉 upstreamPrompt 后
+    //    23 个用例集体失败（提交路径整个断掉），而报错信息（"限流账号应进入冷却"之类）
+    //    完全指向不了真正的原因，非常难查。
+    // 这里注入的是**真函数**而不是 stub，两个原因：
+    //   ① 真函数能连"调用点形状"一起验 —— 谁把 `upstreamPrompt(...).text` 写成忘了 `.text`，
+    //      会在这里炸出来，而不是默默把 "[object Object]" 当提示词发给上游；
+    //   ② 设置读取器换成假的：隔离测试里 db.js 的模块级 `db` 是 null，真去读设置会 TypeError。
+    //      假读取器默认只回 fallback（= 开关关），wrap:true 时才开启并给一个固定前缀。
+    upstreamPrompt: prompt => realUpstreamPrompt(prompt, {
+      readSetting: (key, fallback) => {
+        if (!wrap) return fallback;
+        if (key === 'gateway_prompt_wrap_enabled') return 'true';
+        if (key === 'gateway_prompt_prefix') return WRAP_PREFIX;
+        return fallback;
+      },
+    }),
+    // chain-text-rules.js 的两个入口（上游文本分类 + 漂移计数）。
+    // ⚠️ 这个 harness 会把 generator.js 的**所有 import 行剥掉**，再由本 box 提供依赖；
+    //    漏一个，被切的代码里就会 ReferenceError，表现是整条轮询断掉、任务永远停在 generating。
+    //    分类器本身有专门单测（test/chain-text-rules.mjs），这里只要不炸即可。
+    classifyChainText: () => ({ rule: 'none', evidence: 'isolated_test', classifiable: false }),
+    recordChainText: result => result,
+    // account-score.js 的 8 个入口（失败分调度）。同上：漏一个整条切片就 ReferenceError。
+    //    排序/节流/记账各有专门单测（test/account-score.mjs），这里只要行为不错误：
+    //    rankCandidates 恒等（保持原 last_used_at 轮转顺序，与改前行为一致）、
+    //    submitThrottle 不节流、记账 noop。
+    recordTaskSuccess: () => {},
+    recordTaskFailure: () => ({ code: 'other', weight: 5, failScore: 5 }),
+    markAccountSubmitted: () => {},
+    rankCandidates: accounts => accounts,
+    submitThrottle: () => ({ throttled: false, waitSeconds: 0 }),
+    routeRow: (account, rank) => ({ id: account?.id, rank }),
+    FAIL_SCORE_CAP: 50,
+    FAIL_SCORE_DECAY_PER_HOUR: 10,
     settleFailedVideoRefund: (_db, row) => { assert.equal(row.status, 'failed'); calls.refunds.push(row.id); return { refunded: true }; },
     Date, URL, AbortController, Buffer, console: { log() {}, warn() {}, error() {} },
     setImmediate: fn => immediate.push(fn), setTimeout: deny, clearTimeout() {},
@@ -85,7 +132,7 @@ function fixture(t, { owner = null, seconds = 30 } = {}) {
   vm.runInContext(code, box);
   box.originalSubmit = box.submitViaBrowser;
   box.originalArchive = box.archiveVideo;
-  box.submitViaBrowser = async (...args) => { calls.submit++; return overrides.submit(...args); };
+  box.submitViaBrowser = async (...args) => { calls.submit++; calls.prompts.push(args[1]?.prompt); return overrides.submit(...args); };
   box.archiveVideo = async (...args) => { calls.archive++; assert.equal(args[1].proxyUrl, undefined); return overrides.archive(...args); };
   box.probeVideoDuration = async (...args) => { calls.probe++; return overrides.probe(...args); };
   box.probeMp4ContainerDuration = async (...args) => { calls.containerProbe++; return overrides.containerProbe(...args); };
@@ -315,11 +362,11 @@ for (const seconds of [10, 15, 20, 30]) {
   });
 }
 
-for (const seconds of [20, 30]) {
-  test(`${seconds}s carrier-only probe is rejected before task creation or charge`, async t => {
+for (const [seconds, wrongCarrier] of [[20, 15], [30, 10]]) {
+  test(`${seconds}s wrong-carrier probe is rejected before task creation or charge`, async t => {
     const h = fixture(t);
     h.overrides.preflight = async () => ({ ok: true, state: 'available', seconds,
-      uiSeconds: 10, native: false, rewriteCarrier: true, model: 'seedance_v2.5' });
+      uiSeconds: wrongCarrier, native: false, rewriteCarrier: true, model: 'seedance_v2.5' });
     await assert.rejects(
       h.box.createVideoTask({ prompt: `carrier-only-${seconds}`, seconds }),
       error => error.code === 'GENERATION_PREFLIGHT_FAILED' && /未确认目标模型及时长/.test(error.message),
@@ -913,3 +960,28 @@ for (const [name, prepare, expected, ffprobeMissing] of [
     assert.equal(calls[0].options.timeout, 30000);
   });
 }
+
+// ─────────────── 提示词包装：两条硬约束（提交时包装、库里留原文）───────────────
+//
+// 这两条是 prompt-wrap.js 文件头写死的约束，也是最容易被"顺手改坏"的地方：
+//   ① 发给上游的必须是包装后的文本（否则开关点了没意义）；
+//   ② 库里存的、以及 /v1 回给调用方的必须是**用户原文**
+//      （否则调用方会看到自己没写过的话术，历史任务也对不上）。
+// 只验 ① 会漏掉 ② —— 而 ② 一旦写错，破坏的是对账与可复现性，事后再查非常难。
+test('★ 开关关闭时：发给上游的就是用户原文（默认行为不许变）', async t => {
+  const h = fixture(t);
+  await h.run();
+  assert.equal(h.calls.submit, 1);
+  assert.deepEqual(h.calls.prompts, ['synthetic-only']);
+  assert.equal(h.row().prompt, 'synthetic-only');
+});
+
+test('★ 开关开启时：发给上游的是包装文本，而库里仍存用户原文', async t => {
+  const h = fixture(t, { wrap: true });
+  await h.run();
+  assert.equal(h.calls.submit, 1);
+  // ① 上游看到的：前缀 + 换行 + 原文
+  assert.deepEqual(h.calls.prompts, [`${WRAP_PREFIX}\nsynthetic-only`]);
+  // ② 库里留的：仍然是用户原文（没被包装污染）
+  assert.equal(h.row().prompt, 'synthetic-only');
+});

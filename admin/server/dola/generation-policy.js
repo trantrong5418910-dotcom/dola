@@ -1,5 +1,6 @@
 /** Pure generation guards. No database, browser, account files or network access. */
 import { quotaObservation } from './account-observations.js';
+import { DURATION_SOURCE } from './generation-duration.js';
 const badRequest = message => Object.assign(new Error(message), { status: 400 });
 export const SUPPORTED_VIDEO_SECONDS = Object.freeze([10, 15, 20, 30]);
 
@@ -56,24 +57,45 @@ export function hasLiveSession(profile) {
 }
 
 /**
+ * 页面自己声明的**上游合成档位**（形如 `30s (15s ×2)`）证据判定。
+ *
+ * 与载体改写的区别：载体改写是我们把 15s 请求改成 30s，能不能出 30 秒
+ * 由上游决定；合成档位是**页面自己就把这一档标成 30 秒**，拆段与首尾相接
+ * 都在上游完成，交回来的是一条连续成片。所以它要求的证据形态是
+ * 「UI 秒数 = 目标秒数 + 明确拼接标记」，而不是"更短的载体"。
+ *
+ * 单独的导出，是因为生成器也要用它决定「这一单要不要关掉请求改写」。
+ */
+export function isUpstreamConcatCapability(result, seconds) {
+  const target = Number(seconds);
+  return Boolean(result) && result.source === DURATION_SOURCE.UPSTREAM_CONCAT
+    && result.concat === true && result.native === false && result.rewriteCarrier === false
+    && result.seconds === target && result.uiSeconds === target;
+}
+
+/**
  * A page probe is admission evidence only when it proves the requested native
  * duration itself. A shorter UI carrier plus a request rewrite is useful
  * diagnostics, but it is not proof that the upstream accepts the target
  * duration and must not create/charge a task.
+ *
+ * `allowUpstreamConcat` 单独开关：上游合成档位默认**不放行**，
+ * 因为它改变的是"我们愿意把什么算作 30 秒任务"这个口径，属于要显式拍板的事。
  */
-export function isVerifiedNativeCapability(result, seconds) {
+export function isVerifiedNativeCapability(result, seconds, { allowUpstreamConcat = false } = {}) {
   const target = Number(seconds);
   if (!SUPPORTED_VIDEO_SECONDS.includes(target) || !result || result.ok !== true
       || result.state !== 'available' || result.seconds !== target) return false;
+  const model = target === 15 ? 'seedance_v2.0' : 'seedance_v2.5';
+  if (result.model !== model) return false;
+  // 上游合成档位：整条片子由上游合成后交付，本地不拼接。
+  if (isUpstreamConcatCapability(result, target)) return allowUpstreamConcat;
   // 20/30 秒走改写路径：20s 载体 10s，30s 载体 15s（2 额度档），rewriteCarrier=true 即为有效
   if (target === 20 || target === 30) {
     const expectCarrier = target === 30 ? 15 : 10;
-    if (result.uiSeconds !== expectCarrier || result.native !== false || result.rewriteCarrier !== true) return false;
-  } else {
-    if (result.uiSeconds !== target || result.native !== true || result.rewriteCarrier !== false) return false;
+    return result.uiSeconds === expectCarrier && result.native === false && result.rewriteCarrier === true;
   }
-  const model = target === 15 ? 'seedance_v2.0' : 'seedance_v2.5';
-  return result.model === model;
+  return result.uiSeconds === target && result.native === true && result.rewriteCarrier === false;
 }
 
 /**

@@ -27,6 +27,17 @@ import dolaGoogleLoginRoutes, { stopGoogleLogins } from './routes/dola-google-lo
 import frontendRoutes from './routes/frontend.js';
 import gatewayRoutes from './routes/gateway.js';
 import materialRoutes from './routes/materials.js';
+import proxyPoolRoutes, { ensureProxyPoolSchema } from './proxy-pool.js';
+// 成片库 / 无水印资源（自包含模块，见 server/media-routes.js 文件头）。
+// 建表用不上 —— 它读写的 dola_videos 是既有表，只加挂载。
+import mediaRoutes from './media-routes.js';
+// /v1 对外开放生成 API（对标参考站 68.64.176.15 的 /v1 契约，见 server/v1-routes.js 文件头）。
+// ⚠️ 必须挂在下面的 SPA fallback **之前**：那条兜底是 /^(?!\/api).*/，
+//    而 /v1 不以 /api 开头，漏挂的话任何 /v1 请求都会回 index.html。
+import v1Routes from './v1-routes.js';
+// Prometheus 抓取端点 /metrics 与 /metrics.json（对标参考站，但**带鉴权**，见文件头）。
+// ⚠️ 同样必须挂在 SPA 兜底之前：它不以 /api 开头。
+import metricsRoutes from './routes/metrics.js';
 import { recoverStaleJobs } from './jobs.js';
 import { recoverStaleVideoTasks } from './dola/generator.js';
 import { seedHistoricalGenerationGuards } from './dola/generation-guards.js';
@@ -49,6 +60,15 @@ const HOST = String(process.env.HOST || '127.0.0.1').trim();
 const EXPOSED = !['127.0.0.1', 'localhost', '::1'].includes(HOST);
 
 await initDb();
+// 代理池建表（自包含模块，见 server/proxy-pool.js 文件头）。
+// ⚠️ 必须 try/catch：这个模块是后加的，建表若出错**不能**把整个服务拦在启动阶段
+//    —— 后台进不去，比没有代理池严重得多。
+try {
+  ensureProxyPoolSchema();
+  console.log('[proxy-pool] 代理池表已就绪');
+} catch (e) {
+  console.error('[proxy-pool] 建表失败，代理池相关接口将不可用（其余功能不受影响）:', e.message);
+}
 const guarded = seedHistoricalGenerationGuards(db);
 if (guarded) console.log(`[gen] 已为 ${guarded} 项未确认能力启用重复失败保护`);
 // 上次进程没跑完的任务不会自动续跑，标成中断，别让前端一直转圈
@@ -138,6 +158,12 @@ app.use('/api/dola/google-login', dolaGoogleLoginRoutes);
 app.use('/api/frontend', frontendRoutes);
 app.use('/api/gateway', gatewayRoutes);
 app.use('/api/materials', materialRoutes);
+app.use('/api/proxy-pool', proxyPoolRoutes);
+app.use('/api/media', mediaRoutes);
+app.use('/v1', v1Routes);
+// 必须在这里（SPA 兜底 app.get(/^(?!\/api).*/) 之前）—— 否则 /metrics 会回 index.html，
+// 而 Prometheus 拿到 200 + HTML 只会解析出零条序列，静默以为"服务没有任何指标"。
+app.use('/', metricsRoutes);
 
 app.use('/api', (req, res) => res.status(404).json({ ok: false, message: `未找到接口 ${req.method} ${req.path}` }));
 

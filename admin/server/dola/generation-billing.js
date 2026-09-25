@@ -12,7 +12,17 @@ function atomic(db, work) {
   }
 }
 
-export function chargeVideoTask(db, { taskId, tokenId, points }) {
+/**
+ * 扣费。
+ *
+ * @param {object} [opts.guard=null] 事务内的额外前提校验，签名 `({db, token, taskId}) => void`，
+ *   不满足就 `throw`（带 `status` 的错误会被上层原样透传）。
+ *
+ * ⚠️ guard **只在首次扣费时执行**。这是刻意的：本函数按 `gen-<id>` 幂等，
+ *    重试会走到"已经扣过"的分支。如果那时还跑 guard，额度就**已经被这笔占掉了**，
+ *    重试必然假报超限 —— 表现为"任务其实建好了，客户端重试却说额度不够"。
+ */
+export function chargeVideoTask(db, { taskId, tokenId, points, guard = null }) {
   if (!Number.isSafeInteger(points) || points <= 0) throw new Error('invalid_video_price');
   return atomic(db, () => {
     const row = db.prepare('SELECT * FROM dola_videos WHERE id=?').get(taskId);
@@ -28,6 +38,7 @@ export function chargeVideoTask(db, { taskId, tokenId, points }) {
     const existing = db.prepare("SELECT * FROM point_transactions WHERE kind='consume' AND ref=?").get(ref);
     if (existing && (existing.token_id !== tokenId || existing.delta !== points)) throw new Error('video_charge_conflict');
     if (!existing) {
+      if (guard) guard({ db, token, taskId });
       const updated = db.prepare("UPDATE tokens SET points=points-?,updated_at=? WHERE id=? AND status='active' AND points>=?")
         .run(points, at, tokenId, points);
       if (!updated.changes) throw Object.assign(new Error(`积分不足（需要 ${points}，当前 ${token.points}）`), { status: 402, balance: token.points });

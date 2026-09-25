@@ -129,6 +129,35 @@ router.delete('/:id', requirePerm('material:delete'), (req, res) => {
 });
 
 /**
+ * 批量导入必须**同生共死**：要么这批全进，要么一条都不进。
+ *
+ * ⚠️★ 这里原本写的是 `db.transaction(...)` —— 而那是 **better-sqlite3 独有的 API**。
+ *    `db.js` 的 `wrap()` 只暴露 `{ raw, exec, prepare }`，**没有 `transaction`**
+ *    （见 db.js:36-49），所以 `db.transaction` 恒为 `undefined` ⇒ 调用即 `TypeError`。
+ *    后果是 `/api/materials/import` 的**每一次调用都必然 500**，
+ *    而且因为整段被 try/catch 包着，表现成"导入失败：db.transaction is not a function"
+ *    —— 看起来像业务失败，不像代码坏了，所以一直没人发现。
+ *    更隐蔽的一点：`db.js` 有 `node:sqlite` 回退分支，而**两套引擎都没有**这个方法，
+ *    所以不存在"本地好、线上坏"的落差可供发现 —— 到哪都同样地坏。
+ *
+ * 统一走手写 SAVEPOINT。这不是新发明：`generation-billing.js`、`submission-journal.js`、
+ * `account-login-registry.js`、`routes/gateway.js` 四处都是这么做的，
+ * 理由写在 routes/gateway.js 里（"底层驱动可能是 better-sqlite3，也可能是 node:sqlite 回退"）。
+ */
+function atomic(db, work) {
+  db.exec('SAVEPOINT material_import');
+  try {
+    const result = work();
+    db.exec('RELEASE SAVEPOINT material_import');
+    return result;
+  } catch (error) {
+    db.exec('ROLLBACK TO SAVEPOINT material_import');
+    db.exec('RELEASE SAVEPOINT material_import');
+    throw error;
+  }
+}
+
+/**
  * POST /api/materials/import —— 批量导入。
  * body: { items: [{ name?, prompt, images? }] }，单条失败跳过并计入 problems。
  */
@@ -145,9 +174,6 @@ router.post('/import', requirePerm('material:create'), (req, res) => {
                            VALUES (?,?,?,?,?,?)`);
   let inserted = 0;
   const problems = [];
-  const insertMany = db.transaction((list) => {
-    for (const v of list) stmt.run(v.name || '未命名素材', v.prompt, JSON.stringify(v.images), req.user?.id ?? null, at, at);
-  });
   const valid = [];
   items.forEach((raw, i) => {
     try {
@@ -158,7 +184,11 @@ router.post('/import', requirePerm('material:create'), (req, res) => {
     }
   });
   try {
-    insertMany(valid);
+    atomic(db, () => {
+      for (const v of valid) {
+        stmt.run(v.name || '未命名素材', v.prompt, JSON.stringify(v.images), req.user?.id ?? null, at, at);
+      }
+    });
     inserted = valid.length;
   } catch (e) {
     return res.status(500).json({ ok: false, message: `导入失败：${e.message}` });

@@ -7,7 +7,12 @@ import { EventEmitter } from 'node:events';
 import { createPreflightDiagnostics } from '../server/dola/preflight-diagnostics.js';
 const source = readFileSync(new URL('../server/dola/provider.js', import.meta.url), 'utf8');
 const code = source.slice(source.indexOf('export async function probeNativeVideoViaBrowser('),
-  source.indexOf('export async function probeNativeThirtySecondViaBrowser(')).replace('export ', '');
+  source.indexOf('export async function probeNativeThirtySecondViaBrowser(')).replace('export ', '')
+  // 被测源码是 ESM（含 import.meta.url），但此处用 vm 经典脚本上下文执行，
+  // 解析期即报 "Cannot use 'import.meta' outside a module"。
+  // import.meta.url 仅用于拼 accountId 的 profileDir，而本测试从不传 accountId、
+  // 走不到该分支；替换为固定字符串只为通过语法解析，不影响任何执行路径。
+  .replaceAll('import.meta.url', JSON.stringify('file:///synthetic/provider.js'));
 function fixture({ expireAt = '', error = null, errorPhase = 'model', prepareGate = null } = {}) {
   const calls = { routes: [], handlers: new Map(), order: [], closed: 0, cleared: 0, prepared: 0, timerEvents: [] }, timers = [];
   const activeTimers = new Map();
@@ -30,6 +35,17 @@ function fixture({ expireAt = '', error = null, errorPhase = 'model', prepareGat
     createPreflightDiagnostics: options => createPreflightDiagnostics({ ...options, clock: () => now }),
     Date: { now: () => now },
     DOLA_BASE: 'https://example.invalid', DOLA_HEADERS: { 'user-agent': 'synthetic' },
+    // ⚠️ 本 harness 只剥源码里的 import 语句，**剥不掉函数体内的自由标识符**：
+    //    被测代码调用 toPlaywrightCookies 时必须由这里提供，缺了就 ReferenceError，
+    //    而它会被函数里的裸 catch 吞成 { ok:false, state:'unknown' } ——
+    //    症状伪装成「探针判定不出来」，跟 cookie 逻辑看不出半点关系，极难定位。
+    //    真实实现见 server/dola/provider.js；其保留前缀语义由 test/cookie-playwright.mjs
+    //    在真 Chromium 里守（本桩只负责让探针逻辑跑得起来）。
+    toPlaywrightCookies: cookies => Object.entries(cookies || {})
+      .filter(([name, value]) => typeof name === 'string' && name && typeof value === 'string')
+      .map(([name, value]) => (name.startsWith('__Secure-') || name.startsWith('__Host-')
+        ? { name, value, domain: '.dola.com', path: '/', secure: true }
+        : { name, value, domain: '.dola.com', path: '/' })),
     observeVideoComposerBootstrap: observed => { assert.equal(observed, page); calls.order.push('observe'); },
     nativeCapabilityState: e => e.code === 'NATIVE_CAPABILITY_UNAVAILABLE' ? 'unavailable' : 'unknown',
     loadPlaywright: async () => ({ chromium: { executablePath: () => '/synthetic/chromium', launch: async () => {

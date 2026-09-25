@@ -120,8 +120,9 @@ test('native 15s expert guard accepts only Seedance 2.0', async () => {
   assert.equal(isNativeVideoRequest(body('seedance_v2.0', 10), 15, 'seedance_v2.0'), false);
 });
 
-test('preflight requires exact native duration/model evidence, not a shorter carrier rewrite', () => {
-  for (const seconds of [10, 15, 20, 30]) {
+test('preflight requires exact carrier evidence for 20/30s, native for 10/15s', () => {
+  // 10/15s: native evidence (uiSeconds=seconds, no rewrite)
+  for (const seconds of [10, 15]) {
     const good = { ok: true, state: 'available', seconds, uiSeconds: seconds, native: true,
       rewriteCarrier: false, model: seconds === 15 ? 'seedance_v2.0' : 'seedance_v2.5' };
     assert.equal(isVerifiedNativeCapability(good, seconds), true);
@@ -130,7 +131,35 @@ test('preflight requires exact native duration/model evidence, not a shorter car
     assert.equal(isVerifiedNativeCapability({ ...good, state: 'adapter_only' }, seconds), false);
     assert.equal(isVerifiedNativeCapability({ ...good, seconds: seconds + 1 }, seconds), false);
   }
+  // 20/30s: carrier evidence (20→10s, 30→15s, rewriteCarrier=true)
+  for (const [seconds, carrier] of [[20, 10], [30, 15]]) {
+    const good = { ok: true, state: 'available', seconds, uiSeconds: carrier, native: false,
+      rewriteCarrier: true, model: 'seedance_v2.5' };
+    assert.equal(isVerifiedNativeCapability(good, seconds), true);
+    // Wrong carrier is rejected
+    const wrongCarrier = carrier === 10 ? 15 : 10;
+    assert.equal(isVerifiedNativeCapability({ ...good, uiSeconds: wrongCarrier }, seconds), false);
+    // Native claim without rewrite is rejected for 20/30
+    assert.equal(isVerifiedNativeCapability({ ...good, uiSeconds: seconds, native: true, rewriteCarrier: false }, seconds), false);
+    assert.equal(isVerifiedNativeCapability({ ...good, state: 'adapter_only' }, seconds), false);
+    assert.equal(isVerifiedNativeCapability({ ...good, seconds: seconds + 1 }, seconds), false);
+  }
   assert.equal(isVerifiedNativeCapability({ ok: true, state: 'available', seconds: 10, model: 'seedance_v2.5' }, 10), false);
+});
+
+test('upstream concat evidence is admitted only with an explicit opt-in', () => {
+  const concat = { ok: true, state: 'available', seconds: 30, uiSeconds: 30, native: false,
+    rewriteCarrier: false, source: 'upstream_concat', concat: true, model: 'seedance_v2.5' };
+  // 默认不放行：合成档位改变的是"什么算 30 秒任务"这个口径，必须显式拍板
+  assert.equal(isVerifiedNativeCapability(concat, 30), false);
+  assert.equal(isVerifiedNativeCapability(concat, 30, { allowUpstreamConcat: true }), true);
+  // 证据必须齐全，少任何一项都不算
+  assert.equal(isVerifiedNativeCapability({ ...concat, concat: false }, 30, { allowUpstreamConcat: true }), false);
+  assert.equal(isVerifiedNativeCapability({ ...concat, source: undefined }, 30, { allowUpstreamConcat: true }), false);
+  assert.equal(isVerifiedNativeCapability({ ...concat, rewriteCarrier: true }, 30, { allowUpstreamConcat: true }), false);
+  assert.equal(isVerifiedNativeCapability({ ...concat, uiSeconds: 15 }, 30, { allowUpstreamConcat: true }), false);
+  assert.equal(isVerifiedNativeCapability({ ...concat, model: 'seedance_v2.0' }, 30, { allowUpstreamConcat: true }), false);
+  assert.equal(isVerifiedNativeCapability({ ...concat, state: 'adapter_only' }, 30, { allowUpstreamConcat: true }), false);
 });
 
 test('archive and independently measured duration are both necessary', () => {

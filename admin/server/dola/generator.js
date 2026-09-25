@@ -21,14 +21,25 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { db, getSetting } from '../db.js';
-import { parseCookies, getPlaywright, fetchProfile, probeNativeVideoViaBrowser, DOLA_HEADERS } from './provider.js';
+import { parseCookies, getPlaywright, fetchProfile, probeNativeVideoViaBrowser, DOLA_HEADERS, toPlaywrightCookies } from './provider.js';
 import { pullChain, extractUnwatermarked } from './unwatermark.js';
 import { proxyOf } from './proxy.js';
 import { startSocksBridge } from './socks-bridge.js';
 import { parseVideoQuotaReceipt } from './account-observations.js';
+import { tryAcquireAccountBrowserLock } from './account-browser-lock.js';
+// 提示词包装（前缀/中缀/后缀）。见 prompt-wrap.js 文件头：只作用于发给上游的那一刻。
+import { upstreamPrompt } from './prompt-wrap.js';
+// 上游文本分类 + 协议漂移告警（对标参考站的 chain_text_rules_total / protocol_drift）。
+// 见 chain-text-rules.js 文件头：纯计数，不碰数据库、不发网络。
+import { classifyChainText, recordChainText } from './chain-text-rules.js';
+// 失败分调度（对照参考站 fail_score 机制，见 account-score.js 文件头）：
+// 选号排序、成败记账、最短提交间隔（让早已配置的 dola_gen_min_submit_interval_sec 真正生效）。
+import { recordTaskSuccess, recordTaskFailure, markAccountSubmitted, rankCandidates, submitThrottle,
+  routeRow, FAIL_SCORE_CAP, FAIL_SCORE_DECAY_PER_HOUR } from './account-score.js';
 import { settleFailedVideoRefund } from './generation-billing.js';
 import { hasGenerationGuard, recordGenerationGuard } from './generation-guards.js';
 import { installVideoRequestAdapter } from './generation-request.js';
+import { DURATION_SOURCE } from './generation-duration.js';
 import { prepareNativeVideoComposer, prepareReferenceImageComposer } from './native-capability.js';
 import { observeVideoComposerBootstrap } from './composer-bootstrap.js';
 import { fillAndSubmitVideoPrompt } from './generation-submit.js';
@@ -51,6 +62,16 @@ const num = (k, d) => {
   const v = Number(getSetting(k, String(d)));
   return Number.isFinite(v) && v > 0 ? v : d;
 };
+const bool = (k, d = false) => String(getSetting(k, d ? 'true' : 'false')) === 'true';
+
+/**
+ * 是否允许把页面上游合成档位（`30s (15s ×2)`）当作 30 秒可用证据。
+ *
+ * 默认关闭：它改变的是"我们愿意把什么算成 30 秒任务"这个口径，属于要显式拍板的事。
+ * 开启后，30 秒多一条路 —— 页面自己标着 30 秒的合成档位，拆段与首尾相接都在上游完成，
+ * 交回来的是一条连续成片，所以本地不跑 ffmpeg、没有拼接导致的时长漂移。
+ */
+const upstreamConcatEnabled = () => bool('dola_upstream_concat', false);
 
 /**
  * 归档目录：admin/server/data/videos
@@ -61,6 +82,15 @@ const num = (k, d) => {
  */
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const VIDEO_DIR = path.join(HERE, '..', 'data', 'videos');
+
+/**
+ * 归档阶段最多试几个成片候选。
+ *
+ * 上游合成档位会把一次任务拆成两段生成，消息链里可能既有中间段也有成品；
+ * 只取第一个直链有可能把 15 秒中间段当成 30 秒交付。给到 3 个候选是
+ * 「够覆盖中间段 + 成品」和「不无节制下载」之间的折中。
+ */
+const MAX_ARCHIVE_ATTEMPTS = 3;
 
 /**
  * 浏览器持久化 profile 目录（每账号一个）。
@@ -84,9 +114,6 @@ const VIDEO_DIR = path.join(HERE, '..', 'data', 'videos');
  */
 const PROFILE_ROOT = path.join(HERE, '..', 'data', 'browser-profiles');
 
-/** 同一账号同一时刻只允许一个浏览器（profile 目录不能并发用） */
-const ACCOUNT_LOCKS = new Set();
-
 /**
  * 选号阶段的短暂 reservation。
  *
@@ -108,6 +135,7 @@ const PUBLIC_FIELDS = `
   status, stage, watermarked_url, unwatermarked_url, unwatermark_note, is_unwatermarked,
   local_path, local_bytes,
   duration_sec, bytes, error, owner_token_id, owner_prefix, charge_ref,
+  cleared_at,
   created_at, updated_at, finished_at
 `;
 
@@ -264,6 +292,8 @@ export function recoverStaleVideoTasks() {
  */
 function candidates(preferId = null, seconds = null, { requireReferenceImages = false, strictAccount = false, excludeIds = null } = {}) {
   const nowIso = now();
+  const nowMs = Date.parse(nowIso) || Date.now();
+  const minIntervalSec = num('dola_gen_min_submit_interval_sec', 60);
   const exclude = new Set((excludeIds || []).map((v) => Number(v)).filter(Number.isSafeInteger));
   // free/pro are billing labels, not evidence that a requested duration is supported.
   // 跳过冷却中的账号：上游限流（710022002）时它们会话还好好的，
@@ -286,16 +316,31 @@ function candidates(preferId = null, seconds = null, { requireReferenceImages = 
     .filter((account) => !hasConfirmedZeroVideoQuota(account, nowIso))
     .filter((account) => !hasGenerationGuard(db, account.id, seconds, requireReferenceImages))
     .filter((account) => !generationExitIpIssue(account))
+    // ★ 登录态「已确认未登录」的账号直接排除（对照参考站 §4 把 unsigned「未登录」列成独立状态、不参与调度）。
+    //    只排除**有明确否定证据**的（unavailable）；unknown 一律放行 ——
+    //    参考站的新号先入 standby、不立即探活（懒激活："等号池不够用了再探"），
+    //    "没探过"绝不等于"不可用"，否则一次发版就能把整个号池清空。
+    //    为什么 10 秒也必须有这道闸：下面两条原生能力闸只盖 15/30 秒，
+    //    而线上真正在跑的是 **10 秒**任务 —— 于是没有任何闸能拦住一个连创作输入框都拿不到的号，
+    //    每次都白等最多 3 分钟（60s 等输入框 + 60s 刷新 + 60s 再等，见本文件提交段的 BOOT_MS）。
+    .filter((account) => account.login_state !== 'unavailable')
     .filter((account) => Number(seconds) !== 15 || account.native_15s_state === 'available')
     .filter((account) => Number(seconds) !== 30 || account.native_30s_state === 'available')
-    .filter((account) => !requireReferenceImages || account.reference_image_state === 'available');
-  if (!preferId) return rest.slice(0, 8);
+    .filter((account) => !requireReferenceImages || account.reference_image_state === 'available')
+    // ★ 最短提交间隔：刚向上游派发过的号先缓缓（dola_gen_min_submit_interval_sec 的第一个真实使用点，
+    //    这个设置早就存在但生成路径从没读过）。所有号都在间隔内时任务留在 queued，
+    //    下一轮 dispatch 自然再试 —— 这就是节流本身，不需要额外等待逻辑。
+    .filter((account) => !submitThrottle(account, minIntervalSec, nowMs).throttled);
+  // ★ 失败分排序（对照参考站 /admin/route：失败分低者优先 → 剩余额度多者优先 → 最久未用者优先）。
+  //    原来的纯 last_used_at 轮转会让"最近连续失败"的号只要最久没用就被第一个选中。
+  const ranked = rankCandidates(rest, { nowMs });
+  if (!preferId) return ranked.slice(0, 8);
   // 指定的号排最前，**但不是唯一选项** —— 它体检不过时会自动落到后面的轮转队列，
   // 而不是直接报"没有可用账号"。
-  const pref = rest.find((a) => a.id === Number(preferId));
+  const pref = ranked.find((a) => a.id === Number(preferId));
   if (strictAccount) return pref ? [pref] : [];
-  if (!pref) return rest.slice(0, 8);
-  return [pref, ...rest.filter((a) => a.id !== pref.id)].slice(0, 8);
+  if (!pref) return ranked.slice(0, 8);
+  return [pref, ...ranked.filter((a) => a.id !== pref.id)].slice(0, 8);
 }
 
 /**
@@ -498,10 +543,30 @@ const SESSION_DEAD_CODES = new Set([710012014, 710012001]);
  *
  * @returns {Promise<{account:object|null, skipped:Array<{id:number,label:string,code:any}>}>}
  */
-async function pickLiveAccount(preferId = null, { probe = 3, seconds = null, requireReferenceImages = false, strictAccount = false, excludeIds = null } = {}) {
+/**
+ * 单次挑号**最多体检几个账号**（延迟上限，不是"池子有多大"）。
+ *
+ * ⚠️ 这个数字以前是硬编码的 `probe = 3`，而 `candidates()` 其实返回前 8 个。
+ *    于是池子里 5 个候选全都不通时，报出来的话是
+ *    「账号池里没有可用账号（status=valid）」—— **这是一句谎话**：
+ *    真实情况是"只试了 3 个，另外 2 个压根没试"。
+ *    排查的人会去查代理、查 cookie、查号池，而真相只是"试的个数不够"。
+ *
+ * 为什么不能直接把上限调大：每个候选是一次 15 秒超时的真实出站探测，
+ * 试满 8 个最多 120 秒 —— 那是**把排障成本换成了接口延迟**。
+ * 所以这里保留上限（可配置），但**把"被截断了"这件事如实说出来**。
+ */
+const accountProbeLimit = () => Math.max(1, num('dola_account_probe_limit', 3));
+
+async function pickLiveAccount(preferId = null, { probe = null, seconds = null, requireReferenceImages = false, strictAccount = false, excludeIds = null } = {}) {
   const list = candidates(preferId, seconds, { requireReferenceImages, strictAccount, excludeIds });
   const skipped = [];
-  for (const acc of list.slice(0, Math.max(1, probe))) {
+  // 两条路径（创建 / 换号）以前一个用 3 一个用 5，口径不一致且都写死。
+  // 现在统一走设置，`probe` 只在调用方确实要覆盖时才传。
+  const limit = Math.max(1, Number(probe) || accountProbeLimit());
+  const probed = { tried: 0, available: list.length, limit };
+  for (const acc of list.slice(0, limit)) {
+    probed.tried++;
     // Reserve before the first await. JavaScript is single-threaded, so this
     // synchronous Set write closes the selection race between concurrent HTTP
     // submissions without serializing the network probes themselves.
@@ -537,7 +602,7 @@ async function pickLiveAccount(preferId = null, { probe = 3, seconds = null, req
           continue;
         }
         keepReservation = true;
-        return { account: acc, skipped };
+        return { account: acc, skipped, probed };
       }
 
       if (SESSION_DEAD_CODES.has(Number(r.code))) {
@@ -556,7 +621,7 @@ async function pickLiveAccount(preferId = null, { probe = 3, seconds = null, req
       if (!keepReservation) ACCOUNT_SELECTION_RESERVATIONS.delete(acc.id);
     }
   }
-  return { account: null, skipped };
+  return { account: null, skipped, probed };
 }
 
 /**
@@ -568,7 +633,7 @@ async function pickLiveAccount(preferId = null, { probe = 3, seconds = null, req
  */
 async function switchTaskAccount(id, { excludeIds = [], seconds = null, requireReferenceImages = false, strictAccount = false } = {}) {
   if (strictAccount) return { account: null, skipped: [] };
-  const picked = await pickLiveAccount(null, { seconds, requireReferenceImages, probe: 5, excludeIds });
+  const picked = await pickLiveAccount(null, { seconds, requireReferenceImages, excludeIds });
   const next = picked.account;
   if (!next) return { account: null, skipped: picked.skipped };
   db.prepare('UPDATE dola_videos SET account_id=?, account_label=?, updated_at=? WHERE id=?')
@@ -594,10 +659,15 @@ async function preflightGenerationAccount(acc, seconds, requireReferenceImages) 
   preflightRunning++;
   try {
     await resolveFfprobePath();
+    const allowUpstreamConcat = upstreamConcatEnabled();
     const result = await probeNativeVideoViaBrowser(parseCookies(acc.cookie), {
       seconds, proxy: proxyOf(acc), proxyUrl: requireGenerationProxy(acc.proxy), timeout: 120000,
+      // Reuse this account's persistent browser profile so preflight gets the
+      // same warm Dola cache as the explicit read-only capability probes.
+      accountId: acc.id,
+      allowUpstreamConcat,
     });
-    if (!isVerifiedNativeCapability(result, seconds)) {
+    if (!isVerifiedNativeCapability(result, seconds, { allowUpstreamConcat })) {
       throw Object.assign(new Error(`生成前只读预检未通过：${result?.error || '未确认目标模型及时长'}；未建任务、未扣积分`), {
         status: 409, code: 'GENERATION_PREFLIGHT_FAILED', diagnostic: result?.diagnostic,
       });
@@ -606,6 +676,7 @@ async function preflightGenerationAccount(acc, seconds, requireReferenceImages) 
     const current = db.prepare('SELECT * FROM dola_accounts WHERE id=?').get(acc.id);
     if (!current || current.status !== 'valid'
         || accountHasUnsettledSubmission(db, acc.id)
+        || current.login_state === 'unavailable'
         || hasConfirmedZeroVideoQuota(current)
         || ['cookie_hash', 'proxy', 'sec_user_id', 'exit_ip'].some(key => current[key] !== acc[key])
         || (current.cooldown_until && current.cooldown_until > now())
@@ -780,8 +851,15 @@ export async function createVideoTask({
       });
     }
     // 先体检再占坑 —— 拿到一个真的能用的号，别让任务跑一半死在死号上
-    const { account: acc, skipped } = await pickLiveAccount(accountId, { seconds: duration.seconds, requireReferenceImages: Boolean(hasReferenceImages), strictAccount });
+    const { account: acc, skipped, probed } = await pickLiveAccount(accountId, { seconds: duration.seconds, requireReferenceImages: Boolean(hasReferenceImages), strictAccount });
     if (!acc) {
+      // ★ 如实说明"试了几个 / 池里还有几个没试"。
+      //   以前不管试了几个都报「账号池里没有可用账号」，池子明明还有候选没体检时这是假信息，
+      //   会把人往"代理坏了 / cookie 过期了"上带，而真相只是本次体检名额用完了。
+      const shortfall = probed && probed.available > probed.tried;
+      const head = shortfall
+        ? `本轮体检的 ${probed.tried} 个账号都没通过，池里还有 ${probed.available - probed.tried} 个候选**尚未体检**（单次体检有延迟上限，可用 dola_account_probe_limit 调整）`
+        : '账号池里没有可用账号（status=valid）';
       const detail = skipped.length
         ? `本次跳过 ${skipped.length} 个账号（${skipped.map((s) => `#${s.id} ${s.kind ?? s.code}`).join('、')}）`
         : '';
@@ -804,7 +882,7 @@ export async function createVideoTask({
       const capability = capabilityParts.join('；');
       const reason = `请确认账号登录有效、身份匹配、已配置有效的 IPWeb 或显式代理，且出口 IP 已核验并只被一个有效账号使用；最新回执确认零额度的账号不参与分配，不按免费/订阅身份判定时长能力。已触发重复失败保护的账号须在后台「生成统计与复核」通过只读复核。${capability}${isolation}${queueHint}`;
       throw Object.assign(
-        new Error(`账号池里没有可用账号（status=valid）。${reason}${detail}`),
+        new Error(`${head}。${reason}${detail}`),
         { status: 409 },
       );
     }
@@ -825,6 +903,7 @@ export async function createVideoTask({
       const id = Number(info.lastInsertRowid);
       // 从这里开始队列名额由 active task 统计接管；即使后续更新/调度报错，
       // 数据库里的 queued 任务也必须继续占用名额，避免容量被错误释放。
+      releaseGenerationAdmission();
       admissionHeld = false;
       db.prepare('UPDATE dola_accounts SET last_used_at=?, updated_at=? WHERE id=?').run(now(), now(), acc.id);
       // The reservation only protects the async selection/probe window. Once the
@@ -883,8 +962,13 @@ function fail(id, message, accountSnapshot = null) {
     AND status IN ('queued','submitting','generating','resolving')`)
     .run(String(message).slice(0, 500), now(), now(), id);
   if (updated.changes) {
+    const row = db.prepare('SELECT * FROM dola_videos WHERE id=?').get(id);
     settleFailedVideoRefund(db, getVideoTask(id));
-    if (accountSnapshot) recordGenerationGuard(db, db.prepare('SELECT * FROM dola_videos WHERE id=?').get(id), accountSnapshot);
+    if (accountSnapshot) recordGenerationGuard(db, row, accountSnapshot);
+    // ★ 失败分记账：从任务行取 account_id，覆盖**所有** fail 路径（包括没传快照的）。
+    //    message 原文留给 classifyFailure 分类（会话/能力/代理重罚，限流/网络/中断轻罚）。
+    const scored = recordTaskFailure(db, row?.account_id, message);
+    if (scored) console.warn(`[gen] #${id} 失败 → 账号 #${row?.account_id} 记失败分（${scored.code} +${scored.weight}，当前 ${scored.failScore}/${FAIL_SCORE_CAP}）`);
     void cleanupReferenceImages(id).catch(() => {});
   }
 }
@@ -935,8 +1019,8 @@ async function submitViaBrowser(cookieText, {
   // 同一账号不能并发开两个（profile 目录会打架）。正常情况下队列会避开，
   // 但并发上限调大之后仍有可能撞上，这里兜住。
   const lockKey = String(accountId ?? 'anon');
-  if (ACCOUNT_LOCKS.has(lockKey)) throw new Error(`账号 #${lockKey} 已有一个浏览器在跑，跳过本次`);
-  ACCOUNT_LOCKS.add(lockKey);
+  const releaseAccountBrowserLock = tryAcquireAccountBrowserLock(lockKey);
+  if (!releaseAccountBrowserLock) throw new Error(`账号 #${lockKey} 已有一个浏览器在跑，跳过本次`);
 
   const profileDir = path.join(PROFILE_ROOT, lockKey);
   let ctx = null;
@@ -1073,7 +1157,11 @@ async function submitViaBrowser(cookieText, {
       return work;
     });
 
-    await ctx.addCookies(Object.entries(ck).map(([name, value]) => ({ name, value, domain: '.dola.com', path: '/' })));
+    // ⚠️ 必须走 toPlaywrightCookies：带 `__Host-` / `__Secure-` 前缀的 cookie
+    // 一刀切成 `{ domain: '.dola.com', path: '/' }` 会让 addCookies 直接抛
+    // `Invalid cookie fields`（__Host- 禁带 domain；__Secure- 必须 secure=true），
+    // 提交链路静默失败。详见 provider.js 里的注释。
+    await ctx.addCookies(toPlaywrightCookies(ck));
 
     if (forceSeconds || seconds) {
       // 10/20/30：方悦路径可改写 duration（20s 用 10s 承载，30s 用 15s 承载）；15 秒仍只观察不改写。
@@ -1098,16 +1186,25 @@ async function submitViaBrowser(cookieText, {
     const BOOT_MS = 60000;
 
     log('打开 dola /chat/');
-    await page.goto('https://www.dola.com/chat/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+    // ★ 导航异常不能吞（同 provider.js 里的注释）：吞掉之后「代理/隧道挂了」和「账号未登录」
+    //   抛出的是**同一句话**，于是会被记账成 login/session 去折腾 cookie，
+    //   而账号真正的问题在出口 —— 修错地方，而且每轮白等最多 3 分钟。
+    let navError = null;
+    await page.goto('https://www.dola.com/chat/', { waitUntil: 'domcontentloaded', timeout: 60000 })
+      .catch((e) => { navError = e; });
 
     // 等输入框出现 = 已登录创作页。代理冷启动常抖，失败则刷新再等一次。
     let hasComposer = await page.waitForSelector(INPUT_SEL, { timeout: BOOT_MS }).then(() => true).catch(() => false);
     if (!hasComposer) {
       log('创作页输入框未出现，刷新重试');
-      await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch((e) => { navError = navError || e; });
       hasComposer = await page.waitForSelector(INPUT_SEL, { timeout: BOOT_MS }).then(() => true).catch(() => false);
     }
     if (!hasComposer) {
+      // 页面压根没打开 → 关于"登录态"什么都推不出来，必须报出口问题而不是登录问题。
+      if (navError) {
+        throw new Error(`页面未能加载（代理或网络故障），未做登录判定：${String(navError?.message || navError).replace(/\s+/g, ' ').slice(0, 160)}`);
+      }
       throw new Error('未确认已登录的创作页面（输入框未出现）');
     }
 
@@ -1133,7 +1230,12 @@ async function submitViaBrowser(cookieText, {
       log('网络空闲后输入框消失，刷新重开创作页');
       await page.goto('https://www.dola.com/chat/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
       const back = await page.waitForSelector(INPUT_SEL, { timeout: BOOT_MS }).then(() => true).catch(() => false);
-      if (!back) throw new Error('未确认已登录的创作页面（刷新后输入框仍未出现）');
+      // ⚠️ 这里的措辞刻意**不再**用「未确认已登录」：输入框刚刚是可见的，
+      //    登录态已经被证明过了，消失是页面/链路抖动。若沿用旧文案，
+      //    classifyFailure 会把它归成 login → 建账号级防护 → 冤枉一个已登录的号。
+      //    同理也不能写「非登录问题」这种带「登录」二字的说明 ——
+      //    session 分支的正则就是抓裸词「登录」，一句善意的澄清会把分类带偏（写测试时实际踩到）。
+      if (!back) throw new Error('创作输入框加载后消失，刷新后仍未恢复（页面抖动，非账号问题）');
       await page.getByRole('button', { name: '我知道了' }).click({ timeout: 3000 }).catch(() => {});
       await page.waitForTimeout(800);
     }
@@ -1144,11 +1246,42 @@ async function submitViaBrowser(cookieText, {
       const modelLabel = requestedModel === 'seedance_v2.0' ? 'Seedance 2.0' : 'Seedance 2.5';
       if ([20, 30].includes(requestedSeconds)) {
         const carrier = requestedSeconds === 30 ? 15 : 10;
-        log(`确认并选择 ${modelLabel}：页面选 ${carrier}s 承载 + 请求改写 duration→${requestedSeconds}（方悦路径）`);
+        log(`确认并选择 ${modelLabel}：优先页面原生/上游合成档位，否则选 ${carrier}s 承载 + 请求改写 duration→${requestedSeconds}（方悦路径）`);
       } else {
         log(`确认并选择 ${modelLabel} 与页面原生 ${requestedSeconds} 秒选项`);
       }
-      await prepareNativeVideoComposer(page, { seconds: requestedSeconds, model: requestedModel, timeout: BOOT_MS, log });
+      const composer = await prepareNativeVideoComposer(page, {
+        seconds: requestedSeconds,
+        model: requestedModel,
+        timeout: BOOT_MS,
+        log,
+        allowUpstreamConcat: upstreamConcatEnabled(),
+      });
+      /**
+       * ★ 上游合成档位**自己就声明了目标时长**（页面写着 `30s (15s ×2)`），
+       *   所以请求体里的 duration 本来就该是目标值 —— 这时候再改写反而会破坏它。
+       *
+       * 适配器是 addInitScript 装上去的，装的时候还不知道最终走哪条路；
+       * 这里把 settings 改回"只观察不改写"（installVideoRequestAdapter 命中已装分支会更新设置）。
+       * 位置在提交之前，所以不存在"先被改写一次"的窗口。
+       */
+      if (composer?.source === DURATION_SOURCE.UPSTREAM_CONCAT) {
+        log(`上游合成档位已选中（${requestedSeconds}s = 拆段后首尾相接，由上游合成）；本次关闭请求改写，只观察`);
+        await page.evaluate(installVideoRequestAdapter, {
+          seconds: requestedSeconds,
+          targetModel: requestedModel,
+          rewrite: false,
+        }).catch(() => {});
+        // 必须**确认**改写真的关了再往下走：适配器在非 dola.com 源上会静默不装，
+        // 那种情况下改写仍然生效，会把上游合成档位请求改坏。
+        const applied = await page.evaluate(() => {
+          const state = window[Symbol.for('dola.generation-request.adapter.v1')];
+          return state ? { seconds: state.seconds, rewrite: state.rewrite } : null;
+        }).catch(() => null);
+        if (applied?.rewrite !== false) {
+          throw new Error('无法确认上游合成档位的请求不被改写，已中止本次提交（未发送提示词）');
+        }
+      }
     }
 
     if (referenceImagePaths?.length) {
@@ -1248,7 +1381,7 @@ async function submitViaBrowser(cookieText, {
     }
     receiptCollectorClosed = true;
     await bridge?.close().catch(() => {});
-    ACCOUNT_LOCKS.delete(lockKey);
+    releaseAccountBrowserLock();
   }
 }
 
@@ -1258,13 +1391,29 @@ export const RATE_LIMIT_CODES = new Set([710022002]);
 
 // ---------------------------------------------------------------- 轮询
 
-/** 从消息链原文里扒带水印直链 + 失败/额度线索 */
-function analyzeChain(raw) {
+/** 从消息链原文里扒带水印直链 + 失败/额度线索，并给这一轮的原文分类 */
+function analyzeChain(raw, { prompt = '' } = {}) {
   const text = String(raw || '').replace(/\\\//g, '/');
   const vids = [...new Set([...text.matchAll(/https?:\/\/[^"\\\s]{20,240}?(?:\.mp4|video\/tos)[^"\\\s]{0,160}/g)].map((m) => m[0]))];
+  // ★ 每轮都把原文分类并记账。连续 3 轮连「提示词回显」都认不出来 → 日志里报协议漂移。
+  //   放在这里是因为这是**唯一的**上游原文入口；别的地方再补一处必然漏。
+  const classified = recordChainText(classifyChainText(text, { prompt, hasVideo: vids.length > 0 }));
   return {
     vids,
-    failed: /视频生成失败|生成失败/.test(text),
+    // ⚠️ failed 的**唯一口径是分类器的 rule**，这里不再另写一条正则。
+    //    原先它是 /视频生成失败|生成失败/，与 chain-text-rules.js 的 VOIDED_PATTERN
+    //    各存一份 —— 上游换措辞时改一处漏一处必然漂移。已经收口。
+    // 终态判定有两种形态，都必须立刻判失败 + 退款 + 放行账号：
+    //   voided          = 内容/审核层面被拒
+    //   quota_exhausted = 当日生成次数用尽（今天重试多少次都是同一句，无意义）
+    // 反过来，把它们留成 active 会让轮询跑满 20 分钟时限，再被判成 uncertain，
+    // 而 uncertain 会永久锁死账号 —— 生产上已经这样锁掉过 419。
+    failed: classified.rule === 'voided' || classified.rule === 'quota_exhausted',
+    // 上游的通用错误回执（实测样本：「出了点问题，请稍后重试。」）**只作证据，不作终态**。
+    // 它是可重试的抖动措辞，直接判死会把偶发抖动变成任务失败 —— 而积分这时已经扣了。
+    // 但也不能像以前那样丢掉：丢掉的结果就是"跑了 20 分钟只说一句到时限了"。
+    upstreamError: classified.upstreamError ?? null,
+    rule: classified.rule,
     ...parseVideoQuotaReceipt(text),
   };
 }
@@ -1365,7 +1514,11 @@ async function run(id, { maxMin }) {
       const submitFn = submitMode === 'scheme-a' ? submitViaSchemeA : submitViaBrowser;
       if (submitMode === 'scheme-a') log('提交通道：方案A（abort 取签名 + 页内重放提交）');
       sub = await submitFn(acc.cookie, {
-        prompt: row.prompt,
+        // ★ 提示词包装只作用于**发给上游的那一刻**（见 dola/prompt-wrap.js）：
+        //   `row.prompt`（库里存的、以及 /v1 返回给调用方的）始终是用户原文。
+        //   两个提交通道（browser / scheme-a）都走这一行，所以只在这里包一次就够；
+        //   在 submitViaBrowser 内部包会漏掉 scheme-a 通道。
+        prompt: upstreamPrompt(row.prompt).text,
         seconds: duration.seconds,
         forceSeconds: duration.forceSeconds ?? duration.seconds,
         targetModel: duration.targetModel,
@@ -1373,8 +1526,13 @@ async function run(id, { maxMin }) {
         proxyUrl: accProxy, accountId: acc.id, log,
         sessionVerified, isActive: () => taskActive(id),
         referenceImagePaths,
-        onDispatch: () => recordSubmissionDispatch(db, { taskId: id, account: acc,
-          deadlineAt: new Date(Date.now() + maxMin * 60_000).toISOString() }),
+        onDispatch: () => {
+          recordSubmissionDispatch(db, { taskId: id, account: acc,
+            deadlineAt: new Date(Date.now() + maxMin * 60_000).toISOString() });
+          // ★ 最短提交间隔的记账点：只在"确认已派发"时记。提交失败不记 ——
+          //   下次可以立刻换号重试，不该被一次没发出去的尝试卡住。
+          markAccountSubmitted(db, acc.id);
+        },
         onConversation: (conversationId, evidence) => recordSubmissionConversation(db, id, conversationId, evidence),
       });
     } catch (e) {
@@ -1494,6 +1652,7 @@ async function run(id, { maxMin }) {
     }
 
     await pollSubmittedVideo(id, { acc, accProxy, ck, duration, conversationId: sub.conversationId, maxMin,
+      prompt: row.prompt,
       deadline: Date.parse(getSubmission(db, id)?.deadline_at || '') || Date.now() + maxMin * 60_000 });
   } finally {
     if (globalAcquired) release();
@@ -1502,11 +1661,15 @@ async function run(id, { maxMin }) {
 }
 
 /** Shared query/archive path. This function cannot submit a generation request. */
-async function pollSubmittedVideo(id, { acc, accProxy, ck, duration, conversationId, maxMin, deadline }) {
+async function pollSubmittedVideo(id, { acc, accProxy, ck, duration, conversationId, maxMin, deadline, prompt = '' }) {
     const log = message => db.prepare("UPDATE dola_videos SET stage=?,updated_at=? WHERE id=? AND status IN ('generating','resolving')")
       .run(message, now(), id);
     let round = 0;
     let found = null;
+    // 记住上游**最后**说的那句错误话，最终带进 stage / 终态说明。
+    // 不记住的话，一次真实的上游拒绝在库里只留下「到达时限、待核对」，
+    // 看日志的人根本没法判断该重试、该换号，还是该去查账号订阅。
+    let lastUpstreamError = '';
     while (Date.now() < deadline) {
       if (!taskActive(id)) return;
 
@@ -1519,11 +1682,13 @@ async function pollSubmittedVideo(id, { acc, accProxy, ck, duration, conversatio
         await new Promise((r) => setTimeout(r, 30_000));
         continue;
       }
-      const a = analyzeChain(chain.text);
+      const a = analyzeChain(chain.text, { prompt });
+      if (a.upstreamError) lastUpstreamError = a.upstreamError;
       const elapsed = ((round * 1) && Math.round((maxMin * 60_000 - (deadline - Date.now())) / 1000)) || 0;
       const cr = a.cost ?? null;
       db.prepare("UPDATE dola_videos SET stage=?, updated_at=? WHERE id=? AND status='generating'")
-        .run(`生成中 ${elapsed}s｜已轮询 ${round} 次${cr ? `｜本条约耗 ${cr} 额度` : ''}`, now(), id);
+        .run(`生成中 ${elapsed}s｜已轮询 ${round} 次${cr ? `｜本条约耗 ${cr} 额度` : ''}`
+          + (lastUpstreamError ? `｜上游回执：${lastUpstreamError}` : ''), now(), id);
 
       // 只保存成功响应中明确的剩余额度，不从消耗量推算，也不刷新旧读数。
       // 生成期间账号凭据/出口被替换或被停用时，不能把旧会话读数写回。
@@ -1535,14 +1700,19 @@ async function pollSubmittedVideo(id, { acc, accProxy, ck, duration, conversatio
 
       if (a.vids.length) { found = { url: a.vids[0], quota: a }; break; }
       if (a.failed) {
-        return settleRejectedSubmission(db, id, () => fail(id, '上游明确报「生成失败」；上游额度是否退还以实际回执为准'));
+        // 把上游的原话写进终态 —— 操作者据此判断是该换号、该等明天，还是该查内容。
+        const why = a.upstreamError
+          ? `上游明确拒绝（回执：「${a.upstreamError}」）；已退款并放行账号`
+          : '上游明确报「生成失败」；上游额度是否退还以实际回执为准';
+        return settleRejectedSubmission(db, id, () => fail(id, why));
       }
       await new Promise((r) => setTimeout(r, 30_000));
     }
 
     if (!found) {
-      if (getSubmission(db, id)) return holdUncertainSubmission(db, id, '查询原任务到达时限，最终结果待核对；不会重新生成或自动退款');
-      return fail(id, `等待 ${maxMin} 分钟仍未出现成片直链`);
+      const suffix = lastUpstreamError ? `（上游最后回执：「${lastUpstreamError}」）` : '';
+      if (getSubmission(db, id)) return holdUncertainSubmission(db, id, `查询原任务到达时限，最终结果待核对；不会重新生成或自动退款${suffix}`);
+      return fail(id, `等待 ${maxMin} 分钟仍未出现成片直链${suffix}`);
     }
 
     if (!taskActive(id)) return;
@@ -1577,24 +1747,77 @@ async function pollSubmittedVideo(id, { acc, accProxy, ck, duration, conversatio
       stage='正在归档并验收真实时长', updated_at=? WHERE id=? AND status='resolving'`)
       .run(unwUrl, note, unwUrl ? 1 : 0, now(), id);
 
-    // ---- ④ Stay nonterminal until the actual archived media passes validation. ----
-    // Archive bytes replace the former unbounded HEAD request.
-    const arch = await archiveVideo(id, { unwatermarkedUrl: unwUrl, watermarkedUrl: found.url });
-    if (!taskActive(id)) return;
-    const probe = arch ? await probeVideoDuration(arch.path) : { seconds: null, status: 'unreadable' };
-    let durationSec = probe.seconds;
+    /**
+     * ---- ④ 归档并按**真实时长**挑选成片 ----
+     *
+     * 为什么不能只看第一个直链：上游合成档位（`30s (15s ×2)`）会拆成两段生成，
+     * 消息链里可能同时出现中间段和合成后的成品。只取 `vids[0]` 有可能把
+     * 15 秒的中间段当成 30 秒交付 —— 那正是我们最不想要的错。
+     *
+     * 所以改成**有界多候选**：无水印候选优先，逐个归档 + 探测真实时长，
+     * 接受第一个通过 validateArchivedVideo 的候选。判据没有放宽，
+     * 只是把"一次机会"变成"最多三次机会"。
+     */
+    const candidates = [
+      ...unw.videos.map(v => ({ url: v.url, unwatermarked: true })),
+      { url: found.url, unwatermarked: false },
+    ].filter((candidate, index, all) =>
+      candidate.url && all.findIndex(other => other.url === candidate.url) === index)
+      .slice(0, MAX_ARCHIVE_ATTEMPTS);
+
+    let arch = null;
+    let durationSec = null;
     let acceptNote = '';
-    if (durationSec == null && probe.status === 'tool_missing' && arch) {
-      // ffprobe 不可用是工具链问题：退回纯 Node 的 MP4 容器解析（mvhd 时长），
-      // 不把已归档的好片误判为失败。容器解析替代不了逐帧读取，明确标注。
-      const fallbackSeconds = await probeMp4ContainerDuration(arch.path);
-      if (fallbackSeconds != null) {
-        durationSec = fallbackSeconds;
-        acceptNote = '（ffprobe 不可用，已改用 MP4 容器解析验证时长）';
+    let probeStatus = 'unreadable';
+    let rejection = null;
+    const rejectedPaths = [];
+    for (const candidate of candidates) {
+      if (!taskActive(id)) return;
+      const attempt = await archiveVideo(id, candidate.unwatermarked
+        ? { unwatermarkedUrl: candidate.url }
+        : { watermarkedUrl: candidate.url });
+      if (!taskActive(id)) return;
+      if (!attempt) { rejection = 'archive_failed'; continue; }
+
+      const probe = await probeVideoDuration(attempt.path);
+      let seconds = probe.seconds;
+      let note2 = '';
+      if (seconds == null && probe.status === 'tool_missing') {
+        // ffprobe 不可用是工具链问题：退回纯 Node 的 MP4 容器解析（mvhd 时长），
+        // 不把已归档的好片误判为失败。容器解析替代不了逐帧读取，明确标注。
+        const fallbackSeconds = await probeMp4ContainerDuration(attempt.path);
+        if (fallbackSeconds != null) {
+          seconds = fallbackSeconds;
+          note2 = '（ffprobe 不可用，已改用 MP4 容器解析验证时长）';
+        }
       }
+      if (!taskActive(id)) return;
+
+      const bad = validateArchivedVideo(attempt, seconds, duration.seconds);
+      arch = attempt;
+      durationSec = seconds;
+      acceptNote = note2;
+      probeStatus = probe.status;
+      rejection = bad;
+      if (!bad) break;
+      // 这一条不合格：先留着，等确定最终交付哪条再决定删谁。
+      rejectedPaths.push(attempt.path);
     }
+
+    // 已经挑中一条时，其余候选都是中间产物，删掉免得磁盘越攒越多。
+    // 全都失败时**保留最后一条**：失败文案会告诉运维"文件已归档在本地，可手动核验"，
+    // 把它删掉会让那句话变成假话。
+    // 全都失败时保留最后一条（不参与清理），供运维手动核验。
+    if (rejection) rejectedPaths.pop();
+    for (const stale of rejectedPaths) {
+      if (stale === arch?.path) continue;
+      // ⚠️ 必须用 try/catch 而不是 `.catch()`：隔离测试里 fs 是一个"取属性就抛"的 Proxy，
+      //    异常发生在**取值那一刻**（同步），链式 .catch() 根本挂不上去，
+      //    结果是把一次清理失败放大成整条交付流程失败。清理永远不该决定交付结果。
+      try { await fs.unlink(stale); } catch { /* 清理失败不影响交付 */ }
+    }
+
     if (!taskActive(id)) return;
-    const rejection = validateArchivedVideo(arch, durationSec, duration.seconds);
     if (arch) {
       db.prepare(`UPDATE dola_videos SET local_path=?, local_bytes=?, duration_sec=?, bytes=?, updated_at=?
         WHERE id=? AND status='resolving'`).run(arch.path, arch.bytes, durationSec, arch.bytes, now(), id);
@@ -1602,16 +1825,33 @@ async function pollSubmittedVideo(id, { acc, accProxy, ck, duration, conversatio
     if (rejection) {
       const messages = {
         archive_failed: '成片归档失败，未通过交付验收；不能仅凭临时直链标记成功',
-        duration_unverified: probe.status === 'tool_missing'
+        duration_unverified: probeStatus === 'tool_missing'
           ? 'ffprobe 不可用且 MP4 容器解析也失败，未通过验收；文件已归档在本地，可手动核验'
           : '无法探测实际媒体时长（文件不可读或已损坏），未通过验收',
         duration_mismatch: `实际媒体时长 ${durationSec} 秒，不符合请求的 ${duration.seconds} 秒；未通过验收`,
       };
       return fail(id, messages[rejection]);
     }
-    db.prepare(`UPDATE dola_videos SET status='ready', error='', stage=?, updated_at=?, finished_at=?
+    const ready = db.prepare(`UPDATE dola_videos SET status='ready', error='', stage=?, updated_at=?, finished_at=?
       WHERE id=? AND status='resolving'`)
       .run(`完成（已归档 ${(arch.bytes / 1048576).toFixed(2)} MiB；真实时长 ${durationSec.toFixed(2)} 秒${acceptNote}）`, now(), now(), id);
+    // ★ 成功记账：失败分清零、连续失败归零。只有真的落进 ready（changes=1）才记 ——
+    //   并发下两个 resolving 同时到这，只有一个能赢，别把已被取消/失败的也算成功。
+    if (ready.changes) {
+      const accountId = db.prepare('SELECT account_id FROM dola_videos WHERE id=?').get(id)?.account_id;
+      recordTaskSuccess(db, accountId);
+      // ★ 出片成功是「已登录」的**最强证据**：坐实登录态，并顺手解掉历史上可能存在的登录防护。
+      //   清 guard 的常规入口只有只读探针（generation-guard-probe），但真实出片比探针更强，
+      //   没有任何理由让一个已经被证明能出片的号还被旧的登录防护挡在池外。
+      const okId = Number(accountId);
+      if (Number.isSafeInteger(okId) && okId > 0) {
+        const at = now();
+        db.prepare("UPDATE dola_accounts SET login_state='available',login_at=?,login_note=?,updated_at=? WHERE id=?")
+          .run(at, '出片成功，已确认登录态与创作面板可用', at, okId);
+        db.prepare("UPDATE dola_generation_guards SET cleared_at=? WHERE account_id=? AND scope='login' AND cleared_at IS NULL")
+          .run(at, okId);
+      }
+    }
     void cleanupReferenceImages(id).catch(() => {});
 }
 
@@ -1645,6 +1885,7 @@ async function resumeSubmittedVideo(id) {
     setStage(id, 'generating', '服务重启：继续查询原上游任务（不重新提交）');
     await pollSubmittedVideo(id, { acc, accProxy: requireGenerationProxy(acc.proxy), ck: parseCookies(acc.cookie),
       duration: normalizeVideoDuration({ seconds: row.seconds, forceSeconds: row.force_seconds }),
+      prompt: row.prompt,
       conversationId: receipt.conversation_id, deadline: Date.parse(receipt.deadline_at),
       maxMin: (Date.parse(receipt.deadline_at) - Date.parse(receipt.sent_at)) / 60000 });
   } finally {
@@ -1746,4 +1987,72 @@ export function resolvePendingSubmission(id, { resolution, note = '' } = {}) {
   }
 
   throw Object.assign(new Error('resolution 只能是 failed 或 release'), { status: 400 });
+}
+
+// ---------------------------------------------------------------- 路由决策视图
+
+/**
+ * 生成路由决策（对照参考站 /admin/route 的「号 | 排序 | 剩余额度 | 失败分 | 占用 | 原因」）。
+ *
+ * 与 candidates() 同源的池评估：能参选的号给出完整排序键与排序原因，
+ * 被排除的号给出**第一个命中的排除原因** —— 排障时不用翻日志猜"为什么没选它"。
+ * 冷却中的号也列入 excluded（candidates() 的 SQL 会把它们滤掉，但运维需要看见它们）。
+ *
+ * 字段白名单由 routeRow() 保证：绝不带 cookie / proxy / exit_ip / cookie_hash。
+ */
+export function generationRouteView({ seconds = null, requireReferenceImages = false, limit = 8 } = {}) {
+  const nowIso = now();
+  const nowMs = Date.parse(nowIso) || Date.now();
+  const minIntervalSec = num('dola_gen_min_submit_interval_sec', 60);
+  const pool = db.prepare(`SELECT * FROM dola_accounts
+                           WHERE status = 'valid' AND TRIM(COALESCE(proxy, '')) <> ''
+                           ORDER BY id ASC LIMIT 300`).all();
+
+  // 与 candidates() 完全同源的排除判据，只是返回原因而不是默默滤掉。
+  const exclusionReason = (account) => {
+    if (account.cooldown_until && account.cooldown_until > nowIso) return `冷却中（至 ${String(account.cooldown_until).slice(11, 16)}）`;
+    if (ACCOUNT_SELECTION_RESERVATIONS.has(account.id)) return '刚被另一路选中，探测中';
+    if (accountHasUnsettledSubmission(db, account.id)) return '有未完结的提交记录';
+    if (account.login_state === 'unavailable') return '登录态未确认（创作输入框未出现）';
+    if (hasConfirmedZeroVideoQuota(account, nowIso)) return '已确认今日额度为零';
+    if (hasGenerationGuard(db, account.id, seconds, requireReferenceImages)) return '触发生成防护（近期同类失败）';
+    const exitIssue = generationExitIpIssue(account);
+    if (exitIssue) return exitIssue;
+    if (Number(seconds) === 15 && account.native_15s_state !== 'available') return '原生 15 秒能力未确认';
+    if (Number(seconds) === 30 && account.native_30s_state !== 'available') return '原生 30 秒能力未确认';
+    if (requireReferenceImages && account.reference_image_state !== 'available') return '参考图能力未确认';
+    const throttle = submitThrottle(account, minIntervalSec, nowMs);
+    if (throttle.throttled) return `提交间隔未到（还需 ${throttle.waitSeconds}s）`;
+    return null;
+  };
+
+  const eligible = [];
+  const excluded = [];
+  for (const account of pool) {
+    const reason = exclusionReason(account);
+    if (reason) excluded.push({ id: Number(account.id), label: String(account.label || ''), reason });
+    else eligible.push(account);
+  }
+
+  const inflightIds = new Set(db.prepare(`SELECT DISTINCT account_id FROM dola_videos
+    WHERE status IN ('submitting','generating','resolving') AND account_id IS NOT NULL`).all()
+    .map((r) => Number(r.account_id)));
+  const capped = Math.max(1, Math.min(50, Number(limit) || 8));
+  const ranked = rankCandidates(eligible, { nowMs });
+  return {
+    at: nowIso,
+    seconds: seconds == null ? null : Number(seconds),
+    requireReferenceImages: Boolean(requireReferenceImages),
+    minSubmitIntervalSec: minIntervalSec,
+    failScoreCap: FAIL_SCORE_CAP,
+    decayPerHour: FAIL_SCORE_DECAY_PER_HOUR,
+    concurrency: concurrency(),
+    running,
+    ranked: ranked.slice(0, capped).map((acc, i) => routeRow(acc, i + 1, {
+      nowMs, minIntervalSec, inflight: inflightIds.has(Number(acc.id)),
+    })),
+    eligibleCount: eligible.length,
+    excludedCount: excluded.length,
+    excluded: excluded.slice(0, 50),
+  };
 }

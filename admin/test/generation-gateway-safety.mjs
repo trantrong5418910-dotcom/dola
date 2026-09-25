@@ -21,6 +21,17 @@ function fixture(t) {
   const box = { db, Date, findUnsettledPrompt, settleFailedVideoRefund,
     express: { Router: () => ({ use() {}, get() {}, post: (path, fn) => handlers.set(path, fn) }) },
     getSetting: (key, fallback) => key === 'gateway_prompt_cooldown_seconds' ? '0' : fallback,
+    // ⚠️ 本测试会剥掉 gateway.js 的所有 import 行，所以那边每加一个 import
+    //    都得在这里补一个同名绑定。本用例只调 /refund，这些绑定暂时用不到，
+    //    但**必须存在**：一旦将来有人把这几个函数挪到顶层执行，缺绑定就会炸。
+    quotaView: () => ({ limit: 0, used: 0, remaining: null, ok: true, reason: 'unlimited', day: '1970-01-01', limitSource: 'none' }),
+    usageSnapshot: () => ({ limit: 0, used: 0, remaining: null, ok: true, reason: 'unlimited', day: '1970-01-01', limitSource: 'none' }),
+    resolveTaskPoints: () => ({ points: 1, source: 'setting', key: 'gateway_points_per_task', costsReason: 'n/a' }),
+    parseModelCosts: () => ({ ok: true, costs: {}, reason: 'empty' }),
+    QUOTA_SETTING_KEYS: { defaultPoints: 'gateway_points_per_task', modelCosts: 'gateway_model_costs', dailyLimit: 'gateway_daily_points_limit' },
+    switchView: () => ({ key: 'gateway_enabled', enabled: true, scope_enabled: true, effective_enabled: true, scope: 'v1', configuredScope: 'all', reasons: [] }),
+    SWITCH_KEYS: { gateway: 'gateway_enabled', promptWrap: 'gateway_prompt_wrap_enabled' },
+    readinessSummary: () => ({ grade: 'degraded', reasons: [], at: '1970-01-01T00:00:00.000Z' }),
   };
   vm.createContext(box); vm.runInContext(source, box);
   const invokeRefund = () => {

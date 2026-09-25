@@ -175,6 +175,24 @@ CREATE TABLE IF NOT EXISTS dola_accounts (
   quota_total     INTEGER NOT NULL DEFAULT 4,
   quota_at        TEXT,
   quota_source    TEXT,                              -- generation_receipt；空或历史来源需重新确认
+  -- 失败分调度（对照参考站 68.64.176.15 的 fail_score 机制，实现见 dola/account-score.js）。
+  -- 选号时失败分低者优先；成功即清零，失败按类型加权累加（上限 50），并随时间衰减。
+  fail_score     INTEGER NOT NULL DEFAULT 0,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  last_failure_at TEXT,
+  success_count  INTEGER NOT NULL DEFAULT 0,
+  fail_count     INTEGER NOT NULL DEFAULT 0,
+  -- 上一次**真正向上游派发**的时间（不是建任务时间）。选号时用它做「最短提交间隔」节流，
+  -- 让早就配置好的 dola_gen_min_submit_interval_sec 真正生效（此前只在设置页展示、生成路径没人读）。
+  last_submit_at TEXT,
+  -- ★ 登录态（对照参考站 §4 的 logged_in 字段，以及它把 unsigned「未登录」列成**独立状态**）。
+  --   三态而不是布尔：'unknown' 表示还没探过，**不参与排除**。
+  --   为什么只做否定证据：参考站的新号先入 standby、不立即探活（懒激活，"等号池不够用了再探"），
+  --   所以「没探过」绝不能等于「不可用」—— 否则一次迁移就会把整个号池清空。
+  --   只有只读探针**明确**确认页面是匿名态时，才写 'unavailable' 并把它挡在选号之外。
+  login_state TEXT NOT NULL DEFAULT 'unknown',  -- unknown / available / unavailable
+  login_at    TEXT,
+  login_note  TEXT NOT NULL DEFAULT '',
   -- 原生 15/30 秒能力只记录页面只读探测结果；unknown 不得进入对应时长选号。
   native_15s_state TEXT NOT NULL DEFAULT 'unknown',  -- unknown / available / unavailable
   native_15s_at    TEXT,
@@ -188,6 +206,8 @@ CREATE TABLE IF NOT EXISTS dola_accounts (
   reference_image_note  TEXT NOT NULL DEFAULT '',
   last_error     TEXT NOT NULL DEFAULT '',
   note           TEXT NOT NULL DEFAULT '',
+  group_name     TEXT NOT NULL DEFAULT '',          -- 账号分组（运营自定，如：渠道A / 测试组），用于筛选和批量管理
+  source         TEXT NOT NULL DEFAULT '',          -- 账号来源（导入时录入，如：某渠道 / 某批次），用于来源筛选
   imported_by    INTEGER,
   created_at     TEXT NOT NULL,
   updated_at     TEXT NOT NULL
@@ -353,6 +373,9 @@ function migrate() {
     ['dola_accounts', 'quota_total', 'INTEGER NOT NULL DEFAULT 4'],
     ['dola_accounts', 'quota_at', 'TEXT'],
     ['dola_accounts', 'quota_source', 'TEXT'],
+    ['dola_accounts', 'login_state', "TEXT NOT NULL DEFAULT 'unknown'"],
+    ['dola_accounts', 'login_at', 'TEXT'],
+    ['dola_accounts', 'login_note', "TEXT NOT NULL DEFAULT ''"],
     ['dola_accounts', 'native_15s_state', "TEXT NOT NULL DEFAULT 'unknown'"],
     ['dola_accounts', 'native_15s_at', 'TEXT'],
     ['dola_accounts', 'native_15s_note', "TEXT NOT NULL DEFAULT ''"],
@@ -362,12 +385,32 @@ function migrate() {
     ['dola_accounts', 'reference_image_state', "TEXT NOT NULL DEFAULT 'unknown'"],
     ['dola_accounts', 'reference_image_at', 'TEXT'],
     ['dola_accounts', 'reference_image_note', "TEXT NOT NULL DEFAULT ''"],
+    ['dola_accounts', 'group_name', "TEXT NOT NULL DEFAULT ''"],
+    ['dola_accounts', 'source', "TEXT NOT NULL DEFAULT ''"],
+    ['dola_accounts', 'fail_score', 'INTEGER NOT NULL DEFAULT 0'],
+    ['dola_accounts', 'consecutive_failures', 'INTEGER NOT NULL DEFAULT 0'],
+    ['dola_accounts', 'last_failure_at', 'TEXT'],
+    ['dola_accounts', 'success_count', 'INTEGER NOT NULL DEFAULT 0'],
+    ['dola_accounts', 'fail_count', 'INTEGER NOT NULL DEFAULT 0'],
+    ['dola_accounts', 'last_submit_at', 'TEXT'],
     ['dola_videos', 'local_path', 'TEXT'],
     ['dola_videos', 'local_bytes', 'INTEGER'],
     ['dola_videos', 'is_unwatermarked', 'INTEGER NOT NULL DEFAULT 0'],
     ['dola_videos', 'has_reference_images', 'INTEGER NOT NULL DEFAULT 0'],
     ['dola_videos', 'reference_image_count', 'INTEGER NOT NULL DEFAULT 0'],
     ['dola_videos', 'strict_account', 'INTEGER NOT NULL DEFAULT 0'],
+    // 软清除（对应 /v1 的 DELETE /v1/videos）：任务行是扣费/退款/审计凭据，不能物理删除，
+    // 但调用方要的「从列表消失」必须真的做到 —— 否则「清除」点了、刷新又回来。
+    ['dola_videos', 'cleared_at', 'TEXT'],
+    // 每令牌每日额度（见 dola/gateway-quota.js）：NULL = 用全局设置，0 = 不限，正数 = 上限。
+    // 做成**可空**而不是 `NOT NULL DEFAULT 0`：0 的语义是"不限"，若默认 0 就等于
+    // 所有存量令牌都变成"无限额"，把全局日上限彻底废掉 —— 那是静默失效。
+    ['tokens', 'daily_points_limit', 'INTEGER'],
+    // 代理出口轮换 epoch（见 dola/proxy-epoch.js）。
+    // `dola_proxies` 由 proxy-pool.js 懒建表，所以这两列在那边也补了一遍
+    // （新建库走 PROXY_POOL_SCHEMA，已有库走这里的 ALTER）。
+    ['dola_proxies', 'exit_ip_at', 'TEXT'],
+    ['dola_proxies', 'rotation_count', 'INTEGER NOT NULL DEFAULT 0'],
   ];
   for (const [table, column, def] of ALTERS) {
     try {
@@ -433,20 +476,54 @@ function seed() {
     ['dola_autorotate_max_attempts', '3', '上游限流后自动换号重试的最大账号数（含首次，1=不换号）', 'dola'],
     ['dola_replenish_min_accounts', '5', '号池补号提示：有效账号低于此数时提示补号', 'dola'],
     ['dola_replenish_min_quota', '30', '号池补号提示：已确认剩余额度低于此数时提示补号（0=关闭额度判据）', 'dola'],
+    ['dola_quota_reset_tz', 'Asia/Tokyo', 'dola 每日额度重置时区（IANA，如 Asia/Tokyo；上游按此时区 0 点重置）', 'dola'],
+    ['dola_quota_reset_hour', '0', 'dola 每日额度重置时刻（0～23，重置时区当地时间）', 'dola'],
     ['dola_submit_mode', 'browser', '视频提交通道：browser=浏览器模拟提交（默认）/ scheme-a=Abort取签名+页内重放提交（实验）', 'dola'],
+    ['dola_upstream_concat', 'false', '允许把页面上游合成档位（30s = 15s ×2）算作 30 秒可用证据：拆段与首尾相接均在上游完成，本服务不做本地拼接', 'dola'],
     ['dola_convert_auto_zero', 'false', '转换后把账号额度清零（仅记账，不代表真的扣了 dola）', 'dola'],
     ['dola_auto_maintenance_enabled', 'true', '自动巡检账号和可查额度', 'dola'],
     ['dola_auto_cleanup_invalid', 'true', '自动隔离明确失效账号（保留 cookie，不硬删除）', 'dola'],
     ['dola_auto_quota_probe', 'true', '自动探测接口可返回的额度（免费日额度仍以生成回执为准）', 'dola'],
     ['dola_auto_maintenance_interval_minutes', '180', '自动巡检间隔（15～1440 分钟）', 'dola'],
+    // 单次生成最多体检几个账号（见 generator.js 的 pickLiveAccount）。
+    // 之前这个值被**写死在代码里**（3），而换号重试路径传的是 5，两条路不一致；
+    // 后果是失败信息谎称「账号池里没有可用账号」，其实池里还有没体检过的候选。
+    ['dola_account_probe_limit', '3', '单次生成最多体检几个账号（池里候选更多时会在失败信息里提示还有多少未体检）', 'dola'],
+    // 代理出口轮换（见 server/dola/proxy-epoch.js）。
+    // ⚠️ 我们算出来的到期时刻只是**上界**（IPWeb 的窗口锚在它自己的时钟上），
+    //    这两个设置只影响「什么时候提示有风险」，不改变那个诚实边界。
+    ['dola_proxy_rotation_risk_sec', '120', '代理出口剩余时间低于此值即标记「即将轮换」（秒，0=不判定）', 'dola'],
+    ['dola_proxy_assumed_minutes', '0', 'URL 里读不出粘性窗口时的兜底窗口（分钟，0=不知道就不算）', 'dola'],
     // 用户端网关（给 8787 工作台调）
     ['gateway_enabled', 'true', '允许用户端调用网关接口（校验令牌/扣积分）', 'gateway'],
     ['gateway_points_per_task', '1', '每个视频任务扣多少积分', 'gateway'],
     ['gateway_prompt_cooldown_seconds', '120', '同一令牌相同提示词冷却时间（秒）', 'gateway'],
     ['gateway_key', '7d4aaa02d7ce44a0e99ebebd7e8f34abe7e28c5ae49b1424', '网关共享密钥（用户端要用它调后台）', 'gateway'],
+    // 提示词包装（发给上游前拼接，见 server/dola/prompt-wrap.js）。
+    // ⚠️ 同样必须先注册（`setSetting()` 只 UPDATE 已有 key）；否则后台改了"没反应"。
+    // 默认**关**：包装会改变上游看到的内容，属于运营决策，不该在升级后自动生效。
+    ['gateway_prompt_wrap_enabled', 'false', '启用提示词包装（前缀/中缀/后缀，仅作用于发给上游的那一刻）', 'gateway'],
+    ['gateway_prompt_prefix', '', '提示词前缀（拼在用户提示词之前）', 'gateway'],
+    ['gateway_prompt_middle', '', '提示词中缀（拼在用户提示词之后、后缀之前）', 'gateway'],
+    ['gateway_prompt_suffix', '', '提示词后缀（拼在最后）', 'gateway'],
+    // 按模型计费（见 server/dola/gateway-quota.js）。
+    // 值是一份 JSON：{"default":1,"seedance_v2.0":2,"seedance_v2.5":1,"seedance_v2.5|30":3}
+    // 留空 = 全部回落到 gateway_points_per_task（升级后行为不变）。
+    // ⚠️ 必须注册：`setSetting()` 只 UPDATE 已有 key，不注册就永远写不进去。
+    ['gateway_model_costs', '', '按模型计费价目表（JSON，如 {"default":1,"seedance_v2.5":1,"seedance_v2.5|30":3}；留空=用上面的一口价）', 'gateway'],
+    ['gateway_daily_points_limit', '0', '每个令牌每日积分上限（0=不限；在令牌上单独设置可覆盖此项）', 'gateway'],
+    // 三层开关的「范围」层（见 server/dola/feature-switch.js）。
+    // ⚠️ 默认必须是 all：升级之后不能改变任何既有行为。
+    ['gateway_enabled_scope', 'all', '网关开关生效范围：all=全部入口 / v1=只对外接口 / admin=只后台工作台', 'gateway'],
+    ['gateway_prompt_wrap_enabled_scope', 'all', '提示词包装生效范围：all / v1 / admin', 'gateway'],
+    // 可观测性（Prometheus 抓取）。
+    // ⚠️ 必须先在这里注册：`setSetting()` **只 UPDATE 已有的 key**，不创建任意 key
+    //    （见 db.js 的 setSetting 注释）—— 不注册的话这个设置永远写不进去、也就永远抓不到指标，
+    //    而且症状是"设置接口返回成功、值却是 null"，很难查。
+    ['metrics_key', '', 'Prometheus 抓取密钥（x-metrics-key）；留空则只有管理员会话能看 /metrics', 'security'],
     // 前台入口
-    ['frontend_name', '前台', '前台入口名称', 'frontend'],
-    ['frontend_url', 'http://127.0.0.1:8787/', '前台地址（含 http:// 或 https://）', 'frontend'],
+    ['frontend_name', '视频工作台', '前台入口名称', 'frontend'],
+    ['frontend_url', 'https://admin.fei85.cn/test.html', '前台地址（含 http:// 或 https://）', 'frontend'],
     ['frontend_open_mode', 'tab', '打开方式：tab=新标签页 / browser=服务器上开真实浏览器', 'frontend'],
     ['frontend_browser_visible', 'true', '真实浏览器是否显示窗口（关闭=后台静默打开）', 'frontend'],
   ];
@@ -454,11 +531,17 @@ function seed() {
     const exist = db.prepare('SELECT key FROM settings WHERE key=?').get(k);
     if (!exist) db.prepare('INSERT INTO settings (key,value,label,group_name,updated_at) VALUES (?,?,?,?,?)').run(k, v, label, g, now());
   }
-  // 2026-09-24：前台默认地址改为 http://127.0.0.1:8787/（mvp 用户面）。
-  // 只补空值，不覆盖用户已填的自定义地址；服务每次启动都会执行，幂等。
+  // 2026-09-25：旧 api.fei85.cn 工作台已并入 admin.fei85.cn/test.html。
+  // 只迁移精确匹配的旧根地址，保留其他自定义地址；服务每次启动执行，幂等。
+  db.prepare(`UPDATE settings SET value=?, updated_at=?
+    WHERE key='frontend_url' AND lower(trim(value)) IN (
+      'https://api.fei85.cn', 'https://api.fei85.cn/',
+      'http://api.fei85.cn', 'http://api.fei85.cn/'
+    )`).run('https://admin.fei85.cn/test.html', now());
+  // 只补空值，不覆盖用户已填的自定义地址。
   db.prepare(`UPDATE settings SET value=?, updated_at=?
     WHERE key='frontend_url' AND (value IS NULL OR value='')`)
-    .run('http://127.0.0.1:8787/', now());
+    .run('https://admin.fei85.cn/test.html', now());
 
   // 示例内容（让用户一进来就有东西看）
   const cCount = db.prepare('SELECT COUNT(*) AS c FROM contents').get().c;

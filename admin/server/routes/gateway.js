@@ -36,6 +36,9 @@ import { validateReferenceImages } from '../dola/reference-images.js';
 import { saveReferenceImages, cleanupReferenceImages } from '../dola/reference-image-store.js';
 import { findUnsettledPrompt } from '../dola/submission-journal.js';
 import { sanitizePreflightDiagnostic } from '../dola/preflight-diagnostics.js';
+import { resolveTaskPoints, quotaView, usageSnapshot, parseModelCosts, QUOTA_SETTING_KEYS } from '../dola/gateway-quota.js';
+import { switchView, SWITCH_KEYS } from '../dola/feature-switch.js';
+import { readinessSummary } from '../dola/readiness.js';
 
 const router = express.Router();
 
@@ -129,8 +132,18 @@ function releasePromptReservation(ownerTokenId, prompt) {
 
 /** 网关鉴权：共享密钥。不通过一律 401。 */
 function requireGatewayKey(req, res, next) {
-  if (getSetting('gateway_enabled', 'true') !== 'true') {
-    return res.status(503).json({ ok: false, message: '网关已在后台关闭（系统设置 → 用户端网关）' });
+  // 三层开关：总开关 × 范围（all/v1/admin）。`/api/gateway/*` 与 `/v1/*` 同属**对外**入口，
+  // 所以这一层的 scope 是 `v1`（范围设成 v1 时对外关、后台工作台照常）。
+  // fallback='true'：与改造前 `getSetting('gateway_enabled','true')` 的默认值保持一致 ——
+  // 设置行万一丢失，不能把对外网关静默关掉。
+  const view = switchView({ key: SWITCH_KEYS.gateway, scope: 'v1', fallback: 'true' });
+  if (!view.effective_enabled) {
+    return res.status(503).json({
+      ok: false,
+      code: 'GATEWAY_DISABLED',
+      message: `网关已在后台关闭（系统设置 → 用户端网关）：${view.reasons.join('；') || '未开启'}`,
+      switch: view,
+    });
   }
   const expect = getSetting('gateway_key', '');
   const got = String(req.headers['x-gateway-key'] || '');
@@ -174,41 +187,77 @@ router.post('/verify', (req, res) => {
 });
 
 /**
- * POST /api/gateway/redeem —— 用户端自助兑换卡密。
+ * 卡密兑换的**唯一实现**。
  *
- * 这里不复用后台的 /api/cards/redeem：那个接口是管理员把卡充给任意令牌，
- * 而本接口只允许把卡充给当前请求里验证通过的令牌，避免用户传入别人的 tokenId。
+ * 两条入口共用它，不要再各写一份：
+ *   · POST /api/gateway/redeem  —— 机器对机器（X-Gateway-Key），给 8787 那类用户端服务调
+ *   · POST /v1/redeem           —— 调用方拿自己的 Bearer 令牌，直接给 /test.html 工作台用
+ * 两份实现最容易走偏的地方是「并发重复兑换」那条原子条件（UPDATE ... AND status='unused'）
+ * 与审计字段，一旦其中一份被改漏，卡就能被重复兑换成两份积分。
+ *
+ * ⚠️ 也刻意不复用后台的 /api/cards/redeem：那个接口是管理员把卡充给**任意**令牌，
+ *    而这里只允许把卡充给入参里这个**已经校验过**的令牌 —— 不接受调用方传 tokenId，
+ *    否则用户 A 能把自己的卡充到 B 头上，也能凭空给自己加积分。
+ *
+ * @param {{ token: object, code: string, req?: object|null,
+ *           action?: string, actor?: object|null }} args
+ *        token 必须是一条 tokens 行（已按调用方口径校验过存在性）。
+ *        action / actor 只影响审计日志的操作名与操作人 —— 两条入口的审计动作名不同
+ *        （gateway.card.redeem / v1.card.redeem），查询时才能分辨卡是从哪条路兑的。
+ * @returns {{ ok: true, points: number, balance: number, at: string, tokenPrefix: string, cardId: number }
+ *          | { ok: false, status: number, message: string }}
  */
-router.post('/redeem', (req, res) => {
-  const raw = String(req.body?.token || '').trim();
-  const code = String(req.body?.card || '').trim();
-  if (!raw) return res.status(400).json({ ok: false, message: '缺少 token' });
-  if (!code) return res.status(400).json({ ok: false, message: '请输入卡密' });
+export function redeemCard({
+  token, code, req = null,
+  action = 'gateway.card.redeem', actor = null,
+} = {}) {
+  const value = String(code ?? '').trim();
+  if (!value) return { ok: false, status: 400, message: '请输入卡密' };
+  if (!token) return { ok: false, status: 401, message: '访问令牌无效' };
+  if (token.status !== 'active') {
+    return { ok: false, status: 403, message: `令牌状态为「${token.status}」，不能兑换` };
+  }
 
-  const token = db.prepare('SELECT * FROM tokens WHERE value = ?').get(raw);
-  if (!token) return res.status(401).json({ ok: false, message: '访问令牌无效' });
-  if (token.status !== 'active') return res.status(403).json({ ok: false, message: `令牌状态为「${token.status}」，不能兑换` });
-
-  const card = db.prepare('SELECT * FROM cards WHERE code = ?').get(code);
-  if (!card) return res.status(404).json({ ok: false, message: '卡密不存在' });
-  if (card.status === 'redeemed') return res.status(409).json({ ok: false, message: `该卡密已于 ${card.redeemed_at} 被兑换` });
-  if (card.status === 'revoked') return res.status(400).json({ ok: false, message: '该卡密已被撤销' });
+  const card = db.prepare('SELECT * FROM cards WHERE code = ?').get(value);
+  if (!card) return { ok: false, status: 404, message: '卡密不存在' };
+  if (card.status === 'redeemed') {
+    return { ok: false, status: 409, message: `该卡密已于 ${card.redeemed_at} 被兑换` };
+  }
+  if (card.status === 'revoked') return { ok: false, status: 400, message: '该卡密已被撤销' };
   if (card.expires_at && new Date(card.expires_at) < new Date()) {
-    return res.status(400).json({ ok: false, message: `该卡密已于 ${card.expires_at} 过期` });
+    return { ok: false, status: 400, message: `该卡密已于 ${card.expires_at} 过期` };
   }
 
   const now = new Date().toISOString();
-  // 关键：带 status='unused' 条件，和后台兑换接口一样兜住并发重复兑换。
+  // 关键：带 status='unused' 条件，兜住并发重复兑换。
   const info = db.prepare(
     'UPDATE cards SET status=?, redeemed_by_token=?, redeemed_at=?, updated_at=? WHERE id=? AND status=?',
   ).run('redeemed', token.id, now, now, card.id, 'unused');
-  if (!info.changes) return res.status(409).json({ ok: false, message: '卡密已被其他请求兑换，请刷新后重试' });
+  if (!info.changes) return { ok: false, status: 409, message: '卡密已被其他请求兑换，请刷新后重试' };
 
   db.prepare('UPDATE tokens SET points = points + ?, updated_at=? WHERE id=?')
     .run(card.points, now, token.id);
   const balance = db.prepare('SELECT points FROM tokens WHERE id = ?').get(token.id).points;
-  audit(req, 'gateway.card.redeem', 'card', card.id, `面额 ${card.points} → 令牌 ${token.prefix}（余额 ${balance}）`);
-  res.json({ ok: true, points: card.points, balance, tokenPrefix: token.prefix });
+  if (req) {
+    audit(req, action, 'card', card.id, `面额 ${card.points} → 令牌 ${token.prefix}（余额 ${balance}）`, actor);
+  }
+  return { ok: true, points: card.points, balance, at: now, tokenPrefix: token.prefix, cardId: card.id };
+}
+
+/**
+ * POST /api/gateway/redeem —— 用户端自助兑换卡密（机器对机器入口）。
+ * 业务全在 redeemCard() 里；这里只负责按网关的口径（token 原文）取行与翻译响应。
+ */
+router.post('/redeem', (req, res) => {
+  const raw = String(req.body?.token || '').trim();
+  if (!raw) return res.status(400).json({ ok: false, message: '缺少 token' });
+
+  const token = db.prepare('SELECT * FROM tokens WHERE value = ?').get(raw);
+  if (!token) return res.status(401).json({ ok: false, message: '访问令牌无效' });
+
+  const result = redeemCard({ token, code: req.body?.card, req });
+  if (!result.ok) return res.status(result.status).json({ ok: false, message: result.message });
+  res.json({ ok: true, points: result.points, balance: result.balance, tokenPrefix: result.tokenPrefix });
 });
 
 /**
@@ -219,6 +268,10 @@ router.post('/consume', (req, res) => {
   const raw = String(req.body?.token || '').trim();
   const ref = String(req.body?.ref || '').trim();
   const reason = String(req.body?.reason || 'consume');
+  // ⚠️ 这里**有意**不接「按模型计费」：本接口是通用的"扣多少分"入口，调用方
+  //    （mvp 用户面）自己带 `points`，服务端看不到 seconds、也就无从判断模型。
+  //    硬套 modelForTask 会把它变成"按 v2.5 的价扣"，是**静默涨价**。
+  //    视频任务走 `submitGenerationTask`，那条路才做按模型计价。
   const points = Number(req.body?.points ?? numSetting('gateway_points_per_task', 1));
 
   if (!raw) return res.status(400).json({ ok: false, message: '缺少 token' });
@@ -359,10 +412,37 @@ router.get('/health', (req, res) => {
   const native15 = nativeFifteenSecondPoolStats();
   const native30 = nativeThirtySecondPoolStats();
   const referenceImages = referenceImagePoolStats();
+  const costs = parseModelCosts(getSetting(QUOTA_SETTING_KEYS.modelCosts, ''));
+  const gatewayView = switchView({ key: SWITCH_KEYS.gateway, scope: 'v1', fallback: 'true' });
+  const generation = generationStatus();
+  // 合成就绪度：把"能不能提交"收成一个结论，别让每个调用方自己拼四个布尔。
+  // 本接口有网关密钥保护，所以可以回完整理由。
+  const readiness = readinessSummary({
+    gatewayEnabled: gatewayView.effective_enabled,
+    generation,
+    pools: {
+      expertSecondsReady: native15?.ready,
+      fixedSecondsReady: native30?.ready,
+      referenceImagesReady: referenceImages?.ready,
+    },
+  });
   res.json({
     ok: true,
     pointsPerTask: numSetting('gateway_points_per_task', 1),
-    generation: generationStatus(),
+    // 价目表：用户端要能在下单**之前**算出这一单多少钱，否则只能在被扣费后才发现价不对。
+    // `costsReason` 揭示价目表是不是坏的（invalid_json 等）—— 坏表会整份回落。
+    pricing: {
+      defaultPoints: numSetting('gateway_points_per_task', 1),
+      costs: costs.ok ? costs.costs : {},
+      costsOk: costs.ok,
+      costsReason: costs.reason,
+      dailyPointsLimit: numSetting(QUOTA_SETTING_KEYS.dailyLimit, 0),
+    },
+    gateway: gatewayView,
+    // 三分级：ok / degraded / down。`degraded` 是常态（原生 15s/30s 本来就不常确认），
+    // 所以调用方应当按"能不能用它想要的档位"来判，而不是要求 ok。
+    readiness,
+    generation,
     // These are accepted native request targets. 15s is the expert Seedance
     // 2.0 path; readiness is reported only when a matching account has a
     // read-only page probe plus an exclusive verified exit.
@@ -439,9 +519,12 @@ export class GatewayTaskError extends Error {
  * @param {Array} [input.images=[]] 参考图（base64 数组）
  * @param {number|null} [input.accountId=null] 指定账号
  * @param {boolean} [input.strictAccount=false]
- * @param {number|null} [input.points=null] 每任务扣积分，默认取 gateway_points_per_task
- * @returns {{taskId, status, chargedPoints, balance, chargeRef, account, skippedAccounts, prompt, tokenId, tokenPrefix}}
- * @throws {GatewayTaskError}
+ * @param {number|null} [input.points=null] 每任务扣积分。**不传时按模型与秒数计价**
+ *        （见 dola/gateway-quota.js）；传了就按传的算（后台批量/测试用）。
+ * @param {boolean} [input.autoStart=true] false = 只建任务并扣积分，等调用方自己启动（见 /v1 的 auto_start）
+ * @returns {{taskId, status, started, chargedPoints, balance, chargeRef, account, skippedAccounts,
+ *            prompt, tokenId, tokenPrefix, pricing, usage}}
+ * @throws {GatewayTaskError} 额度超限时 `status=429, code=DAILY_POINTS_LIMIT`
  */
 export async function submitGenerationTask(input = {}) {
   const fail = (opts) => { throw new GatewayTaskError(opts); };
@@ -449,6 +532,9 @@ export async function submitGenerationTask(input = {}) {
   const prompt = String(input.prompt || '').trim();
   if (!tokenValue) fail({ status: 400, message: '缺少 token' });
   if (!prompt) fail({ status: 400, message: '缺少 prompt' });
+  // auto_start=false：建任务 + 扣积分，但**不**派发。给 /v1 的 auto_start 用。
+  // 默认 true，既有调用方（后台批量、/api/gateway/gen）行为完全不变。
+  const autoStart = input.autoStart !== false;
 
   const mode = String(input.mode || 'standard').trim().toLowerCase();
   if (!['standard', 'expert'].includes(mode)) {
@@ -467,11 +553,39 @@ export async function submitGenerationTask(input = {}) {
     fail({ status: 403, message: '访问令牌已过期' });
   }
 
-  const points = Number(input.points ?? numSetting('gateway_points_per_task', 1));
+  // 计价的「秒数口径」：`forceSeconds` 会真的改变上游时长（见 generator.js 的时长注入），
+  // 所以按**实际要跑的秒数**计价，而不是按请求里写的那个。否则会出现
+  // 「请求 10 秒、强改为 30 秒、按 10 秒的价收」——成本与收入对不上。
+  const forcedSeconds = Number(input.forceSeconds);
+  const pricingSeconds = Number.isFinite(forcedSeconds) && forcedSeconds > 0 ? forcedSeconds : requestedSeconds;
+
+  // 定价优先级：显式 points > 价目表（模型|秒数 → 模型 → default）> gateway_points_per_task。
+  // 显式 points 保留，是因为后台批量与测试都靠它钉住价格。
+  const explicitPoints = input.points === null || input.points === undefined ? null : Number(input.points);
+  const priced = explicitPoints === null
+    ? resolveTaskPoints({ seconds: pricingSeconds })
+    : { points: explicitPoints, source: 'explicit', key: 'input.points', costsReason: 'n/a' };
+  const points = priced.points;
   if (!Number.isInteger(points) || points <= 0) {
     fail({ status: 400, message: 'points 必须是正整数' });
   }
   if (t.points < points) fail({ status: 402, message: '积分不足，任务未提交', fields: { balance: t.points, need: points } });
+
+  // 每日额度闸门。放在这里（提示词占位、参考图校验、账号体检**之前**）有两个理由：
+  //   ① 那些步骤都带副作用或很贵（体检要真发请求），额度不够就不该走到那一步；
+  //   ② 这里是纯读+判断，失败时没有任何东西需要回滚。
+  // ⚠️ 这个前置检查**挡不住并发**：两个请求可以同时读到"还没超"。真正的强一致
+  //    在 `chargeVideoTask` 的 guard 里（同一个事务内复核）。两处共用同一段判断逻辑。
+  const quota = quotaView({ token: t, points });
+  if (!quota.ok) {
+    fail({
+      status: 429,
+      code: 'DAILY_POINTS_LIMIT',
+      message: `已达今日积分上限（上限 ${quota.limit}，今日已用 ${quota.used}），任务未提交，也未扣积分；`
+        + `额度按服务器本地日结算，${quota.day} 当天内不再放行`,
+      fields: { quota },
+    });
+  }
 
   // 上游对短时间重复相同提示词会触发限流；先挡在账号体检和扣积分之前。
   const duplicate = reservePrompt(t.id, prompt);
@@ -566,7 +680,24 @@ export async function submitGenerationTask(input = {}) {
 
   // ② 扣积分：幂等键绑在任务 id 上，重试不会重复扣
   let charge;
-  try { charge = chargeVideoTask(db, { taskId: task.id, tokenId: t.id, points }); }
+  try {
+    charge = chargeVideoTask(db, {
+      taskId: task.id, tokenId: t.id, points,
+      // 同一个事务里复核每日额度：前面那道 `quotaView` 是"快速失败"，挡不住
+      // 两个并发请求同时通过。这里才是强一致的那道闸。
+      // ⚠️ 只在**首次扣费**时触发（chargeVideoTask 对已扣过的 ref 会跳过 guard），
+      //    否则重试会因为"额度已被自己占掉"而假报超限。
+      guard: ({ token: fresh }) => {
+        const q = quotaView({ token: fresh, points });
+        if (!q.ok) {
+          throw Object.assign(
+            new Error(`已达今日积分上限（上限 ${q.limit}，今日已用 ${q.used}），任务已取消，未扣积分`),
+            { status: 429, code: 'DAILY_POINTS_LIMIT', fields: { quota: q } },
+          );
+        }
+      },
+    });
+  }
   catch (error) {
     // No worker is scheduled yet: cancelled preparation must never submit to Dola.
     cancelVideoTask(task.id);
@@ -574,27 +705,42 @@ export async function submitGenerationTask(input = {}) {
     fail({
       status: error.status || 500,
       message: error.status ? error.message : '计费未完成，任务已取消',
-      fields: { balance: error.balance, need: points },
+      code: error.code,
+      // `fields` 里可能带着 quotas/诊断（如 guard 抛的 quota），别丢掉
+      fields: { balance: error.balance, need: points, ...(error.fields || {}) },
     });
   }
   const { chargeRef, balance } = charge;
-  try {
-    if (!startVideoTask(task.id)) throw new Error('任务在准备期间已取消');
-  } catch {
-    cancelVideoTask(task.id);
-    settleFailedVideoRefund(db, { ...task, status: 'queued' }, { cancelledBeforeSubmit: true });
-    await cleanupReferenceImages(task.id).catch(() => {});
-    fail({ status: 409, message: '任务未能启动，已取消并核对退还内部积分；未提交生成' });
+  // 扣费**之后**再算一次用量，返回的才是"这笔算进去之后"的状态。
+  const usage = usageSnapshot({ token: t });
+  // auto_start=false 时到此为止：任务已是 queued 且已有效扣费，由调用方决定何时启动。
+  // 不启动是安全的 —— startVideoTask 会先复核这笔扣费，没扣成不会跑。
+  if (autoStart) {
+    try {
+      if (!startVideoTask(task.id)) throw new Error('任务在准备期间已取消');
+    } catch {
+      cancelVideoTask(task.id);
+      settleFailedVideoRefund(db, { ...task, status: 'queued' }, { cancelledBeforeSubmit: true });
+      await cleanupReferenceImages(task.id).catch(() => {});
+      fail({ status: 409, message: '任务未能启动，已取消并核对退还内部积分；未提交生成' });
+    }
   }
 
   const skippedAccounts = (task._skipped || []).map((s) => ({ id: s.id, label: s.label, reason: s.kind ?? String(s.code) }));
   return {
-    taskId: task.id, status: task.status,
+    taskId: task.id, status: task.status, started: autoStart,
     chargedPoints: points, balance, chargeRef,
     account: task.account_label,
     // 体检过程中被剔除的失效账号（有值说明账号池在损耗，值得关注）
     skippedAccounts,
     prompt, mode, requestedSeconds, tokenId: t.id, tokenPrefix: t.prefix,
+    // 这一笔的价是怎么来的（source/key）+ 今天的额度状态。
+    // 没有 source 的话，"价格不对"只能靠翻设置猜，没法定位到具体命中了哪一档。
+    pricing: {
+      points, source: priced.source, key: priced.key,
+      seconds: pricingSeconds, costsReason: priced.costsReason,
+    },
+    usage,
   };
 }
 
@@ -622,6 +768,8 @@ router.post('/gen', async (req, res) => {
       chargedPoints: result.chargedPoints, balance: result.balance, chargeRef: result.chargeRef,
       account: result.account,
       skippedAccounts: result.skippedAccounts,
+      pricing: result.pricing,
+      usage: result.usage,
     });
   } catch (e) {
     if (e instanceof GatewayTaskError) {

@@ -1,8 +1,8 @@
 import { selectSeedance } from './generation-model.js';
-import { selectNativeVideoDuration } from './generation-duration.js';
+import { NATIVE_DURATION_CONTROL_SELECTOR, selectNativeVideoDuration } from './generation-duration.js';
 import { waitForVideoComposerBootstrap } from './composer-bootstrap.js';
 
-export const VIDEO_COMPOSER_INPUT_SELECTOR = 'textarea, [contenteditable="true"]';
+export const VIDEO_COMPOSER_INPUT_SELECTOR = 'textarea, [contenteditable="true"], [role="textbox"]';
 
 function unknownCapability(label, detail, reason = '') {
   const error = new Error(`${label}能力探测未完成：${detail}`);
@@ -26,7 +26,9 @@ function preparationBudget(timeout, label) {
 const reportPhase = (callback, phase) => { try { callback(phase); } catch { /* Diagnostics cannot alter admission. */ } };
 
 
-const VIDEO_DURATION_CONTROL = '[data-input-engine-actionbar-control-key="video-duration"], [data-input-engine-actionbar-control-key="duration"]';
+// Keep composer readiness checks aligned with the duration selector itself;
+// newer Dola builds also expose the control via test id or accessible label.
+const VIDEO_DURATION_CONTROL = NATIVE_DURATION_CONTROL_SELECTOR;
 
 /** Open the bottom video composer chip — never the sidebar recent-chat title. */
 async function openVideoComposerEntry(page, {
@@ -133,6 +135,10 @@ async function openVideoComposerEntry(page, {
 /**
  * Open the existing video composer and inspect its current native controls.
  * This helper never fills a prompt and never presses Enter/send.
+ *
+ * `allowUpstreamConcat` 决定是否把页面自己的合成档位（`30s (15s ×2)`）也算作
+ * 一种可用证据。默认关闭；开启后返回的 `source` 会标成 `upstream_concat`，
+ * 调用方据此关闭请求改写（合成档位本身就是目标时长，不该再被改写）。
  */
 export async function prepareNativeVideoComposer(page, {
   seconds = 30,
@@ -141,6 +147,7 @@ export async function prepareNativeVideoComposer(page, {
   clickDelayMs = 2500,
   log = () => {},
   onPhase = () => {},
+  allowUpstreamConcat = false,
 } = {}) {
   if (![10, 15, 20, 30].includes(Number(seconds))) throw new TypeError('seconds must be 10, 15, 20 or 30');
   if (!['seedance_v2.0', 'seedance_v2.5'].includes(model)) throw new TypeError('unsupported Seedance model');
@@ -172,7 +179,10 @@ export async function prepareNativeVideoComposer(page, {
   let duration;
   try {
     reportPhase(onPhase, 'duration');
-    duration = await selectNativeVideoDuration(page, targetSeconds, { timeout: Math.min(remaining(), 15000) });
+    duration = await selectNativeVideoDuration(page, targetSeconds, {
+      timeout: Math.min(remaining(), 15000),
+      allowUpstreamConcat,
+    });
   } catch (error) {
     if (['NATIVE_CAPABILITY_UNAVAILABLE', 'NATIVE_CAPABILITY_UNKNOWN'].includes(error?.code)) throw error;
     throw unknown(targetSeconds, '页面时长控件未完成加载');
@@ -185,6 +195,8 @@ export async function prepareNativeVideoComposer(page, {
     uiSeconds: duration.uiSeconds,
     native: duration.native,
     rewriteCarrier: duration.rewriteCarrier,
+    source: duration.source,
+    concat: duration.concat === true,
   };
 }
 

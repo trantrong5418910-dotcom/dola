@@ -21,7 +21,7 @@
  *   - 代理缺失绝不直连（requireGenerationProxy）。
  */
 import { randomUUID } from 'node:crypto';
-import { getPlaywright, parseCookies, guardLogoutRequests, DOLA_HEADERS } from './provider.js';
+import { getPlaywright, parseCookies, guardLogoutRequests, DOLA_HEADERS, toPlaywrightCookies } from './provider.js';
 import { proxyOf } from './proxy.js';
 import { startSocksBridge } from './socks-bridge.js';
 import { requireGenerationProxy } from './generation-policy.js';
@@ -187,7 +187,9 @@ export async function submitViaSchemeA(cookieText, {
       await route.continue();
     });
 
-    await ctx.addCookies(Object.entries(ck).map(([name, value]) => ({ name, value, domain: '.dola.com', path: '/' })));
+    // 同 generator.js：`__Host-` / `__Secure-` 前缀必须按 RFC 6265bis 分流，
+    // 不能用 `{ domain, path }` 一刀切，否则 addCookies 抛 Invalid cookie fields。
+    await ctx.addCookies(toPlaywrightCookies(ck));
 
     const page = await ctx.newPage();
     log('方案A：打开 dola /chat/ 取签名');

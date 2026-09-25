@@ -13,12 +13,15 @@ import {
   generateTokenValue, maskValue, insertMany, MAX_BATCH,
   expiresAtFromDays, toCsv,
 } from '../generate.js';
+import { parseDailyPointsLimit } from '../dola/gateway-quota.js';
 
 const router = express.Router();
 router.use(requireAuth);
 
+// `daily_points_limit` 要回给前端：否则界面上没法显示「这个令牌是跟随全局还是自己设了」。
 const LIST_SQL = `SELECT t.id, t.name, t.value, t.prefix, t.points, t.status, t.expires_at, t.note,
-                         t.created_at, t.updated_at, u.username AS created_by_name
+                         t.created_at, t.updated_at, t.daily_points_limit,
+                         u.username AS created_by_name
                   FROM tokens t LEFT JOIN users u ON u.id = t.created_by`;
 
 /** 列表项：完整值换成掩码 */
@@ -53,7 +56,7 @@ router.get('/', requirePerm('token:list'), (req, res) => {
   res.json({ ok: true, items: items.map((r) => toRow(r)), total, page: Number(page), pageSize: Number(pageSize), summary });
 });
 
-/** POST /api/tokens/generate  { count, points, name, note, expiresInDays } */
+/** POST /api/tokens/generate  { count, points, name, note, expiresInDays, dailyPointsLimit } */
 router.post('/generate', requirePerm('token:generate'), (req, res) => {
   const count = Math.min(Math.max(Number(req.body?.count) || 1, 1), MAX_BATCH);
   const points = Number(req.body?.points) || 0;
@@ -62,15 +65,32 @@ router.post('/generate', requirePerm('token:generate'), (req, res) => {
   const expires_at = expiresAtFromDays(req.body?.expiresInDays);
 
   if (points < 0) return res.status(400).json({ ok: false, message: '初始积分不能为负' });
+  const limit = parseDailyPointsLimit(req.body?.dailyPointsLimit ?? null);
+  if (!limit.ok) return res.status(400).json({ ok: false, message: limit.message });
 
   const now = new Date().toISOString();
   const rows = Array.from({ length: count }, () => ({ points, name, note, expires_at, created_by: req.user.id, now }));
   const created = insertMany(db, 'tokens', generateTokenValue, rows);
 
-  audit(req, 'token.generate', 'token', created.map((c) => c.id).join(','), `生成 ${count} 个，每个 ${points} 积分`);
+  // 生成时带上日上限。`insertMany` 的列是硬编码的（改它会连带影响卡密），
+  // 所以这里在插入之后补一次 UPDATE —— 新行此刻还没有别的调用方，不存在竞态。
+  if (limit.value !== null && created.length) {
+    db.prepare(`UPDATE tokens SET daily_points_limit=? WHERE id IN (${created.map(() => '?').join(',')})`)
+      .run(limit.value, ...created.map((c) => c.id));
+  }
+
+  audit(req, 'token.generate', 'token', created.map((c) => c.id).join(','),
+    [`生成 ${count} 个，每个 ${points} 积分`, describeDailyLimit(limit.value)].filter(Boolean).join('；'));
   // 完整值只在这里返回一次，前端要提示用户复制走
-  res.status(201).json({ ok: true, items: created, count: created.length });
+  res.status(201).json({ ok: true, items: created, count: created.length, daily_points_limit: limit.value });
 });
+
+/** 审计文案：把三态说成人话。 */
+function describeDailyLimit(v) {
+  if (v === null || v === undefined) return '';
+  if (v === 0) return '每日上限：不限（覆盖全局）';
+  return `每日上限：${v} 积分`;
+}
 
 /**
  * GET /api/tokens/export —— 导出 CSV，**含完整令牌值**。
@@ -119,10 +139,12 @@ router.get('/:id/reveal', requirePerm('token:reveal'), (req, res) => {
 });
 
 /**
- * POST /api/tokens/:id/action  { action, delta?, days? }
+ * POST /api/tokens/:id/action  { action, delta?, days?, dailyPointsLimit? }
  *   disable / enable / revoke   —— 改状态
  *   points { delta }            —— 增减积分
  *   expire { days }             —— 设/清过期时间（days<=0 清除）
+ *   daily_limit { dailyPointsLimit } —— 设每令牌每日积分上限
+ *       留空/null = 跟随全局设置；0 = 该令牌不限；正数 = 上限
  */
 router.post('/:id/action', requirePerm('token:update'), (req, res) => {
   const id = Number(req.params.id);
@@ -159,6 +181,14 @@ router.post('/:id/action', requirePerm('token:update'), (req, res) => {
     db.prepare('UPDATE tokens SET expires_at=?, updated_at=? WHERE id=?').run(expires_at, now, id);
     audit(req, 'token.expire', 'token', id, expires_at ?? '清除过期时间');
     return res.json({ ok: true, expires_at });
+  }
+
+  if (action === 'daily_limit') {
+    const parsed = parseDailyPointsLimit(req.body?.dailyPointsLimit ?? null);
+    if (!parsed.ok) return res.status(400).json({ ok: false, message: parsed.message });
+    db.prepare('UPDATE tokens SET daily_points_limit=?, updated_at=? WHERE id=?').run(parsed.value, now, id);
+    audit(req, 'token.daily_limit', 'token', id, describeDailyLimit(parsed.value) || '恢复跟随全局设置');
+    return res.json({ ok: true, daily_points_limit: parsed.value });
   }
 
   return res.status(400).json({ ok: false, message: `不支持的动作：${action}` });

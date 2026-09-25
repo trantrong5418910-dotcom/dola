@@ -17,6 +17,22 @@ function fixture({ chargeError = false, startResult = true, withImages = true, c
     sanitizePreflightDiagnostic,
     findUnsettledPrompt: () => null,
     getSetting: (key, fallback) => key === 'gateway_prompt_cooldown_seconds' ? '0' : fallback,
+    // ⚠️ 本钩子会**剥掉 gateway.js 里所有 import 行**（见文件顶部的 replace），
+    //    所以 gateway.js 每新增一个 import 都必须在这里补一个同名绑定，否则
+    //    调用点会 ReferenceError —— 而报错信息指向的是"调度顺序不对"，
+    //    完全看不出是沙箱少了绑定。这是本项目最容易踩的坑之一。
+    //
+    // 每日额度：本测试的 db 是个三行桩，喂不了真实的 point_transactions 查询，
+    // 所以这里注入**恒放行**的假实现（只保留 `ok`，让闸门不拦）。
+    // 真实的定价与额度口径由 test/gateway-quota.mjs 覆盖。
+    quotaView: () => ({ limit: 0, used: 0, remaining: null, ok: true, reason: 'unlimited', day: '1970-01-01', limitSource: 'none' }),
+    usageSnapshot: () => ({ limit: 0, used: 0, remaining: null, ok: true, reason: 'unlimited', day: '1970-01-01', limitSource: 'none' }),
+    resolveTaskPoints: () => ({ points: 1, source: 'setting', key: 'gateway_points_per_task', costsReason: 'n/a' }),
+    parseModelCosts: () => ({ ok: true, costs: {}, reason: 'empty' }),
+    QUOTA_SETTING_KEYS: { defaultPoints: 'gateway_points_per_task', modelCosts: 'gateway_model_costs', dailyLimit: 'gateway_daily_points_limit' },
+    switchView: () => ({ key: 'gateway_enabled', enabled: true, scope_enabled: true, effective_enabled: true, scope: 'v1', configuredScope: 'all', reasons: [] }),
+    SWITCH_KEYS: { gateway: 'gateway_enabled', promptWrap: 'gateway_prompt_wrap_enabled' },
+    readinessSummary: () => ({ grade: 'degraded', reasons: [], seconds: { supported: [10, 15, 20, 30], ready: [10, 20] }, accounts: { valid: 0, cooling: 0, available: 0 }, queue: {}, at: '1970-01-01T00:00:00.000Z' }),
     db: { prepare: sql => {
       assert.match(sql, /SELECT \* FROM tokens WHERE value/);
       return { get: () => ({ id: 1, status: 'active', points: 10 }) };

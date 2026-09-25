@@ -28,7 +28,9 @@ router.use(requireAuth);
  * （前端 Settings.vue 的 save() 是全量提交 `patch[it.key] = it.value`，
  *   如果 view 用户能提交，掩码就会被写进库 —— 这正是必须一起考虑的点）。
  */
-const SECRET_SETTING_KEYS = new Set(['gateway_key']);
+// `metrics_key` 与 `gateway_key` 同类：都是**服务级共享密钥**，
+// 拿到就能绕过用户令牌直接抓运行态。只给 `setting:view` 的人不该看到真值。
+const SECRET_SETTING_KEYS = new Set(['gateway_key', 'metrics_key']);
 const MASK = '••••••••（无权限查看，需要 设置-修改 权限）';
 
 /** GET /api/settings */
@@ -57,6 +59,21 @@ router.put('/', requirePerm('setting:update'), (req, res) => {
     if (!Number.isInteger(minutes) || minutes < 15 || minutes > 1440) {
       return res.status(400).json({ ok: false, message: '自动巡检间隔须为 15～1440 分钟的整数' });
     }
+  }
+  if ('dola_quota_reset_hour' in patch) {
+    const hour = Number(patch.dola_quota_reset_hour);
+    if (!Number.isInteger(hour) || hour < 0 || hour > 23) {
+      return res.status(400).json({ ok: false, message: '额度重置时刻须为 0～23 的整数' });
+    }
+  }
+  if ('dola_quota_reset_tz' in patch) {
+    const tz = String(patch.dola_quota_reset_tz || '').trim();
+    if (!/^[A-Za-z_]+(\/[A-Za-z_0-9+-]+)+$/.test(tz)) {
+      return res.status(400).json({ ok: false, message: '重置时区格式不正确，应为 IANA 时区如 Asia/Tokyo' });
+    }
+    try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); }
+    catch { return res.status(400).json({ ok: false, message: `不支持的时区：${tz}` }); }
+    patch.dola_quota_reset_tz = tz;
   }
   const integerRanges = {
     dola_gen_concurrency: [1, 20, '视频生成并发数须为 1～20 的整数'],

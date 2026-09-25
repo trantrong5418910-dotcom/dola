@@ -11,6 +11,7 @@
  *      但「查额度」到底需不需要签名，必须用真实 cookie 实测 —— 见 probeCredits()。
  */
 import crypto from 'node:crypto';
+import { tryAcquireAccountBrowserLock } from './account-browser-lock.js';
 import { observeVideoComposerBootstrap } from './composer-bootstrap.js';
 import { createPreflightDiagnostics } from './preflight-diagnostics.js';
 import {
@@ -70,6 +71,37 @@ const COOKIE_NAME_RE = /^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$/;
  * 否则把多行 JSON 误当 cookie 头解析时，`"name": "ttwid",` 这种行会被当成
  * cookie 名 = `"name"`（带引号）而混进来 —— 真踩过。
  */
+/**
+ * 在一层 JSON 对象里挖出「cookie 数组」。
+ *
+ * 为什么必须有这个函数：导出的 cookie 常常是**包装对象**，形状是
+ *   { format, schemaVersion, exportedAtUtc, scope, instanceName, cookieCount, cookies: [ {name,value,...} ] }
+ *
+ * ⚠️ 不挖内层数组的后果（实测踩到，且症状极具误导性）：
+ *   顶层剩下 format / schemaVersion / scope / instanceName / cookieCount 这些**字符串标量**，
+ *   它们恰好都能通过 RFC 6265 的 token 校验 —— 于是被当成「cookie」装进结果里。
+ *   keep() 返回非空 → JSON 分支直接短路 return，**真正的 cookie 一个都没解析到**。
+ *   外部表现是「导入成功，但账号缺少 ttwid/odin_tt 被判 invalid」，
+ *   让人以为是 cookie 本身坏了 / 复制不全，而不是解析器丢了内容。
+ *
+ * 只认一层（不递归），先按常见键名找，再退化为扫所有值。
+ */
+function findCookieArray(obj) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
+  const isCookieArray = (v) => Array.isArray(v) && v.length > 0
+    && v.every((x) => x && typeof x === 'object' && !Array.isArray(x) && typeof x.name === 'string');
+
+  // ① 常见键名（本项目导出工具用 cookies；Playwright storageState 也是 cookies）
+  for (const k of ['cookies', 'cookieList', 'cookie_list']) {
+    if (isCookieArray(obj[k])) return obj[k];
+  }
+  // ② 退化为扫一层值：找「全是 {name:string,...}」的数组
+  for (const v of Object.values(obj)) {
+    if (isCookieArray(v)) return v;
+  }
+  return null;
+}
+
 export function parseCookies(input) {
   // 浏览器插件导出的 JSON 常带 UTF-8 BOM，JSON.parse 会因为首字符 \uFEFF 直接报错
   const raw = String(input || '').replace(/^\uFEFF/, '').trim();
@@ -96,6 +128,16 @@ export function parseCookies(input) {
         const clean = keep(out);
         if (Object.keys(clean).length) return clean;
       } else if (js && typeof js === 'object') {
+        // ① 包装导出：先挖内层 cookies 数组（详见 findCookieArray 的说明）。
+        //    必须在「扁平对象」分支之前做，否则会被顶层标量短路。
+        const nested = findCookieArray(js);
+        if (nested) {
+          const out = {};
+          for (const c of nested) out[c.name] = String(c.value ?? '');
+          const clean = keep(out);
+          if (Object.keys(clean).length) return clean;
+        }
+        // ② 扁平对象 {"a":"1","b":"2"}
         const out = {};
         for (const [k, v] of Object.entries(js)) {
           if (typeof v !== 'object') out[k] = String(v ?? '');
@@ -145,6 +187,36 @@ export function cookieHeader(cookies) {
 export const REQUIRED_COOKIES = ['ttwid', 'odin_tt'];
 export function missingRequired(cookies) {
   return REQUIRED_COOKIES.filter((n) => !cookies?.[n]);
+}
+
+/**
+ * ★ 把账号 cookie 映射成 Playwright / Chromium 能接受的结构 —— **不能一刀切**。
+ *
+ * Chromium 会按 RFC 6265bis 校验两个保留前缀：
+ *   `__Secure-`  → 必须带 secure=true
+ *   `__Host-`    → 必须 secure=true、path='/'，且**不能带 domain**（host-only，只能用 url 指定）
+ *
+ * 之前三处注入点都统一写成 `{ domain: '.dola.com', path: '/' }`，于是凡是 cookie 里
+ * 带这类前缀的账号，都会在 `ctx.addCookies()` 直接抛
+ *   `Protocol error (Storage.setCookies): Invalid cookie fields`
+ * 再被上层裸 catch 吞成「页面、登录状态或网络未能完成只读能力探测」，
+ * 根因长期不可见（2026-09-25 靠逐条二分才定位到）。
+ */
+export function toPlaywrightCookies(cookies) {
+  return Object.entries(cookies || {})
+    .filter(([name, value]) => typeof name === 'string' && name && typeof value === 'string')
+    .map(([name, value]) => {
+      if (name.startsWith('__Host-')) {
+        // host-only：只能靠 url 指定（带 domain 会被 Chromium 拒）。
+        // 注意 Playwright 不允许 url 与 domain/path 同时出现，否则报
+        // "Cookie should have either url or path"；path='/' 会由 url 自动推出。
+        return { name, value, url: `${DOLA_BASE}/`, secure: true };
+      }
+      if (name.startsWith('__Secure-')) {
+        return { name, value, domain: '.dola.com', path: '/', secure: true };
+      }
+      return { name, value, domain: '.dola.com', path: '/' };
+    });
 }
 
 // ---------------------------------------------------------------- 请求
@@ -524,9 +596,7 @@ export async function fetchCreditsViaBrowser(cookies, {
     await ctx.route('**/chat/**', route => route.request().method() === 'POST' ? route.abort() : route.continue());
 
     // 把导入的 cookie 灌进浏览器上下文
-    const cookieList = Object.entries(cookies).map(([name, value]) => ({
-      name, value, domain: '.dola.com', path: '/',
-    }));
+    const cookieList = toPlaywrightCookies(cookies);
     if (cookieList.length) await ctx.addCookies(cookieList);
 
     const page = await ctx.newPage();
@@ -575,6 +645,7 @@ export async function probeNativeVideoViaBrowser(cookies, {
   proxy = undefined,
   proxyUrl = null,
   accountId = null,
+  allowUpstreamConcat = false,
 } = {}) {
   timeout = Math.min(120000, Math.max(1, Number(timeout) || 60000));
   const diagnostic = createPreflightDiagnostics({ seconds });
@@ -598,6 +669,13 @@ export async function probeNativeVideoViaBrowser(cookies, {
   let bridge = null;
   let deadlineTimer = null;
   let deadlineExpired = false;
+  // ★ 必须声明在 try 之外：catch 分支要用它判断「页面到底有没有打开」。
+  let navError = null;
+  let navigated = false;
+  const releaseAccountBrowserLock = accountId == null ? null : tryAcquireAccountBrowserLock(accountId);
+  if (accountId != null && !releaseAccountBrowserLock) {
+    return { ok: false, state: 'unknown', error: '该账号浏览器正忙，未进行能力判定' };
+  }
   try {
     // Keep the installed runtime identical to the generation worker. This does
     // not by itself establish page readiness; the composer must still confirm it.
@@ -616,6 +694,7 @@ export async function probeNativeVideoViaBrowser(cookies, {
     // Otherwise a caller may time out while the backend continues creating a task.
     deadlineTimer = setTimeout(() => {
       deadlineExpired = true;
+      void Promise.resolve(ctx?.close()).catch(() => {});
       void browser?.close().catch(() => {});
     }, remaining());
     /**
@@ -667,11 +746,8 @@ export async function probeNativeVideoViaBrowser(cookies, {
 
     await ctx.route('**/chat/completion**', route => route.abort());
     await ctx.route('**/chat/**', route => route.request().method() === 'POST' ? route.abort() : route.continue());
-    const cookieList = Object.entries(cookies || {}).map(([name, value]) => ({
-      name, value, domain: '.dola.com', path: '/',
-    }));
+    const cookieList = toPlaywrightCookies(cookies);
     if (!cookieList.length) {
-      await ctx.close().catch(() => {});
       return { ok: false, state: 'unknown', error: '账号没有可用 cookie，未进行能力判定' };
     }
     await ctx.addCookies(cookieList);
@@ -679,18 +755,48 @@ export async function probeNativeVideoViaBrowser(cookies, {
     diagnostic.attach(page);
     observeVideoComposerBootstrap(page);
     diagnostic.mark('navigate');
-    await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: Math.min(remaining(), 60000) }).catch(() => {});
+    /**
+     * ★ 导航异常必须**留住**，不能 `.catch(() => {})` 一口吞掉。
+     *
+     * 吞掉的代价（2026-09-25 实测，同一个函数、同一天）：
+     *   #420 代理会话失效 → 页面从未打开，diagnostic.phase=`navigate`；
+     *   #408 登录正常     → diagnostic.phase=`entry`（**输入框已出现**），只是时长控件没加载完。
+     * 两者却都抛出同一句话「未确认已登录的创作页面」——
+     * 于是"可用账号"被当成"未登录"去折腾 cookie，而真正坏掉的出口没人去修。双向误判。
+     *
+     * 对照参考站 §4：`logged_in` 与 `proxy_enabled/egress` 是**两个独立字段**，不能混为一谈。
+     * 所以这里把"页面没打开"单独报出来，并归到 proxy（proxy 没有作用域 → 只提示、不封号）。
+     */
+    await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: Math.min(remaining(), 60000) })
+      .catch((e) => { navError = e; });
+    if (navError && !deadlineExpired) {
+      return {
+        ok: false, state: 'unknown', pageLoaded: false,
+        reason: 'VIDEO_NAVIGATION_FAILED',
+        diagnostic: diagnostic.snapshot('VIDEO_NAVIGATION_FAILED'),
+        error: `页面未能加载（代理或网络故障），未做能力判定：${String(navError?.message || navError).replace(/\s+/g, ' ').slice(0, 160)}`,
+      };
+    }
+    navigated = true;
     // Streaming/telemetry can keep the network busy forever. Readiness comes
     // from the visible composer controls below, not from zero open requests.
     await page.waitForLoadState('networkidle', { timeout: Math.min(remaining(), 5000) }).catch(() => {});
-    const capability = await prepareNativeVideoComposer(page, { seconds, model, timeout: remaining(), onPhase: diagnostic.mark });
+    const capability = await prepareNativeVideoComposer(page, {
+      seconds, model, timeout: remaining(), onPhase: diagnostic.mark, allowUpstreamConcat,
+    });
     if (deadlineExpired) throw new Error('capability_probe_timeout');
-    await ctx.close().catch(() => {});
-    return { ok: true, state: 'available', ...capability, diagnostic: diagnostic.snapshot() };
+    return { ok: true, state: 'available', pageLoaded: true, ...capability, diagnostic: diagnostic.snapshot() };
   } catch (error) {
+    // 诊断日志：把通用报错背后的真实异常打出来，否则永远看不到根因
+    try {
+      console.error(`[probe] native video probe failed: code=${error?.code || 'none'} reason=${deadlineExpired ? 'VIDEO_PREPARATION_TIMEOUT' : error?.reason || 'none'} message=${String(error?.message || error).slice(0, 300)}`);
+    } catch { /* 日志不能影响探针返回 */ }
     return {
       ok: false,
       state: nativeCapabilityState(error),
+      // pageLoaded 是「登录未确认」可信度的前提：只有页面真打开了，
+      // "创作输入框没出现"才能当成登录态的证据；页面压根没加载时它什么也证明不了。
+      pageLoaded: navigated,
       reason: deadlineExpired ? 'VIDEO_PREPARATION_TIMEOUT' : error?.reason || null,
       diagnostic: diagnostic.snapshot(deadlineExpired ? 'VIDEO_PREPARATION_TIMEOUT' : error?.reason || 'VIDEO_PROBE_ERROR'),
       error: ['NATIVE_CAPABILITY_UNAVAILABLE', 'NATIVE_CAPABILITY_UNKNOWN'].includes(error?.code)
@@ -700,8 +806,10 @@ export async function probeNativeVideoViaBrowser(cookies, {
   } finally {
     diagnostic.dispose();
     clearTimeout(deadlineTimer);
+    await ctx?.close().catch(() => {});
     await browser?.close().catch(() => {});
     await bridge?.close().catch(() => {});
+    releaseAccountBrowserLock?.();
   }
 }
 
@@ -762,9 +870,7 @@ export async function probeReferenceImageViaBrowser(cookies, {
     });
     await ctx.route('**/passport/**/logout**', route => route.abort());
 
-    const cookieList = Object.entries(cookies || {}).map(([name, value]) => ({
-      name, value, domain: '.dola.com', path: '/',
-    }));
+    const cookieList = toPlaywrightCookies(cookies);
     if (!cookieList.length) {
       await ctx.close().catch(() => {});
       return { ok: false, state: 'unknown', error: '账号没有可用 cookie，未进行能力判定' };

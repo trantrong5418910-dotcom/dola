@@ -109,7 +109,7 @@ function assertSafeUrl(u) {
 
 function frontendConfig() {
   return {
-    name: getSetting('frontend_name', '前台') || '前台',
+    name: getSetting('frontend_name', '视频工作台') || '视频工作台',
     url: getSetting('frontend_url', '') || '',
     mode: getSetting('frontend_open_mode', 'tab') || 'tab',
     browserVisible: getSetting('frontend_browser_visible', 'true') === 'true',

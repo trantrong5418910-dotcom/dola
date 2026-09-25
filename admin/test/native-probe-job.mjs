@@ -118,13 +118,18 @@ test('batch native probe job is read-only, serial and skips accounts without a b
   }
 });
 
-test('native probe contract must not persist a shorter UI carrier as available', () => {
-  // Keep this regression close to the batch job contract: a real page can show
-  // 10s while the adapter carries a requested 20/30s value. That is unknown,
-  // not native capability evidence.
-  const result = { ok: true, state: 'available', seconds: 20, uiSeconds: 10,
+test('native probe contract must not persist a wrong UI carrier as available', () => {
+  // Keep this regression close to the batch job contract: 20s uses the 10s
+  // carrier, 30s uses the 15s carrier. A mismatched carrier is unknown,
+  // not capability evidence.
+  const good20 = { ok: true, state: 'available', seconds: 20, uiSeconds: 10,
     native: false, rewriteCarrier: true, model: 'seedance_v2.5' };
-  assert.equal(isVerifiedNativeCapability(result, 20), false);
-  assert.equal(isVerifiedNativeCapability({ ...result, seconds: 10, uiSeconds: 10,
+  assert.equal(isVerifiedNativeCapability(good20, 20), true);
+  assert.equal(isVerifiedNativeCapability({ ...good20, uiSeconds: 15 }, 20), false);
+  const good30 = { ok: true, state: 'available', seconds: 30, uiSeconds: 15,
+    native: false, rewriteCarrier: true, model: 'seedance_v2.5' };
+  assert.equal(isVerifiedNativeCapability(good30, 30), true);
+  assert.equal(isVerifiedNativeCapability({ ...good30, uiSeconds: 10 }, 30), false);
+  assert.equal(isVerifiedNativeCapability({ ...good20, seconds: 10, uiSeconds: 10,
     native: true, rewriteCarrier: false }, 10), true);
 });

@@ -17,6 +17,10 @@ function fixture({ inputs = 1, sends = 1, text = 'synthetic prompt', enabled = t
   };
   const page = {
     evaluate: async () => {},
+    // generation-submit.js 在点击后同步读 page.url() 做派发取证，并用
+    // page.waitForTimeout 做轮询；桩必须提供这两个方法（Playwright 里 url() 是同步的）。
+    url: () => 'https://example.invalid/',
+    waitForTimeout: async () => {},
     locator: selector => selector === VIDEO_SEND_SELECTOR ? send : input,
     waitForFunction: async (_fn, selector) => { assert.equal(selector, VIDEO_SEND_SELECTOR); calls.push(['wait-ready']); if (waitFails) throw Error('not ready'); },
     keyboard: { press: async () => { throw Error('Enter shortcut forbidden'); }, type: async () => { throw Error('blind fallback forbidden'); } },

@@ -28,6 +28,8 @@ admin/output/
 capture/
 fangyue-evidence/
 .workbuddy/
+# AI 工作数据（记忆日志与技能）：属于本地工作痕迹，不入库
+.workbuddy-ai/
 output/
 
 # 手工备份（.bak-<日期>-<主题>）：历史由 git 负责，备份文件不入库

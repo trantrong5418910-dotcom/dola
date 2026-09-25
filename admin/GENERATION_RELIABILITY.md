@@ -271,3 +271,74 @@
 - 重启 `com.feige.dola-admin` / `com.feige.dola-mvp`，PID分别77449/77450。正式health、accounts、current batch、只读格式预览均HTTP200；8787首页HTTP200。
 - 与备份逐行核对：账号30、视频64、提交留痕0、能力保护10、积分流水116和令牌表均相同。视频仍4ready/51failed/9cancelled；令牌81积分6。新 `dola_login_profiles` 为空，正式预览没有写入编号或启动浏览器。
 - 本轮真实视频生成0、扣费0，预算仍保守3/5。没有改写历史结果，也没有证明98%真实成功率。后续真实生成需明确授权，不自动换号或扩大测试预算。
+
+---
+
+## 2026-09-25 上游合成档位：30 秒的第二条路
+
+对照参考站 68.64.176.15（dola2api 2.3.13）的 30 秒方案。它前端原文写的是：
+「上游不接受 30 秒、要拆两段时，**会同会话催上游拆 2 段并首尾相接成连续 30 秒**，
+只下载合成后的新成片；**本服务不做视频拼接**」。
+
+这句话对应的页面形态，就是本项目此前**主动拒绝**的那一档：形如 `30s (15s ×2)`。
+证据在本仓库内即可复核 —— `scripts/check-native-duration-offline.mjs` 早就有这两个真实档位样本
+（`20s (10s ×2)` / `30s (15s ×2)`），当时的期望是 `NATIVE_CAPABILITY_UNKNOWN`，即拒绝。
+
+### 三条路的区别（这次把口径写进代码）
+
+| 来源 `source` | 页面形态 | 请求层 | 谁在合成 |
+|---|---|---|---|
+| `native_single` | 页面真有「30秒」单次档 | 不改写 | 上游单次出片 |
+| `carrier_rewrite` | 只有 15s 载体档 | 改写 `ability_param.duration=30` | 上游按 30 秒出片 |
+| `upstream_concat` | 页面自己标着 `30s (15s ×2)` | **不改写** | 上游拆段 + 首尾相接 |
+
+第三条**默认关闭**（设置 `dola_upstream_concat`，默认 `false`）。
+理由：它改变的是「我们愿意把什么算成 30 秒任务」这个口径，属于要显式拍板的事，
+不该由一次代码提交顺手放开。开启后它是纯增量 —— 只有在单次档位和载体档位都不成立时才会走到。
+
+### 实现
+
+- `generation-duration.js`：新增 `DURATION_SOURCE` 枚举、`isUpstreamConcatDurationText()`、
+  `selectUpstreamConcatDuration()`；`selectNativeVideoDuration()` 增加 `allowUpstreamConcat` 开关，
+  所有成功结果都带 `source` / `concat`。恢复 `listNativeVideoDurations()`（读菜单实际档位）：
+  菜单**确实打开且有档位**却缺目标档位时记 `unavailable` 并把实际档位写进错误；
+  菜单没渲染则保持 `unknown` —— 运营能一眼分清"账号没有"和"探测没跑完"。
+- `generation-policy.js`：`isVerifiedNativeCapability(result, seconds, { allowUpstreamConcat })`，
+  新增 `isUpstreamConcatCapability()`。缺 `source`/`concat`/秒数不符/模型不符一律拒绝。
+- `generator.js`：预检与提交都按设置传入开关；**来源为 `upstream_concat` 时把请求适配器改回
+  `rewrite:false`（只观察）并复核已生效**——合成档位自己就声明了目标时长，再改写会破坏它。
+  复核不通过直接中止提交，不发送提示词。
+- `generator.js` 归档阶段改为**有界多候选**（最多 3 条）：上游合成会拆段生成，
+  消息链里可能同时有中间段和成品；只取 `vids[0]` 有可能把 15 秒中间段当成 30 秒交付。
+  现在逐个归档 + 探测真实时长，接受第一个通过 `validateArchivedVideo` 的候选，
+  判据没有放宽，只是把"一次机会"变成"最多三次机会"。被拒候选清理用 try/catch 包裹
+  （隔离测试里 `fs` 是"取属性就抛"的 Proxy，链式 `.catch()` 挂不上，会把清理失败放大成交付失败）。
+- `db.js` 新增设置 `dola_upstream_concat`（默认 `false`）。
+- 30 秒探测的 `successNote` 改成按**实际来源**生成，避免把载体改写和上游合成写进同一句备注。
+
+### 顺带修掉的既有问题：测试夹具表结构漂移
+
+`test/generator-isolated.mjs` 的 `dola_videos` 建表缺 `cleared_at`，而 `generator.js`
+（v1 API「清除」软删除那条线）会 SELECT 该列 → 整个文件 90 例里 **37 例**报
+`no such column: cleared_at`。这是上一轮改动留下的夹具漂移，与本次功能无关，已补齐列。
+补上后该文件 90/90 通过。
+
+### 本轮验证
+
+- `npm run test:generation-reliability` **428 通过 / 0 失败**（改前 37 失败）。
+- `test:native-probe` 24、`test:concurrency` 91、`test:generation-analytics` 118、
+  `test:chain-text` 37、`test:account-score` 20、`test:media-library` 82 全部通过。
+- 新增离线用例覆盖：合成档位命中/未命中、未放行时绝不点选、已选中合成档位的识别、
+  合成档位被禁用、选完控件未变化（`UPSTREAM_CONCAT_NOT_CONFIRMED`）、档位读取在无菜单时返回空。
+- **未做**：没有用真实账号探测过页面菜单里到底有没有 `30s (15s ×2)`，
+  也没有做过真实生成。本轮真实生成 0、扣费 0、账号状态未改。
+  功能开关默认关闭，所以在真实证据到位前，线上行为与改前一致。
+
+### 仍未证明的事（不要越界宣称）
+
+1. 参考站那句「催上游拆 2 段」是**它自己前端写的说明文案**，我没有独立验证；
+   它公开的 `/openapi.json` 里没有任何 concat 字段。
+2. 我们不知道合成档位选中后请求体里 `ability_param` 长什么样，
+   所以走这条路径时适配器**只观察不改写**，先收证据再决定要不要动。
+3. 2026-09-25 的实测记录里，至少有一个真实账号的时长菜单只有 `5s / 10s`（免费号额度用完的样子）——
+   连 15s 都没有。上游合成档位能不能出现，取决于账号，不取决于我们的代码。

@@ -1042,6 +1042,87 @@
     }
   }
 
+  // ─────────────────────────────────────────────────────── 参考图（任务详情）
+
+  /**
+   * 上一次为哪条任务拉过「参考图」。图在任务创建时就定下了，中途不会变多，
+   * 所以同一条任务只拉一次 —— 否则常驻轮询会每几秒就重打一次接口。
+   * 换任务、或用户点「立即刷新」时才重拉。
+   */
+  let refImagesTaskId = '';
+
+  function hideReferenceImages() {
+    const box = $('refImages');
+    if (!box) return;
+    box.classList.add('hidden');
+    $('refGrid').replaceChildren();
+    $('refNote').textContent = '';
+  }
+
+  function fileSizeText(bytes) {
+    const n = Number(bytes || 0);
+    if (!n) return '大小未知';
+    return n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
+  }
+
+  /**
+   * 渲染「这条任务带了哪些参考图」。
+   *
+   * 三种状态要分清，别混成一句「暂无」：
+   *   · 有图      → 缩略图网格（点开看原图）
+   *   · 已清理    → 明确写「暂存文件已清理」，并说明保留规则（失败留 24 小时，成功/取消即时清）
+   *   · 本来没带图 → 整块隐藏，不占地方
+   */
+  async function renderReferenceImages(job) {
+    if (!job || !job.id || !state.token) { hideReferenceImages(); return; }
+    const id = String(job.id);
+    if (refImagesTaskId === id) return;
+    refImagesTaskId = id;
+    hideReferenceImages();
+    let data;
+    try {
+      data = await requestJson(`/v1/videos/${id}/reference-images`);
+    } catch {
+      // 附加信息读不到不该打扰用户：保持隐藏，下次刷新再试。
+      refImagesTaskId = '';
+      return;
+    }
+    // 期间用户切到了别的任务 → 丢弃这次结果，别把 A 的图贴到 B 上。
+    if (String(state.currentId) !== id) return;
+    const items = Array.isArray(data?.items) ? data.items : [];
+    const recorded = Number(data?.recorded_count || 0);
+    if (!items.length && !data?.cleared) { hideReferenceImages(); return; }
+
+    $('refImages').classList.remove('hidden');
+    $('refGrid').replaceChildren();
+    for (const item of items) {
+      const a = document.createElement('a');
+      a.className = 'ref-thumb';
+      a.href = item.url;              // 点开看**原图**（带票据的直链，10 分钟内有效）
+      a.target = '_blank';
+      a.rel = 'noopener';
+      a.title = `${item.name}（${fileSizeText(item.size)}）`;
+      const img = document.createElement('img');
+      // 缩略图（服务端按 ?w= 现生成并缓存）：原图 4MB 一张，5 张直接铺 = 打开面板拉 20MB。
+      // 老版本服务端没有 thumb_url，回退到原图地址，功能不至于整个空掉。
+      img.src = item.thumb_url || item.url;
+      img.alt = item.name;
+      img.loading = 'lazy';
+      a.append(img);
+      $('refGrid').append(a);
+    }
+    if (items.length) {
+      $('refNote').textContent = `${items.length} 张 · 点缩略图看原图（图片地址 10 分钟内有效）`;
+    } else {
+      const p = document.createElement('p');
+      p.className = 'ref-missing';
+      p.textContent = `提交时带了 ${recorded || '若干'} 张参考图，但暂存文件已清理。`
+        + '参考图是暂存的：失败任务保留 24 小时，已完成/已取消的任务会即时清掉。';
+      $('refGrid').append(p);
+      $('refNote').textContent = '已清理';
+    }
+  }
+
   function renderJob(job) {
     if (!job) { renderEmptyJob(); return; }
     // 「无水印预览」的可见性靠这一份详情（列表项不带 unwatermarked_url，见 state.currentJob）。
@@ -1052,6 +1133,7 @@
     $('taskStage').textContent = job.stage || '';
     renderProgress(job);
     renderMeta(job);
+    void renderReferenceImages(job);
     if (job.status === 'ready' && !state.loaded[state.currentId]) {
       state.loaded[state.currentId] = true;
       loadContent(job).catch(() => { /* 播放/下载失败不阻塞状态展示，错误已进 error box */ });
@@ -1073,6 +1155,8 @@
     $('taskStage').textContent = '';
     renderProgress(null);
     renderMeta(null);
+    refImagesTaskId = '';
+    hideReferenceImages();
     $('rawJson').textContent = '连接后可读取你自己的任务数据。';
     $('player').hidden = true;
     $('player').removeAttribute('src');
@@ -2812,6 +2896,8 @@
   $('tabJobs').addEventListener('click', () => renderTab('jobs'));
   $('refreshCurrent').addEventListener('click', () => {
     const epoch = state.epoch;
+    // 手动刷新时把参考图缓存也失效掉 —— 否则「图已经被清理了」这种变化要等下次切换任务才看得到。
+    refImagesTaskId = '';
     withBusy($('refreshCurrent'), '刷新中…', () => loadJob(state.currentId)).catch((error) => {
       if (epoch === state.epoch) { setError(error.message, error); showConnection('读取任务失败', 'bad'); }
     });

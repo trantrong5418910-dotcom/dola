@@ -399,6 +399,15 @@
     .stat-strip{gap:8px;margin-top:13px}.stat{border-radius:9px;padding:9px 10px;background:#fafbfd;border-color:var(--line)}.stat b{font-size:16px}.stat span{font-size:10px}
     .task-top{margin-top:15px!important;gap:10px}.task-status{font-size:13px}.task-stage{font-size:11px}.task-actions{gap:6px}
     .prog{height:5px;margin-top:12px}.prog-note{font-size:10px}.meta-grid{margin-top:14px;padding-top:12px;font-size:11px;grid-template-columns:72px 1fr}
+    /* 参考图面板：只用 --line/--soft/--ink/--muted 这几个在两个主题里都定义了的变量，
+       避免「浅色正常、深色消失」那类变量取不到值后静默失效的坑。 */
+    .ref-images{margin-top:12px;padding-top:11px;border-top:1px solid var(--line)}
+    .ref-head{display:flex;align-items:baseline;gap:8px;font-size:11px;font-weight:600;color:var(--ink)}
+    .ref-head .hint{font-weight:400}
+    .ref-grid{display:flex;flex-wrap:wrap;gap:8px;margin-top:9px}
+    .ref-thumb{width:76px;height:76px;padding:0;border:1px solid var(--line);border-radius:8px;background:var(--soft);overflow:hidden;display:block;cursor:zoom-in}
+    .ref-thumb img{width:100%;height:100%;object-fit:contain;display:block}
+    .ref-missing{margin-top:9px;font-size:11px;color:var(--muted)}
     .upstream-note{font-size:10px}.raw{margin-top:11px;padding-top:10px}.raw summary{font-size:11px}
     .list-head{padding:0 0 12px}.list-head h2{font-size:15px}.jobs-tools{margin-bottom:10px}.jobs th,.jobs td{padding:9px 10px;font-size:11px}
     .jobs{min-width:620px}.row-btn{font-size:10px;padding:3px 4px}
@@ -573,6 +582,19 @@
             <video id="player" class="player" controls playsinline hidden></video>
             <div id="taskError" class="error-box"></div>
             <dl id="taskMeta" class="meta-grid"><dt>提示词</dt><dd>—</dd><dt>模型与时长</dt><dd>—</dd><dt>画幅</dt><dd>—</dd><dt>成片</dt><dd>—</dd><dt>流水</dt><dd>—</dd></dl>
+            <!--
+              参考图（2026-09-29 新增）：这条任务提交时带了哪些图。
+              图是**暂存**的 —— 失败任务留 24 小时，成功/取消即时清掉，
+              所以「有记录但图没了」是正常结果，要明确说「已清理」而不是当作「没带图」。
+              缩略图走带票据的直链（<img> 带不上 Authorization），票据 10 分钟有效。
+            -->
+            <div id="refImages" class="ref-images hidden">
+              <div class="ref-head">
+                <span>参考图</span>
+                <span id="refNote" class="hint"></span>
+              </div>
+              <div id="refGrid" class="ref-grid"></div>
+            </div>
             <p class="upstream-note">这里只展示任务的状态、阶段、失败原因与成片归档情况。本服务的任务行不保存上游的逐条对话事件，因此不会出现一条看起来像上游对话的日志。</p>
             <details class="raw"><summary>任务原始 JSON</summary><pre id="rawJson">连接后可读取你自己的任务数据。</pre></details>
           </div>

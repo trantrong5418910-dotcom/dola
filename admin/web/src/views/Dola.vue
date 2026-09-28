@@ -541,6 +541,24 @@
             <el-table-column label="时长" width="76">
               <template #default="{ row }">{{ row.seconds ?? '—' }} 秒</template>
             </el-table-column>
+            <!--
+              参考图（2026-09-29 新增）：只在「记录里带过图」时才给入口。
+              图是**暂存**的 —— 失败任务留 24 小时，已完成/已取消即时清掉，
+              所以这里只能表示「提交时带过」，图还在不在要在弹窗里说清楚，
+              不能让这一列假装图一定还在。
+            -->
+            <el-table-column label="参考图" width="92">
+              <template #default="{ row }">
+                <span v-if="isPlaceholder(row)" class="muted">—</span>
+                <el-button
+                  v-else-if="row.hasReferenceImages"
+                  size="small" text type="primary"
+                  :title="`查看这条任务提交时带的参考图（记录 ${row.referenceImageCount || 0} 张）`"
+                  @click="openRefImages(row)"
+                >{{ row.referenceImageCount ? `${row.referenceImageCount} 张` : '查看' }}</el-button>
+                <span v-else class="muted">—</span>
+              </template>
+            </el-table-column>
             <el-table-column label="状态" width="100">
               <template #default="{ row }">
                 <el-tag size="small" :type="generationStatusType(row.status)">{{ generationStatusLabel(row.status) }}</el-tag>
@@ -967,6 +985,34 @@
       </template>
     </el-dialog>
 
+    <!-- ============ 任务参考图 ============ -->
+    <el-dialog v-model="refDlg" :title="`任务 #${refTaskId ?? '—'} 的参考图`" width="620px">
+      <div v-if="refLoading" class="muted">加载中…</div>
+      <template v-else>
+        <el-alert
+          v-if="refCleared"
+          type="warning" :closable="false" show-icon class="tip"
+          :title="`提交时带了 ${refRecorded || '若干'} 张参考图，但暂存文件已清理`"
+        >
+          <div class="notice-body">参考图是暂存的：失败任务保留 24 小时，已完成 / 已取消的任务会即时清掉。</div>
+        </el-alert>
+        <div v-if="refItems.length" class="ref-grid">
+          <a
+            v-for="item in refItems" :key="item.name"
+            class="ref-thumb" :href="item.url" target="_blank" rel="noopener"
+            :title="`${item.name}（${fileSizeText(item.size)}）`"
+          >
+            <!-- 缩略图走服务端 ?w= 现生成并缓存（原图 4MB 一张，5 张直铺 = 一次弹窗拉 20MB）；
+                 老服务端没有 thumb_url 时回退原图，功能不至于整个空掉。 -->
+            <img :src="item.thumb_url || item.url" :alt="item.name" loading="lazy" />
+          </a>
+        </div>
+        <p v-else-if="!refCleared" class="muted">这条任务提交时没有带参考图。</p>
+        <p v-if="refItems.length" class="muted mt">点缩略图在新标签页看原图（图片地址 10 分钟内有效，刷新弹窗可换一张新票据）。</p>
+      </template>
+      <template #footer><el-button @click="refDlg = false">关闭</el-button></template>
+    </el-dialog>
+
     <!-- ============ 额度转积分 ============ -->
     <el-dialog v-model="convertDlg" title="计价换算（按账号数 / 按额度）" width="620px">
       <el-alert type="warning" :closable="false" show-icon class="tip"
@@ -1139,6 +1185,49 @@ const jobDlg = ref(false);
 const activeJob = ref(null);
 const generationTasks = ref([]);
 const generationLoading = ref(false);
+
+/* ---- 任务参考图（2026-09-29）----
+ * 图是暂存的：失败任务留 24 小时，已完成/已取消即时清。所以这里区分
+ * 「没带图」和「带过但已被清理」两件事，别都显示成一句「暂无」。 */
+const refDlg = ref(false);
+const refLoading = ref(false);
+const refTaskId = ref(null);
+const refItems = ref([]);
+const refCleared = ref(false);
+const refRecorded = ref(0);
+
+function fileSizeText(bytes) {
+  const n = Number(bytes || 0);
+  if (!n) return '大小未知';
+  return n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
+}
+
+/**
+ * 打开某条任务的参考图。
+ *
+ * 走**管理端自己的端点**（`/api/dola/generation-tasks/:id/reference-images`，管理员 JWT），
+ * 而不是 `/v1/videos/:id/reference-images` —— 后者要的是**用户令牌**，后台手里没有、
+ * 也不该有用户的令牌。返回的 url 已经带上绑定了 taskId + 文件名的票据，
+ * 于是 `<img>` 直接就能取图（`<img>` 带不上 Authorization，只能靠票据）。
+ */
+async function openRefImages(row) {
+  refTaskId.value = row.id;
+  refItems.value = [];
+  refCleared.value = false;
+  refRecorded.value = Number(row.referenceImageCount || 0);
+  refDlg.value = true;
+  refLoading.value = true;
+  try {
+    const res = await api.get(`/api/dola/generation-tasks/${row.id}/reference-images`);
+    refItems.value = Array.isArray(res.items) ? res.items : [];
+    refCleared.value = Boolean(res.cleared);
+    refRecorded.value = Number(res.recorded_count || refRecorded.value);
+  } catch {
+    /* api 层已经弹过错误提示了；这里只把弹窗留在「没有图」的状态，不重复报错 */
+  } finally {
+    refLoading.value = false;
+  }
+}
 
 // ---- 成片库删除功能（2026-09-27）----
 // 与后端 generator.js 的 UNDELETABLE_TASK_STATES 保持一致：
@@ -2430,6 +2519,15 @@ onUnmounted(() => {
 }
 /* 乐观更新：提交后在途任务的提示（2026-09-27） */
 .pending-hint { font-size: 12px; color: var(--el-color-primary); }
+/* 任务参考图缩略图（2026-09-29）：object-fit 用 contain，别裁掉图的两边 ——
+   这里的作用是「确认提交的是哪几张」，裁切反而让人认不出。 */
+.ref-grid { display: flex; flex-wrap: wrap; gap: 8px; }
+.ref-thumb {
+  display: block; width: 92px; height: 92px; padding: 0; overflow: hidden;
+  border: 1px solid var(--el-border-color-light); border-radius: 8px;
+  background: var(--el-fill-color-blank);
+}
+.ref-thumb img { width: 100%; height: 100%; object-fit: contain; display: block; }
 .maintenance-bar {
   display: flex; align-items: center; gap: 14px; justify-content: space-between;
   margin: -2px 0 14px; padding: 10px 14px;

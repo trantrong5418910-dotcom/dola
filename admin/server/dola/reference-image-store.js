@@ -6,7 +6,11 @@
  */
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
+
+const run = promisify(execFile);
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const REFERENCE_UPLOAD_ROOT = path.resolve(HERE, '..', 'data', 'reference-uploads');
@@ -128,6 +132,78 @@ export async function resolveReferenceImage(taskId, name) {
   if (!full.startsWith(dir + path.sep)) return null;
   const files = await listReferenceImages(taskId);
   return files.includes(full) ? full : null;
+}
+
+/** 缩略图存放的子目录（**在任务目录内部**，且以点开头）。
+ *
+ * 为什么不另开一个顶层目录：这样 `cleanupReferenceImages()` / 保留期回收
+ * `fs.rm(dir, {recursive:true})` 会连缩略图一起带走，不必再维护第二套清理逻辑、
+ * 也就不会出现「原图删了缩略图还在」的孤儿。
+ * 为什么以点开头：`listReferenceImages()` 过滤掉点开头的条目，
+ * 所以 `.thumbs` 不会被当成一张「参考图」列出来。 */
+const REFERENCE_THUMB_SUBDIR = '.thumbs';
+
+/** 缩略图最长边（像素）。详情面板的展示位是 92px，2x 屏要 ~184，取 256 留余量。 */
+export const REFERENCE_THUMB_SIZE = 256;
+
+/**
+ * 取一张参考图的缩略图路径，没有就现生成一个（落盘缓存）。
+ *
+ * 为什么必须做：参考图动辄 4MB 一张（实测 4.47MB / 4.7 秒），而详情面板只要 92px 的
+ * 展示位。直接送原图的话，打开一次面板就要拉 ~20MB —— 面板会空着转半分钟。
+ * 实测同一张图：原图 4.47MB → 缩略图 16.6KB，生成耗时 0.23 秒（生成一次后走缓存）。
+ *
+ * **失败一律返回 null，由调用方回退到原图** —— 详情面板宁可慢，也不能整块空着。
+ * 这也是为什么这里不用跑一个队列/任务：最坏情况只是回到改动前的行为。
+ *
+ * @returns {Promise<string|null>} 可读的缩略图绝对路径，或 null（生成不了就用原图）
+ */
+export async function ensureReferenceThumb(taskId, name, srcPath) {
+  let dir;
+  try {
+    dir = path.join(referenceImageDir(taskId), REFERENCE_THUMB_SUBDIR);
+  } catch {
+    return null;
+  }
+  const raw = String(name ?? '');
+  if (!raw || raw.startsWith('.')) return null;
+  // 缩略图文件名沿用 safeSegment + 固定 .jpg 后缀：name 本身已经过
+  // resolveReferenceImage 的三道关，这里再收一次口，避免拼出目录外的路径。
+  const base = safeSegment(raw.replace(/\.[^.]+$/, ''), 'image');
+  const dest = path.join(dir, `${base}.jpg`);
+  if (!dest.startsWith(dir + path.sep)) return null;
+
+  // 命中缓存：缩略图比源文件新（且非空）就直接用。源文件被换掉时 mtime 会后移，自然失效。
+  try {
+    const [srcStat, dstStat] = await Promise.all([fs.stat(srcPath), fs.stat(dest)]);
+    if (dstStat.size > 0 && dstStat.mtimeMs >= srcStat.mtimeMs) return dest;
+  } catch { /* 缓存不存在 —— 往下走生成 */ }
+
+  try {
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  } catch {
+    return null;
+  }
+  // 先写临时文件再 rename：并发请求同一张图时，谁都不会读到写了一半的文件。
+  const tmp = `${dest}.${process.pid}.${Date.now()}.tmp`;
+  // `-thumbnail 256x256>` 的 `>` 是「只缩不放」，避免小图被拉大成糊图加大体积；
+  // `jpg:` 前缀强制按 JPEG 输出 —— 否则 ImageMagick 会按 .tmp 后缀猜格式而报错。
+  // `-strip` 去掉 EXIF/ICC，体积更小，也顺带不给他人留拍摄信息。
+  const args = ['-auto-orient', '-thumbnail', `${REFERENCE_THUMB_SIZE}x${REFERENCE_THUMB_SIZE}>`,
+    '-strip', '-quality', '82', `jpg:${tmp}`];
+  // IM7 的正名是 magick，IM6 只有 convert；两种环境都可能遇到，挨个试。
+  for (const bin of ['magick', 'convert']) {
+    try {
+      await run(bin, [srcPath, ...args], { timeout: 20000, maxBuffer: 4 * 1024 * 1024 });
+      await fs.rename(tmp, dest);
+      return dest;
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;   // 这个二进制不存在 → 试下一个
+      break;                                     // 别的错（超时/图片损坏）→ 直接放弃
+    }
+  }
+  await fs.rm(tmp, { force: true }).catch(() => {});
+  return null;
 }
 
 /**

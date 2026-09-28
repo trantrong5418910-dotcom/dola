@@ -10,7 +10,7 @@
 import crypto from 'node:crypto';
 import express from 'express';
 import { db, getSetting, setSetting } from '../db.js';
-import { requireAuth, requirePerm } from '../auth.js';
+import { requireAuth, requirePerm, signJwt } from '../auth.js';
 import { audit } from '../audit.js';
 import { createJob, getJob, listJobs, cancelJob, registerJobHandler } from '../jobs.js';
 import {
@@ -35,6 +35,7 @@ import {
   deleteVideoTask, isTaskDeletable,
 } from '../dola/generator.js';
 import { listPendingSubmissions, listBlockedAccounts, countPendingSubmissions } from '../dola/submission-journal.js';
+import { listReferenceImageEntries, REFERENCE_THUMB_SIZE } from '../dola/reference-image-store.js';
 import { settleFailedVideoRefund } from '../dola/generation-billing.js';
 import { generationAnalytics, classifyFailure } from '../dola/generation-analytics.js';
 import { listGenerationGuards, clearGenerationGuard } from '../dola/generation-guards.js';
@@ -703,6 +704,7 @@ router.get('/generation-tasks', requirePerm('dola:list'), (req, res) => {
   const args = status ? [status, limit] : [limit];
   const rows = db.prepare(`SELECT id, account_label, prompt, ratio, seconds, force_seconds,
       status, stage, error, duration_sec, bytes, is_unwatermarked,
+      has_reference_images, reference_image_count,
       CASE WHEN local_path IS NOT NULL AND local_path <> '' THEN 1 ELSE 0 END AS archived,
       created_at, updated_at, finished_at
     FROM dola_videos ${where} ORDER BY id DESC LIMIT ?`).all(...args);
@@ -716,6 +718,61 @@ router.get('/generation-tasks', requirePerm('dola:list'), (req, res) => {
       promptTruncated: String(row.prompt || '').length > 240,
       archived: Boolean(row.archived),
       isUnwatermarked: Boolean(row.is_unwatermarked),
+      // 有记录 ≠ 图还在：图是**暂存**的（失败任务留 24 小时，成功/取消即时清）。
+      // 所以这两个字段只用来决定「要不要给个入口」，真实可用性由详情接口回报。
+      referenceImageCount: Number(row.reference_image_count || 0),
+      hasReferenceImages: Boolean(row.has_reference_images),
+    })),
+  });
+});
+
+/** 参考图票据有效期（小时）。10 分钟够渲染一次详情，和 /v1 那边保持一致。 */
+const ADMIN_REFERENCE_TICKET_HOURS = 10 / 60;
+
+/**
+ * GET /api/dola/generation-tasks/:id/reference-images —— 管理端读取某条任务的参考图。
+ *
+ * 为什么要在管理端**再开一个**：`/v1/videos/:id/reference-images` 走的是 `requireApiToken`
+ * （用户令牌），而后台 SPA 带的是管理员 JWT —— 两个 secret 不同、互不认。后台要用就得
+ * 有管理员鉴权的同名能力，否则「生成任务」页签里根本看不到图。
+ *
+ * 返回的 `url` 用的是 `/v1` 那个取图端点 + 票据：票据即鉴权（绑定 taskId + 文件名），
+ * 所以 `<img src>` 直接能用，不必给图片请求也带上 JWT。取图端点的路径穿越防护、
+ * 归属校验都在那边，这里只负责列出条目并签票。
+ */
+router.get('/generation-tasks/:id/reference-images', requirePerm('dola:list'), async (req, res) => {
+  const id = Number.parseInt(req.params.id, 10);
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    return res.status(400).json({ ok: false, message: '任务号不合法', code: 'INVALID_TASK_ID' });
+  }
+  // ⚠️ 单独 SELECT 这两列：getVideoTask() 走 PUBLIC_FIELDS 投影，不含它们（踩过：
+  //    直接用投影出来的 row.has_reference_images 恒为 undefined，于是 cleared 永远 false，
+  //    前端把「图已被清理」误判成「本来就没带图」）。
+  const row = db.prepare(`SELECT id, has_reference_images, reference_image_count, status
+    FROM dola_videos WHERE id = ?`).get(id);
+  if (!row) return res.status(404).json({ ok: false, message: '任务不存在', code: 'TASK_NOT_FOUND' });
+  let entries = [];
+  try {
+    entries = await listReferenceImageEntries(row.id);
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: `读取参考图失败：${e.message}`, code: 'REFERENCE_IMAGE_READ_FAILED' });
+  }
+  const ticket = (name) => `/v1/videos/${row.id}/reference-images/${encodeURIComponent(name)}`
+    + `?ticket=${signJwt({ rt: row.id, rn: name }, ADMIN_REFERENCE_TICKET_HOURS)}`;
+  res.json({
+    ok: true,
+    task_id: row.id,
+    task_status: row.status,
+    count: entries.length,
+    cleared: entries.length === 0 && Boolean(row.has_reference_images),
+    recorded_count: Number(row.reference_image_count || 0),
+    expires_in_minutes: Math.round(ADMIN_REFERENCE_TICKET_HOURS * 60),
+    items: entries.map((entry) => ({
+      name: entry.name,
+      size: entry.size,
+      url: ticket(entry.name),
+      // 缩略图（`?w=`）：列表里只铺 92px 的展示位，用原图会把一次弹窗变成 ~20MB 的下载。
+      thumb_url: `${ticket(entry.name)}&w=${REFERENCE_THUMB_SIZE}`,
     })),
   });
 });

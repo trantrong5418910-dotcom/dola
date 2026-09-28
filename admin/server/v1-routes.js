@@ -46,7 +46,7 @@ import {
   referenceImagePoolStats, localFileOf,
 } from './dola/generator.js';
 import { IMAGE_MAX_COUNT, REQUEST_MAX_BYTES } from './dola/reference-images.js';
-import { listReferenceImageEntries, resolveReferenceImage } from './dola/reference-image-store.js';
+import { listReferenceImageEntries, resolveReferenceImage, ensureReferenceThumb, REFERENCE_THUMB_SIZE } from './dola/reference-image-store.js';
 // 只取"是否开启"这个布尔：包装文案属于运营话术，不下发给调用方（见 prompt-wrap.js）。
 // 这里用 `promptWrapView` 拿三层视图（`enabled` / `scope_enabled` / `effective_enabled`），
 // 供 /v1/status 表达"开关开着、但实际没生效"。包装文案本身仍然不下发。
@@ -722,13 +722,19 @@ router.get('/videos/:id/reference-images', requireApiToken, async (req, res) => 
     cleared: entries.length === 0 && Boolean(record.has_reference_images),
     recorded_count: Number(record.reference_image_count || 0),
     expires_in_minutes: expiresMinutes,
-    items: entries.map((entry) => ({
-      name: entry.name,
-      size: entry.size,
-      // 票据即鉴权（10 分钟），这样 <img src> 这种带不上 Authorization 的地方也能直接用。
-      url: absoluteUrl(req, `/v1/videos/${row.id}/reference-images/${encodeURIComponent(entry.name)}`
-        + `?ticket=${signJwt({ rt: row.id, rn: entry.name }, REFERENCE_TICKET_HOURS)}`),
-    })),
+    items: entries.map((entry) => {
+      const ticket = signJwt({ rt: row.id, rn: entry.name }, REFERENCE_TICKET_HOURS);
+      const base = absoluteUrl(req, `/v1/videos/${row.id}/reference-images/${encodeURIComponent(entry.name)}`);
+      return {
+        name: entry.name,
+        size: entry.size,
+        // 票据即鉴权（10 分钟），这样 <img src> 这种带不上 Authorization 的地方也能直接用。
+        url: `${base}?ticket=${ticket}`,
+        // 缩略图给详情/回填面板当 <img src> 用（原图 4MB 一张，直接铺=打开面板拉 20MB）；
+        // `url` 则是点开看原图的地址。取不到缩略图时前端应回退到 url。
+        thumb_url: `${base}?ticket=${ticket}&w=${REFERENCE_THUMB_SIZE}`,
+      };
+    }),
   });
 });
 
@@ -763,20 +769,36 @@ router.get('/videos/:id/reference-images/:name', (req, res, next) => {
   // resolveReferenceImage 已经把路径穿越挡掉了（只认目录里真实枚举出来的条目）。
   const file = await resolveReferenceImage(taskId, name);
   if (!file) return fail(res, 404, '参考图不存在或已清理', 'REFERENCE_IMAGE_MISSING');
+  /**
+   * `?w=` 走缩略图。
+   *
+   * 为什么需要：详情面板的展示位只有 92px，而参考图原图动辄 4MB 一张
+   * （实测 4.47MB / 单张下载 4.7 秒）。直接送原图，打开一次面板要拉 ~20MB、
+   * 面板空转半分钟。缩略图实测 16.6KB，生成一次后走缓存。
+   *
+   * **生成不出来就回退原图**（ensureReferenceThumb 返回 null）——
+   * 详情面板宁可慢，也不能整块空着，更不能因为缩略图挂了就 404。
+   */
+  let servePath = file;
+  let thumbContentType = '';
+  if (String(req.query.w || '')) {
+    const thumb = await ensureReferenceThumb(taskId, name, file);
+    if (thumb) { servePath = thumb; thumbContentType = 'image/jpeg'; }
+  }
   let stat;
   try {
-    stat = await fs.promises.stat(file);
+    stat = await fs.promises.stat(servePath);
   } catch {
     return fail(res, 404, '参考图不存在或已清理', 'REFERENCE_IMAGE_MISSING');
   }
-  const ext = path.extname(file).toLowerCase();
-  res.setHeader('Content-Type', ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
-    : ext === '.png' ? 'image/png' : 'application/octet-stream');
+  const ext = path.extname(servePath).toLowerCase();
+  res.setHeader('Content-Type', thumbContentType || (ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
+    : ext === '.png' ? 'image/png' : 'application/octet-stream'));
   res.setHeader('Content-Length', String(stat.size));
   res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(name)}"`);
   // 票据只活 10 分钟；缓存压到 5 分钟，刷新页面拿新票据，旧地址过期前也不必反复回源。
   res.setHeader('Cache-Control', 'private, max-age=300');
-  const stream = fs.createReadStream(file);
+  const stream = fs.createReadStream(servePath);
   stream.on('error', () => {
     if (!res.headersSent) fail(res, 502, '参考图读取失败，请重试', 'REFERENCE_IMAGE_READ_FAILED');
     else { try { res.end(); } catch { /* 已经没得救了 */ } }

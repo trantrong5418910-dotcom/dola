@@ -100,9 +100,26 @@
           <template #default="{ row }">{{ row.accountId ?? '—' }}</template>
         </el-table-column>
       </el-table>
-      <div v-if="loginPreview && activeBatch" class="login-preview">
-        <p class="help">当前登录页快照（输入框已遮挡，不保存图片，点击查看可更新）</p>
-        <img :src="loginPreview" alt="当前代理登录窗口，所有输入框已遮挡" style="max-width:100%;border-radius:8px" />
+      <div v-if="surfaceOpen && activeBatch" class="login-surface">
+        <p class="help">
+          服务器上的真实登录窗口（画面按需自动刷新）。在画面上点一下输入框，再用下面这行输入文字并发送 —— 和坐在本机操作一样。
+          密码框已被遮挡，不会渲染成图片；输入内容只在本页内存里转交，不保存、不记录、不回显。
+        </p>
+        <div class="surface-frame">
+          <img :src="surfaceImage" alt="服务器上的登录窗口画面" @click="surfaceClick" @wheel.prevent="surfaceWheel">
+        </div>
+        <div class="surface-tools">
+          <el-input v-model="surfaceText" size="small" class="surface-text"
+            placeholder="要输入到窗口的文字（邮箱 / 密码 / 验证码）" @keyup.enter="surfaceSendText" />
+          <el-button size="small" :disabled="!surfaceText || !!surfaceBusy" @click="surfaceSendText">发送到窗口</el-button>
+          <el-button size="small" :disabled="!!surfaceBusy" @click="surfaceKey('Enter')">回车</el-button>
+          <el-button size="small" :disabled="!!surfaceBusy" @click="surfaceKey('Tab')">Tab</el-button>
+          <el-button size="small" :disabled="!!surfaceBusy" @click="surfaceKey('Backspace')">退格</el-button>
+        </div>
+        <p class="help surface-status">
+          <el-switch v-model="surfaceAuto" size="small" active-text="自动刷新画面" />
+          <span v-if="surfaceError" class="surface-error">{{ surfaceError }}</span>
+        </p>
       </div>
     </section>
 
@@ -111,7 +128,7 @@
       <div class="footer">
         <el-button @click="visible = false">关闭</el-button>
         <template v-if="activeBatch">
-          <el-button :loading="busy === 'preview'" :disabled="!!busy || !restored || !canSkip" @click="loadPreview">查看登录窗口</el-button>
+          <el-button :loading="busy === 'surface'" :disabled="!!busy || !restored" @click="loadSurface">查看/操作登录窗口</el-button>
           <el-button type="danger" plain :loading="busy === 'cancel'" :disabled="!!busy || !restored" @click="runAction('cancel')">取消整批</el-button>
           <el-button :loading="busy === 'skip'" :disabled="!!busy || !restored || !canSkip" @click="runAction('skip')">跳过当前</el-button>
           <el-button v-if="batch.status === 'paused'" type="primary" :loading="busy === 'resume'" :disabled="!!busy || !restored" @click="runAction('resume')">确认继续剩余账号</el-button>
@@ -143,8 +160,17 @@ const batch = ref(null);
 const busy = ref('');
 const restored = ref(false);
 const error = ref('');
-const loginPreview = ref('');
+// 可交互的服务器窗口画面。`surfaceViewport` 是页面 viewport 的 CSS 尺寸，
+// 用来把「画面上点到的位置」换算成页面坐标 —— 换算错了就会点偏。
+const surfaceOpen = ref(false);
+const surfaceAuto = ref(true);
+const surfaceImage = ref('');
+const surfaceViewport = ref({ width: 0, height: 0 });
+const surfaceText = ref('');
+const surfaceBusy = ref(false);
+const surfaceError = ref('');
 let pollTimer = null;
+let surfaceTimer = null;
 let disposed = false;
 const notifiedBatches = new Set();
 const terminalItems = new Set(['succeeded', 'failed', 'cancelled']);
@@ -197,7 +223,7 @@ function readBatch(response, allowEmpty = false) {
 function acceptBatch(next) {
   if (disposed) return;
   if (!next || next.id !== batch.value?.id || next.currentIndex !== batch.value?.currentIndex
-      || ['done', 'cancelled', 'paused'].includes(next.status)) loginPreview.value = '';
+      || ['done', 'cancelled', 'paused'].includes(next.status)) stopSurface();
   // 只保留约定的进度字段，不缓存接口可能附带的原始账号输入。
   batch.value = next === null ? null : {
     id: next.id, status: next.status, currentIndex: next.currentIndex, createdAt: next.createdAt,
@@ -303,18 +329,111 @@ function runAction(action) {
   }, '操作结果未确认，请刷新当前批次查看最新进度后再操作。');
 }
 
-function loadPreview() {
+// ---- 服务器窗口的交互式画面 --------------------------------------------------
+// 背景：后台部署在服务器上，「窗口在后台所在电脑弹出」这句话就失效了 ——
+// 窗口只渲染在服务器的虚拟屏上，运营屏幕上什么都没有。
+// 所以这里把画面拉进后台页面，并把点击 / 按键 / 文本转回去。
+function surfaceUrl(suffix = '') {
+  return `${endpoint}/${encodeURIComponent(batch.value?.id || '')}${suffix}`;
+}
+
+async function refreshSurface() {
+  if (disposed || !visible.value || !surfaceOpen.value || !activeBatch.value) return;
+  try {
+    const result = await api.get(surfaceUrl('/surface'), { silent: true });
+    if (disposed || !surfaceOpen.value || !activeBatch.value) return;
+    if (result?.ok && result.image) {
+      surfaceImage.value = result.image;
+      if (result.viewport?.width) surfaceViewport.value = result.viewport;
+      surfaceError.value = '';
+    }
+  } catch { /* 页面正在跳转时取不到画面，是正常的，静默重试即可。 */ }
+}
+
+function syncSurfaceTimer() {
+  const wanted = surfaceAuto.value && surfaceOpen.value && visible.value && !disposed;
+  if (wanted && !surfaceTimer) surfaceTimer = setInterval(() => { void refreshSurface(); }, 900);
+  if (!wanted && surfaceTimer) { clearInterval(surfaceTimer); surfaceTimer = null; }
+}
+
+function loadSurface() {
   if (!activeBatch.value || busy.value) return;
-  return withRequest('preview', async () => {
-    const result = await api.get(`${endpoint}/${encodeURIComponent(batch.value.id)}/preview`, { silent: true });
-    if (!disposed && visible.value && result?.ok) loginPreview.value = result.image;
+  return withRequest('surface', async () => {
+    surfaceOpen.value = true;
+    await refreshSurface();
+    if (!surfaceImage.value) throw new Error('surface unavailable');
+    surfaceAuto.value = true;
+    syncSurfaceTimer();
   }, '暂时无法查看登录窗口，请稍后重试。');
 }
+
+function stopSurface() {
+  surfaceOpen.value = false;
+  surfaceImage.value = '';
+  surfaceText.value = '';
+  surfaceError.value = '';
+  surfaceBusy.value = false;
+  if (surfaceTimer) { clearInterval(surfaceTimer); surfaceTimer = null; }
+}
+
+// 画面上点到哪儿 → 页面里的坐标。必须按当前显示尺寸做等比换算。
+function surfacePointAt(event) {
+  const rect = event.currentTarget.getBoundingClientRect();
+  const view = surfaceViewport.value;
+  if (!rect.width || !rect.height || !view.width || !view.height) return null;
+  return {
+    x: Math.round((event.clientX - rect.left) / rect.width * view.width),
+    y: Math.round((event.clientY - rect.top) / rect.height * view.height),
+  };
+}
+
+async function sendEvent(payload) {
+  if (disposed || !activeBatch.value || surfaceBusy.value) return false;
+  surfaceBusy.value = true;
+  surfaceError.value = '';
+  try {
+    const result = await api.post(surfaceUrl('/interact'), { event: payload }, { silent: true });
+    if (result?.ok !== true) throw new Error('interact rejected');
+    return true;
+  } catch {
+    if (!disposed) surfaceError.value = '这一步没送到窗口，请重试。';
+    return false;
+  } finally {
+    surfaceBusy.value = false;
+  }
+}
+
+async function surfaceClick(event) {
+  const point = surfacePointAt(event);
+  if (!point) return;
+  if (await sendEvent({ type: 'click', ...point, button: 'left' })) void refreshSurface();
+}
+
+function surfaceWheel(event) {
+  const point = surfacePointAt(event);
+  if (!point) return;
+  void sendEvent({ type: 'scroll', ...point, deltaY: event.deltaY });
+}
+
+function surfaceKey(key) {
+  void sendEvent({ type: 'key', key }).then(ok => { if (ok) void refreshSurface(); });
+}
+
+function surfaceSendText() {
+  const text = surfaceText.value;
+  if (!text) return;
+  void sendEvent({ type: 'text', text }).then((ok) => {
+    // 送出去后立刻从内存里清掉，不在页面上留痕。
+    if (ok) { surfaceText.value = ''; void refreshSurface(); }
+  });
+}
+
+watch([surfaceAuto, surfaceOpen, visible], syncSurfaceTimer);
 
 watch(visible, (open) => {
   if (!open) {
     clearPreview();
-    loginPreview.value = '';
+    stopSurface();
     error.value = '';
     restored.value = false;
     stopPolling();
@@ -324,7 +443,7 @@ watch(visible, (open) => {
 onBeforeUnmount(() => {
   disposed = true;
   clearPreview();
-  loginPreview.value = '';
+  stopSurface();
   batch.value = null;
   stopPolling();
 });
@@ -343,6 +462,13 @@ onBeforeUnmount(() => {
 .format-preview { margin: 12px 0; }
 .status-toolbar, .batch-head { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 .status-toolbar { justify-content: space-between; margin: 16px 0; }
+.login-surface { margin-top: 12px; }
+.surface-frame { margin: 8px 0; border-radius: 8px; overflow: hidden; background: var(--el-fill-color-light); }
+.surface-frame img { display: block; width: 100%; height: auto; cursor: crosshair; user-select: none; }
+.surface-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.surface-tools .surface-text { max-width: 320px; }
+.surface-status { display: flex; align-items: center; gap: 10px; }
+.surface-error { color: var(--el-color-danger); }
 .batch-head { overflow-wrap: anywhere; }
 .batch, .error, .waiting, .items { margin-top: 14px; }
 .footer { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }

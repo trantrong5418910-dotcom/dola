@@ -13,6 +13,8 @@ import * as form from '../server/dola/google-login-form.js';
 import * as core from '../server/dola/google-login-core.js';
 import { verifySavedDolaSession } from '../server/dola/google-login-restore.js';
 import { openDolaGoogleLogin } from '../server/dola/dola-login-entry.js';
+// 直连哨兵必须从真实模块取，不能在这份夹具里写字面量，否则测试会和实现漂移。
+import { DIRECT_LOGIN_PROXY, requireLoginProxy, storedLoginProxy } from '../server/dola/google-login-proxy.js';
 
 const EMAIL = 'synthetic@example.test', PASSWORD = 'synthetic-password';
 const PROXY = 'http://proxy.example.invalid:8080';
@@ -24,16 +26,16 @@ const plain = value => JSON.parse(JSON.stringify(value));
 const deny = () => { throw new Error('Unexpected real dependency'); };
 const source = readFileSync(new URL('../server/dola/google-login-browser.js', import.meta.url), 'utf8');
 const allowedImports = new Set(['./provider.js', './proxy.js', './google-login-proxy.js', 'node:net', './google-login-cache.js',
-  './login-session-vault.js', './google-login-restore.js', './google-login-core.js', './google-login-form.js', './dola-login-entry.js', './manual-login-browser.js']);
+  './login-session-vault.js', './google-login-restore.js', './google-login-core.js', './google-login-form.js', './dola-login-entry.js', './manual-login-browser.js', './cdp-login-browser.js']);
 const code = source.replace(/^import\s+[\s\S]*?from\s+['"]([^'"]+)['"];\n/gm, (_, name) => {
   assert.ok(allowedImports.delete(name), 'unexpected or duplicate driver import: ' + name); return '';
 }).replace(/\bexport (async function|function|const) /g, '$1 ');
 assert.equal(allowedImports.size, 0);
 const box = { ...form, ...core, verifySavedDolaSession, openDolaGoogleLogin, isIP, URL, URLSearchParams, AbortController,
-  getPlaywright: deny, checkSession: deny, fetchProfile: deny, missingRequired: deny, proxyOf: deny, requireLoginProxy: deny,
+  getPlaywright: deny, checkSession: deny, fetchProfile: deny, missingRequired: deny, proxyOf: deny, requireLoginProxy: deny, DIRECT_LOGIN_PROXY,
   createGoogleLoginCache: () => ({ load: deny, save: deny, clear: deny }),
   createLoginSessionVault: () => ({ hasRecord: deny, load: deny, save: deny, clear: deny }),
-  openManualLoginBrowser: deny,
+  openManualLoginBrowser: deny, openCdpLoginBrowser: deny,
 };
 vm.runInNewContext(code + '\nthis.factory = createGoogleBrowserDriver; this.typeSlowly = typeGoogleCredentialSlowly;', box);
 
@@ -77,6 +79,26 @@ class Page {
   on(event, fn) { this.handlers[event] = fn; }
   mainFrame() { return this.frame; }
   isClosed() { return this.closed; }
+  // 交互窗口用：viewportSize 可能为 null（CDP 模式没有显式 viewport），
+  // 这时驱动要退回页面内测量 —— 两条路都必须能被断言到。
+  viewportSize() { return this.h.viewportFromEvaluate ? null : (this.h.viewportSize || { width: 1120, height: 820 }); }
+  async evaluate() { this.h.evaluated = (this.h.evaluated || 0) + 1; return this.h.viewportSize || { width: 1120, height: 820 }; }
+  get mouse() {
+    const record = entry => this.h.interactions.push(entry);
+    return {
+      move: async (x, y) => record({ type: 'move', x, y }),
+      down: async ({ button }) => record({ type: 'down', button }),
+      up: async ({ button }) => record({ type: 'up', button }),
+      wheel: async (dx, dy) => record({ type: 'wheel', dx, dy }),
+    };
+  }
+  get keyboard() {
+    const record = entry => this.h.interactions.push(entry);
+    return {
+      press: async key => record({ type: 'press', key }),
+      insertText: async text => record({ type: 'insertText', text }),
+    };
+  }
   navigate(url) { this.currentUrl = url; this.handlers.framenavigated?.(this.frame); }
   async goto(url, options) {
     this.h.navigations.push({ url, options });
@@ -87,16 +109,19 @@ class Page {
     } else {
       this.navigate(url);
       this.nodes = [{ role: 'button', name: 'Log in', kind: 'login' }, { role: 'button', name: 'Continue with Google', kind: 'oauth', action: () => {
-        const popup = this.h.newPage(); popup.step(this.h.firstStep || 'email'); this.h.google = popup;
+        const popup = this.h.newPage(); popup.step(this.h.firstStep || 'email', this.h.firstStepExtra || {}); this.h.google = popup;
       } }];
     }
   }
   step(kind, extra = {}) {
     const paths = { email: '/v3/signin/identifier', loading: '/v3/signin/identifier', password: '/v3/signin/challenge/pwd', recovery: '/v3/signin/challenge/kpe',
-      email_otp: '/v3/signin/challenge/ipe', authenticator_otp: '/v3/signin/challenge/totp', sms: '/v3/signin/challenge/ipp', captcha: '/v3/signin/identifier', unknown: '/v3/signin/challenge/unknown' };
+      email_otp: '/v3/signin/challenge/ipe', authenticator_otp: '/v3/signin/challenge/totp', sms: '/v3/signin/challenge/ipp', captcha: '/v3/signin/identifier', unknown: '/v3/signin/challenge/unknown',
+      // 2026-09-29 生产实测到的 OAuth 授权同意页路径。
+      consent: '/signin/oauth/id' };
     this.navigate(extra.url || G + paths[kind]);
     this.text = extra.text ?? (kind === 'password' ? EMAIL : kind === 'email_otp' ? 'Enter the code sent to your recovery email'
-      : kind === 'authenticator_otp' ? `Google Authenticator. Enter the code. ${EMAIL}` : kind === 'sms' ? 'SMS code on your phone' : '');
+      : kind === 'authenticator_otp' ? `Google Authenticator. Enter the code. ${EMAIL}` : kind === 'sms' ? 'SMS code on your phone'
+        : kind === 'consent' ? `Sign in to dola.com. Google will allow dola.com to access this info about you. Name and picture, ${EMAIL}, Email address` : '');
     const fields = {
       email: { id: extra.arabic ? '' : 'identifierId', name: extra.arabic ? 'البريد الإلكتروني أو الهاتف' : 'Email or phone', role: 'textbox', kind: 'email' },
       password: { type: 'password', kind: 'password' },
@@ -107,7 +132,8 @@ class Page {
       captcha: { attrName: 'captcha', kind: 'captcha' },
     };
     this.nodes = fields[kind] ? [{ tag: 'input', ...fields[kind] }] : [];
-    this.nodes.push({ role: 'button', name: extra.unknownButton ? 'مجهول' : 'التالي', kind: 'next',
+    this.nodes.push({ role: 'button', name: extra.buttonName || (extra.unknownButton ? 'مجهول' : kind === 'consent' ? 'Continue' : 'التالي'),
+      kind: kind === 'consent' ? 'consent' : 'next',
       id: extra.noId ? '' : kind === 'email' ? 'identifierNext' : kind === 'password' ? 'passwordNext' : kind === 'authenticator_otp' ? 'totpNext' : '' });
     if (extra.captcha) this.nodes.push({ tag: 'input', attrName: 'captcha', kind: 'captcha' });
     return this;
@@ -137,7 +163,7 @@ class Page {
 
 function harness(t, config = {}) {
   const h = { navigations: [], clicks: [], typed: [], requests: [], saves: [], cacheCalls: [], checks: [], screenshots: [], pages: [],
-    cookies: [], origins: [], connected: true, session: { valid: true, pullStatus: 200, launchStatus: 200, pullCode: 0, launchCode: 0 },
+    cookies: [], origins: [], connected: true, interactions: [], evaluated: 0, session: { valid: true, pullStatus: 200, launchStatus: 200, pullCode: 0, launchCode: 0 },
     profile: { ok: true, status: 200, code: 0, entityId: 'synthetic-dola-id' }, userinfo: identity(), codeCalls: [], now: 100000, ...config };
   const events = {};
   h.newPage = () => { const p = new Page(h); h.pages.push(p); events.page?.(p); return p; };
@@ -166,10 +192,16 @@ function harness(t, config = {}) {
     save: async (email, proxy, data, options) => { if (h.saveOverride) return h.saveOverride(email, proxy, data, options); h.saves.push({ email, proxy, data, options }); }, clear: deny };
   h.driver = box.factory({
     getPlaywright: async () => ({ chromium: { launch: async options => { h.launchOptions = options; return h.launchOverride ? h.launchOverride() : h.browser; }, connectOverCDP: deny } }),
-    openManualLoginBrowser: async options => { h.manualOptions = options; return { browser: h.browser, context: h.context, close: async () => { h.manualClosed = true; h.connected = false; } }; },
+    openManualLoginBrowser: async options => { h.manualOptions = options; if (h.manualOverride) return h.manualOverride(); return { browser: h.browser, context: h.context, close: async () => { h.manualClosed = true; h.connected = false; } }; },
     requireLoginProxy: raw => { if (typeof raw !== 'string' || !/^(?:https?|socks5h?):\/\//.test(raw)) throw new Error('login_proxy_required'); return raw; },
-    proxyOf: () => h.noProxy ? undefined : ({ server: PROXY }),
+    proxyOf: () => h.noProxy ? undefined
+      : (h.credentialed ? { server: PROXY, username: 'synthetic-user', password: 'synthetic-pass' } : ({ server: PROXY })),
     startSocksBridge: async url => { h.bridgeInput = url; return h.bridgeOverride ? h.bridgeOverride() : { url: 'http://127.0.0.1:12345', close: async () => { h.bridgeClosed = true; } }; },
+    startHttpBridge: async url => { h.httpBridgeInput = url; return h.httpBridgeOverride ? h.httpBridgeOverride() : { url: 'http://127.0.0.1:23456', close: async () => { h.httpBridgeClosed = true; } }; },
+    openCdpLoginBrowser: async options => { h.cdpOptions = options; return { browser: h.browser, context: h.context, close: async () => { h.cdpClosed = true; h.connected = false; } }; },
+    // 默认仍是旧的 chromium.launch()：既有用例的语义一律不变，
+    // CDP 路径由专门的新用例显式打开（h.launchMode = 'cdp'）。
+    launchMode: h.launchMode || 'launch',
     vault: h.vault,
     legacy: { load: async (email, proxy) => { h.cacheCalls.push(['legacyLoad', email, proxy]); return h.legacy || null; }, save: deny, clear: deny },
     checkSession: async (cookies, options) => { h.checks.push({ kind: 'session', cookies, options }); return h.checkOverride ? h.checkOverride() : h.session; },
@@ -278,6 +310,45 @@ for (const cookiesOnly of [false, true]) test('Google page/cookies allow Dola OA
   assert.equal(h.requests.length, 1); assert.equal(h.saves.length, 0);
 });
 
+
+// 2026-09-29 生产实测：mailsapi 的「已登录链接」成功后落在 myaccount.google.com（Google 账号中心），
+// 并不是 accounts.google.com。旧代码只认 GOOGLE_ORIGIN 精确相等 → 明明已经登录成功也判 google_step，
+// 整批卡在「恢复已保存会话」，且快照接口同样拒绝，窗口对运营完全不可见。
+test('Google link landing on myaccount.google.com counts as signed in and unlocks the window preview', async t => {
+  const h = harness(t, { linkLanding: 'https://myaccount.google.com/data-and-privacy' }); await h.open('google_link');
+  assert.deepEqual(h.navigations.map(n => n.url), [LINK, D + '/chat/']);
+  assert.equal(h.clicks.filter(c => c.kind === 'oauth').length, 1);
+  assert.equal(h.saves.length, 0); assert.equal(h.typed.length, 0);
+  // 正向路径不在这里清密码：google_link 仍可能在随后的 OAuth 里遇到密码步骤，
+  // 密码要到会话核验通过（saveVerified）或交人工时才清除。这里只断言「从未被输入过」。
+  assert.equal(h.input.googleSessionUrl, '');
+  assert.equal((await h.handle.preview()).toString(), 'synthetic-image');
+  assert.deepEqual(h.screenshots.at(-1)?.mask?.length, 1);
+});
+
+// 关键回归：链接页 domcontentloaded 时既没跳转也没 cookie，必须**等**它落地再判定。
+// 旧代码只判一次 → 必然判成 google_step（2026-09-29 生产上卡了三轮）。
+test('Google link is polled until it settles instead of being judged at domcontentloaded', async t => {
+  const h = harness(t, { linkLanding: LINK, linkCookie: false });
+  let waits = 0;
+  h.afterWait = page => { if (++waits === 3) page.navigate('https://myaccount.google.com/data-and-privacy'); };
+  await h.open('google_link');
+  assert.equal(waits, 3, '应在第 3 次轮询前都判为未落地');
+  assert.deepEqual(h.navigations.map(n => n.url), [LINK, D + '/chat/']);
+  assert.equal(h.clicks.filter(c => c.kind === 'oauth').length, 1);
+  assert.equal(h.saves.length, 0); assert.equal(h.typed.length, 0);
+});
+
+// 放宽的只是「落在哪个 Google 页」，其它子域一律不许蹭过去。
+for (const hostile of ['https://google.com.example.test/', 'https://evilgoogle.com/', 'https://google.com.evil.test/login']) {
+  test('Google link landing on look-alike ' + hostile + ' still hands off', async t => {
+    const h = harness(t, { linkLanding: hostile, linkCookie: true }); await h.open('google_link');
+    assert.equal((await h.handle.inspect()).kind, 'waiting_user');
+    assert.equal(h.navigations.length, 1);
+    assert.equal(h.input.password, ''); assert.equal(h.input.googleSessionUrl, '');
+    await assert.rejects(h.handle.preview(), { message: 'preview_unavailable' });
+  });
+}
 for (const semantic of ['data', 'button', 'option', 'overlap']) test('Google link chooser selects one exact mailbox once via ' + semantic, async t => {
   const h = harness(t); await h.open('google_link');
   h.google.step('unknown', { url: G + '/v3/signin/accountchooser', text: 'Choose an account' });
@@ -377,6 +448,10 @@ for (const bad of ['identity', 'binding', 'account']) test('Google completion re
 
 test('Google ready requires OIDC plus token exchange/session binding and saves scoped cookies+origins', async t => {
   const h = harness(t); await h.open('google_link'); await h.oauth({ bind: false });
+  // 2026-09-29 起：回调刚落地要先走完**有界宽限**（给 Dola 自己的弹窗留渲染时间），
+  // 宽限用完仍然没有绑定标记才判 binding 失败。见 BINDING_GRACE_MS。
+  assert.equal((await h.handle.inspect()).kind, 'pending'); assert.equal(h.saves.length, 0);
+  h.now += 20001;
   assert.equal((await h.handle.inspect()).reason, 'binding'); assert.equal(h.saves.length, 0);
   await h.oauth(); h.origins = [{ origin: G, localStorage: [{ name: 'synthetic', value: 'google' }] }, { origin: 'https://gapi.mailsapi.com', localStorage: [] }];
   const result = await h.handle.inspect(); assert.equal(result.kind, 'ready'); assert.deepEqual(plain(result.identity), identity());
@@ -407,6 +482,95 @@ test('preview masks input controls and does not close a verified window', async 
   const h = harness(t); await h.open(); await h.handle.preview();
   assert.equal(h.screenshots.length, 1); assert.equal(h.screenshots[0].mask.length, 1);
   assert.equal(h.screenshots[0].mask[0].nodes[0].tag, 'input'); assert.equal(h.connected, true);
+});
+
+// ── 可交互窗口（2026-09-29：服务器上的窗口运营看不见，画面与输入都搬进后台页面）──
+
+test('surface returns the viewport size and masks only password fields', async t => {
+  const h = harness(t); await h.open();
+  h.google.step('password');                 // 到密码页才有密码框可遮挡
+  const surface = await h.handle.surface();
+  assert.equal(surface.image.toString(), 'synthetic-image');
+  assert.deepEqual(plain(surface.viewport), { width: 1120, height: 820 });
+  assert.equal(h.screenshots.length, 1);
+  // 快照遮挡**全部**输入框；交互画面只遮挡密码框，否则运营看不见邮箱框、点不进去。
+  assert.equal(h.screenshots[0].mask.length, 1);
+  assert.equal(h.screenshots[0].mask[0].nodes.length, 1);
+  assert.equal(h.screenshots[0].mask[0].nodes[0].type, 'password');
+  assert.equal(h.connected, true);
+});
+
+test('surface falls back to in-page measurement when the viewport is unset', async t => {
+  const h = harness(t, { viewportFromEvaluate: true, viewportSize: { width: 1280, height: 900 } });
+  await h.open();
+  assert.deepEqual(plain((await h.handle.surface()).viewport), { width: 1280, height: 900 });
+  assert.equal(h.evaluated, 1);
+});
+
+test('surface and interact refuse every page outside the Google/Dola allowlist', async t => {
+  const h = harness(t); await h.open('manual');
+  h.pages[0].navigate('https://evil.test/signin');
+  await assert.rejects(h.handle.surface(), { message: 'preview_unavailable' });
+  await assert.rejects(h.handle.interact({ type: 'click', x: 1, y: 2 }), { message: 'interactive_page_unavailable' });
+  assert.equal(h.interactions.length, 0, '没有白名单内的页面时绝不能转发任何输入');
+});
+
+test('interact forwards clicks, scrolls, allowlisted keys and text into the live page', async t => {
+  const h = harness(t); await h.open('manual');
+  await h.handle.interact({ type: 'click', x: 120.4, y: 88.6 });
+  await h.handle.interact({ type: 'scroll', x: 10, y: 20, deltaY: 300 });
+  await h.handle.interact({ type: 'key', key: 'Enter' });
+  await h.handle.interact({ type: 'text', text: 'synthetic-input' });
+  assert.deepEqual(plain(h.interactions), [
+    { type: 'move', x: 120, y: 89 }, { type: 'down', button: 'left' }, { type: 'up', button: 'left' },
+    { type: 'move', x: 10, y: 20 }, { type: 'wheel', dx: 0, dy: 300 },
+    { type: 'press', key: 'Enter' },
+    { type: 'insertText', text: 'synthetic-input' },
+  ]);
+});
+
+test('interact rejects off-allowlist keys, oversized text, bad coordinates and unknown event types', async t => {
+  const h = harness(t); await h.open('manual');
+  for (const event of [
+    { type: 'key', key: 'F12' },
+    { type: 'key', key: 'KeyA' },
+    { type: 'text', text: '' },
+    { type: 'text', text: 'x'.repeat(513) },
+    { type: 'click', x: 'NaN', y: 1 },
+    { type: 'scroll', x: 1, y: Number.POSITIVE_INFINITY, deltaY: 0 },
+    { type: 'click', x: 1, y: 100000 },
+    { type: 'evaluate', script: 'fetch("/")' },
+  ]) await assert.rejects(h.handle.interact(event), { message: 'interactive_event_invalid' });
+  assert.equal(h.interactions.length, 0);
+});
+
+test('interact refuses to drive the page after the session is closed', async t => {
+  const h = harness(t); await h.open('manual'); await h.handle.close();
+  await assert.rejects(h.handle.interact({ type: 'key', key: 'Enter' }), { message: 'cancelled' });
+  assert.equal(h.interactions.length, 0);
+});
+
+test('manual launch with a credentialed proxy goes through the bridge, never the command line', async t => {
+  const h = harness(t, { credentialed: true }); await h.open('manual');
+  assert.equal(h.httpBridgeInput, PROXY);
+  assert.deepEqual(plain(h.manualOptions.proxy), { server: 'http://127.0.0.1:23456' });
+});
+
+test('manual launch with a credential-free proxy is left alone (no needless bridge)', async t => {
+  const h = harness(t); await h.open('manual');
+  assert.equal(h.httpBridgeInput, undefined);
+  assert.deepEqual(plain(h.manualOptions.proxy), { server: PROXY });
+});
+
+// 「手动窗口打不开」曾经的症状是界面只剩一句通用错误（原因码在驱动与 core 两层被吞掉）。
+test('a diagnosable manual launch failure is reported instead of the generic browser error', async t => {
+  const h = harness(t, { manualOverride: async () => { throw new Error('manual_browser_proxy_unsupported'); } });
+  await assert.rejects(h.open('manual'), { message: 'manual_browser_proxy_unsupported' });
+});
+
+test('manual launch failures carrying upstream text still collapse to the generic browser error', async t => {
+  const h = harness(t, { manualOverride: async () => { throw new Error('synthetic failure at https://internal.example/x'); } });
+  await assert.rejects(h.open('manual'), { message: 'google_browser_unavailable' });
 });
 
 test('driver entry rejects sensitive URL before cache/browser work with secret-safe errors', async t => {
@@ -637,3 +801,199 @@ test('driver phases come from fixed keys and browser closure is not a bad-passwo
   assert.equal((await h.handle.inspect()).reason, 'browser_closed');
   assert.doesNotMatch(JSON.stringify(h.stages), /synthetic|https|@/);
 });
+
+// ── 2026-09-29 生产实测：全新谷歌号的「授权同意页」──────────────────────────
+// mailsapi 的「谷歌已登录链接」会把浏览器落到一个全新的、从未授权过 dola.com 的谷歌号上，
+// 于是 dola 的 OAuth 一定会停在一个「Sign in to dola.com / Continue」同意页。
+// 旧代码把它当成非表单的 manual step，一律 handoff('google_step')；而服务器上没有任何人
+// 可以点那个按钮 —— 整批必然耗满 5 分钟超时失败，且一次额度就此被消耗。
+// 下面这些用例把「允许自动点」和「绝不允许自动点」的边界锁死。
+test('dola OAuth consent page is continued exactly once, then the batch finishes', async t => {
+  const h = harness(t, { firstStep: 'consent' }); await h.open('google_link');
+  assert.equal((await h.handle.inspect()).kind, 'pending');
+  assert.equal(h.clicks.filter(c => c.kind === 'consent').length, 1);
+  assert.equal(h.clicks.filter(c => c.kind === 'next').length, 0, '绝不能借用共享的 Next/Confirm 按钮');
+  assert.equal(h.typed.length, 0); assert.equal(h.saves.length, 0);
+  await h.oauth();
+  const result = await h.handle.inspect();
+  assert.equal(result.kind, 'ready'); assert.equal(h.saves.length, 1);
+});
+
+test('a consent page that does not advance is clicked at most once and then hands off', async t => {
+  const h = harness(t, { firstStep: 'consent' }); await h.open('google_link');
+  assert.equal((await h.handle.inspect()).kind, 'pending');
+  assert.equal(h.clicks.filter(c => c.kind === 'consent').length, 1);
+  await h.handle.inspect(); h.now += 10001;
+  assert.equal((await h.handle.inspect()).reason, 'google_step');
+  assert.equal(h.clicks.filter(c => c.kind === 'consent').length, 1, '点一次不推进就必须交人工，绝不反复点');
+});
+
+for (const [label, extra] of [
+  ['when the expected mailbox is not on the page', { text: 'Sign in to dola.com. Google will allow dola.com to access this info about you.' }],
+  ['for a look-alike client that is not dola.com', { text: `Sign in to other.example. Google will allow other.example to access this info about you. ${EMAIL}` }],
+  ['when the only button is a security-styled Confirm', { buttonName: 'Confirm' }],
+]) test('dola OAuth consent page is never auto-clicked ' + label, async t => {
+  const h = harness(t, { firstStep: 'consent', firstStepExtra: extra }); await h.open('google_link');
+  assert.notEqual((await h.handle.inspect()).kind, 'ready');
+  h.now += 15000;
+  assert.equal((await h.handle.inspect()).kind, 'waiting_user');
+  assert.equal(h.clicks.filter(c => c.kind === 'consent').length, 0);
+  assert.equal(h.typed.length, 0); assert.equal(h.saves.length, 0);
+  assert.equal(h.input.password, '');
+});
+
+test('dola OAuth consent wording off accounts.google.com is never auto-clicked', async t => {
+  // 注意：这里必须**先 open() 再挪弹窗**。openDolaGoogleLogin 在等弹窗落到 Google 时
+  // 用的是 `for (;;)` + 墙钟 deadline 的轮询，而本夹具的 now() 是冻结的假时钟 ——
+  // 若让弹窗一开始就落在非 accounts.google.com 的地址上，那个循环会因为永远不超时而死循环。
+  // 顺带这也说明这条断言的意义：登录成功后落地的 myaccount.google.com（账号中心）
+  // 上并没有任何「同意」语义，绝不能被当成同意页点掉。
+  const h = harness(t); await h.open('google_link');
+  h.google.step('consent', { url: 'https://myaccount.google.com/data-and-privacy' });
+  assert.notEqual((await h.handle.inspect()).kind, 'ready');
+  h.now += 15000;
+  assert.equal((await h.handle.inspect()).kind, 'waiting_user');
+  assert.equal(h.clicks.filter(c => c.kind === 'consent').length, 0);
+  assert.equal(h.typed.length, 0); assert.equal(h.saves.length, 0);
+  assert.equal(h.input.password, '');
+});
+
+test('consent auto-continue stays scoped to the Google-link channel', async t => {
+  const h = harness(t, { firstStep: 'consent' }); await h.open('password');
+  assert.notEqual((await h.handle.inspect()).kind, 'ready');
+  h.now += 15000;
+  assert.equal((await h.handle.inspect()).kind, 'waiting_user');
+  assert.equal(h.clicks.filter(c => c.kind === 'consent').length, 0);
+});
+
+// ── 2026-09-29 生产实测：Dola 自己的「确认你的年龄」弹窗 ─────────────────────
+// OAuth 回调落在 dola.com/auth/callback#state=… 之后，页面上弹着
+// 「确认你的年龄 / 请确认你已满18周岁，未确认可能会影响你继续体验」（按钮「否」「确认」）。
+// 不点掉它 SPA 就不会发起登录交换，会话绑定标记永远采不到 → 必然 handoff('binding')。
+// 截图证据：EVIDENCE-2026-09-29-dola年龄确认弹窗卡住绑定.png
+const agePage = (h, extra = {}) => {
+  const page = h.pages[0];
+  page.navigate(extra.url || D + '/auth/callback#state=synthetic-only');
+  page.text = extra.text ?? '确认你的年龄 请确认你已满18周岁，未确认可能会影响你继续体验。';
+  page.nodes = extra.nodes ?? [{ role: 'button', name: '否', kind: 'age-deny' }, { role: 'button', name: '确认', kind: 'age-confirm' }];
+  return page;
+};
+const ageClicks = h => h.clicks.filter(c => String(c.kind).startsWith('age-'));
+
+test('Dola age modal is confirmed exactly once so the OAuth exchange can finish', async t => {
+  const h = harness(t); await h.open('google_link');
+  agePage(h);
+  assert.equal((await h.handle.inspect()).kind, 'pending');
+  assert.equal(h.clicks.filter(c => c.kind === 'age-confirm').length, 1);
+  assert.equal(h.clicks.filter(c => c.kind === 'age-deny').length, 0, '绝不能点「否」');
+  assert.ok(h.stages.includes('dola_age_confirm'), '阶段要能让运营看见');
+  assert.equal(h.typed.length, 0); assert.equal(h.saves.length, 0);
+  await h.oauth();
+  const result = await h.handle.inspect();
+  assert.equal(result.kind, 'ready'); assert.equal(h.saves.length, 1);
+});
+
+test('Dola age modal is not clicked twice when it does not advance', async t => {
+  const h = harness(t); await h.open('google_link');
+  agePage(h);
+  assert.equal((await h.handle.inspect()).kind, 'pending');
+  assert.equal(ageClicks(h).length, 1);
+  await h.handle.inspect(); h.now += 10001;
+  assert.equal((await h.handle.inspect()).reason, 'google_step');
+  assert.equal(ageClicks(h).length, 1, '点一次不推进就必须交人工，绝不反复点');
+});
+
+for (const [label, extra] of [
+  ['when the age prompt is absent', { text: '欢迎来到 Dola' }],
+  ['when the only button is a deny/cancel', { nodes: [{ role: 'button', name: '否', kind: 'age-deny' }] }],
+  ['when two confirm-ish buttons are ambiguous', { nodes: [{ role: 'button', name: '确认', kind: 'age-confirm' }, { role: 'button', name: 'Confirm', kind: 'age-confirm-2' }] }],
+  ['when the same wording sits off dola.com', { url: 'https://evil.example.test/auth/callback' }],
+]) test('Dola age modal is never auto-clicked ' + label, async t => {
+  const h = harness(t); await h.open('google_link');
+  agePage(h, extra);
+  assert.notEqual((await h.handle.inspect()).kind, 'ready');
+  assert.equal(ageClicks(h).length, 0);
+  assert.equal(h.saves.length, 0);
+});
+
+// ── 2026-09-29 飞哥确认：IPWeb 代理优先，腾讯直连 IP 备用 ───────────────────
+test('an explicit direct sentinel launches without any proxy, and cannot be mistaken for one', async t => {
+  // 哨兵必须"明显不是代理 URL"，漏进校验就会立刻报错，而不是被当成能用的代理。
+  assert.equal(DIRECT_LOGIN_PROXY, 'direct:');
+  assert.throws(() => requireLoginProxy(DIRECT_LOGIN_PROXY), { message: 'login_proxy_required' });
+  // 落库统一成空串（dola_accounts.proxy 的约定是「空 = 不用代理」），哨兵本身绝不入库。
+  assert.equal(storedLoginProxy(DIRECT_LOGIN_PROXY), '');
+  assert.equal(storedLoginProxy(PROXY), PROXY);
+  assert.throws(() => storedLoginProxy(''), { message: 'login_proxy_required' });
+
+  const h = harness(t); await h.open('google_link', { proxy: DIRECT_LOGIN_PROXY });
+  assert.equal(h.launchOptions.proxy, undefined, '直连时不能带任何代理');
+  assert.equal(h.bridgeInput, undefined, '直连时不起 socks 桥');
+  assert.ok(h.stages.includes('proxy_check'), '直连仍然要核验出口连通性');
+  assert.ok(h.stages.includes('dola_home'));
+});
+
+// 2026-09-29 生产复现的竞态：OAuth 回调落地 ≈1~3 秒后 Dola 才渲染自己的「确认你的年龄」弹窗。
+// run8 就是在这里翻车的 —— t=25s 弹窗还没渲染出来，驱动直接 handoff('binding')，
+// 之后 manualOnly 置位、管理器也不再轮询，弹窗永远点不到。
+test('during the binding grace, Dola\'s own age modal is still handled before handing off', async t => {
+  const h = harness(t); await h.open('google_link');
+  await h.oauth({ bind: false });                       // 交换还没发生 → 没有任何绑定标记
+  assert.equal((await h.handle.inspect()).kind, 'pending', '宽限期内绝不能直接交人工');
+  agePage(h);                                            // 弹窗"这才渲染出来"
+  assert.equal((await h.handle.inspect()).kind, 'pending');
+  assert.equal(ageClicks(h).length, 1, '宽限期必须留给自动处理分支');
+  h.now += 20001;
+  assert.equal((await h.handle.inspect()).reason, 'binding', '宽限用完仍失败才交人工');
+  assert.equal(h.saves.length, 0);
+});
+
+// ── 2026-09-29（T2）：spawn + CDP 启动方式 ──────────────────────────────────
+// 背景：`chromium.launch()` 会注入 `--enable-automation`，页面里 `navigator.webdriver`
+// 因此是 `true`；Google 据此在「输入账号密码」这一步直接拒绝（run11 的 browser_blocked，
+// 25 秒即中止）。CDP 路径（`spawn` + `connectOverCDP`）不注入该标记，是打通密码通道的必要条件。
+// 对照实验与取证见 `EVIDENCE-2026-09-29-browser_blocked根因-浏览器指纹而非IP.md`。
+//
+// 注意：驱动的默认 `launchMode` 仍是 'launch'（上面所有用例的语义一律不变），
+// CDP 只在下面这些用例里显式打开。
+
+test('cdp launch mode opens through openCdpLoginBrowser and never calls chromium.launch', async t => {
+  const h = harness(t, { launchMode: 'cdp' }); await h.open('password');
+  assert.ok(h.cdpOptions, 'cdp 模式必须走 openCdpLoginBrowser');
+  assert.equal(h.launchOptions, undefined, 'cdp 模式绝不能同时调 chromium.launch');
+  assert.ok(h.cdpOptions.playwright?.chromium, '要把 playwright 实例交给 cdp runtime');
+  assert.equal(h.cdpOptions.storageState, null, '没有已保存会话时传 null');
+  assert.equal(h.requests.filter(r => r.url === 'https://ipinfo.io/json').length, 1, '出口 IP 校验照旧');
+});
+
+test('cdp launch mode hands a credentialed HTTP proxy to the bridge, never to the command line', async t => {
+  const h = harness(t, { launchMode: 'cdp', credentialed: true });
+  const handle = await h.open('password');
+  assert.ok(h.cdpOptions, 'cdp 模式必须走 openCdpLoginBrowser');
+  assert.equal(h.httpBridgeInput, PROXY, '带用户名密码的 HTTP 代理必须先过 http-bridge');
+  assert.deepEqual(plain(h.cdpOptions.proxy), { server: 'http://127.0.0.1:23456' },
+    '--proxy-server 不支持内联凭据，浏览器只允许看到本地无认证地址');
+  await handle.close();
+  assert.equal(h.httpBridgeClosed, true, '批次结束要关掉桥');
+});
+
+test('cdp launch mode leaves a credential-free proxy alone', async t => {
+  const h = harness(t, { launchMode: 'cdp' }); await h.open('password');
+  assert.ok(h.cdpOptions, 'cdp 模式必须走 openCdpLoginBrowser');
+  assert.equal(h.httpBridgeInput, undefined, '没凭据就不该起桥（省一跳本地转发）');
+  assert.deepEqual(plain(h.cdpOptions.proxy), { server: PROXY }, '无凭据代理直接交给浏览器');
+});
+
+test('cdp launch mode closes through the cdp runtime so the whole process group is reaped', async t => {
+  const h = harness(t, { launchMode: 'cdp' }); const handle = await h.open('password');
+  await handle.close();
+  assert.equal(h.cdpClosed, true, '必须走 cdpRuntime.close()：它负责 kill 整个进程组');
+});
+
+test('manual still wins over cdp launch mode', async t => {
+  const h = harness(t, { launchMode: 'cdp' });
+  await h.open('manual', { proxy: PROXY, sec_user_id: 'synthetic-dola-id' });
+  assert.ok(h.manualOptions, 'manual 优先');
+  assert.equal(h.cdpOptions, undefined, 'manual 模式不该走 cdp runtime');
+});
+

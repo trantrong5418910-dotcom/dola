@@ -5,6 +5,13 @@ export const DOLA_ORIGIN = 'https://www.dola.com';
 export const GOOGLE_ORIGIN = 'https://accounts.google.com';
 export const GOOGLE_EMAIL_LABEL = /^(邮箱或电话号码|電子郵件地址或電話號碼|Email or phone|البريد الإلكتروني أو الهاتف|البريد الإلكتروني أو رقم الهاتف)$/i;
 const NEXT_LABEL = /^(Next|Continue|Verify|Confirm|下一步|继续|繼續|验证|驗證|确认|確認|التالي|متابعة|تحقق|تأكيد)$/i;
+
+// 授权同意页（OAuth consent）专用按钮文案：只认「继续 / 允许」这一种动作。
+// 刻意**不复用** NEXT_LABEL —— 那里含 Verify/Confirm/验证/确认，一旦被用到安全校验页上，
+// 就等于「替用户确认一个安全挑战」，那是绝对不能自动做的事。
+const CONSENT_LABEL = /^(?:Continue|Allow|继续|繼續|允许|允許|متابعة|السماح)(?:\s+as\s+.+)?$/i;
+// Google 的 OAuth 同意端点（2026-09-29 实测 /signin/oauth/id?authuser=0&part=...）。
+const CONSENT_PATH = /^\/signin\/oauth\/(?:consent|id|approval)\/?$/i;
 const AUTHENTICATOR_LABEL = /\bGoogle\s+Authenticator\b|(?:Google|谷歌)\s*(?:身份)?(?:验证|驗證)器|(?:مصادقة|المصادقة)\s+(?:Google|جوجل)/i;
 const OTHER_OTP_CUES = /sms|text\s+messages?|phone|mobile|voice\s+call|back[\s-]?up|pass\s*key|security\s+key|手机|手機|电话|電話|短信|简讯|簡訊|备用|備用|备份|備份|通行密[钥鑰]|通行金鑰|安全密[钥鑰]|هاتف|(?:رسالة|رسائل)\s+نصية|احتياط|(?:مفتاح|مفاتيح)\s+(?:المرور|الأمان)/i;
 const OTP_REJECTION_LABELS = [
@@ -13,6 +20,19 @@ const OTP_REJECTION_LABELS = [
   /(?:الرمز|رمز(?:\s+التحقق)?)\s+(?:الذي\s+أدخلته\s+)?(?:غير\s+صحيح|خاطئ|غير\s+صالح|منتهي\s+الصلاحية)|انتهت\s+صلاحية\s+(?:الرمز|رمز)/,
 ];
 export const originOf = value => { try { return new URL(value).origin; } catch { return ''; } };
+
+/**
+ * 「落在 Google 上」的宽松判定，只用于**判断登录是否已经建立**。
+ *
+ * 为什么需要（2026-09-29 实测）：`gapi.mailsapi.com` 的「谷歌已登录链接」在
+ * 成功登录后会把浏览器落在 **`myaccount.google.com`**（Google 账号中心），
+ * 而不是 `accounts.google.com`。原先只认 `GOOGLE_ORIGIN` 精确相等，
+ * 于是「明明已经登录成功」也被判成需要人工，整批卡在 `google_step`。
+ *
+ * ⚠️ 绝不能拿它替代 `GOOGLE_ORIGIN` 去做**填表单/输密码**前的校验
+ * （`assertGoogleOrigin`）—— 那里必须精确等于 `accounts.google.com`。
+ */
+export const isGoogleWebOrigin = value => /^https:\/\/(?:[a-z0-9-]+\.)*google\.com$/i.test(originOf(value));
 const invalid = () => { throw new Error('invalid_login_url'); };
 
 // Inspect the original spelling: URL() otherwise normalizes ports and slashes.
@@ -116,7 +136,49 @@ export async function readGoogleLoginStep(page, expectedEmail = '') {
     const matches = await visibleMatches(choices);
     if (matches.length === 1) return { kind: 'chooser', text, input: matches[0], otpRejected };
   }
+  // 「授权同意页」（Sign in to dola.com）既不是安全校验、也不是登录表单，但它需要一次点击
+  // 才能走完 OAuth。2026-09-29 生产实测：一个**全新的、从未授权过 dola.com 的**谷歌号必然会
+  // 看到它；而服务器上没有人可以点，于是整批在 handoff('google_step') 上耗满 5 分钟超时而失败。
+  //
+  // 安全边界（缺一不可 —— 宁可漏点交人工，也绝不能点错）：
+  //   1) step 已被判为 manual/google_step：说明页面上没有邮箱/密码/恢复/OTP 输入框，
+  //      也没有 captcha、没有被判成安全挑战（classifyGoogleLoginStep 只在全部落空时才给这个结论）；
+  //   2) origin 精确等于 accounts.google.com，且路径是 OAuth 同意端点（CONSENT_PATH）；
+  //      这一条同时挡掉登录成功后落地的 myaccount.google.com（账号中心没有"同意"语义）；
+  //   3) 正文里出现**期望邮箱**（displaysEmail）—— 防止替另一个账号点同意；
+  //   4) 正文里出现 dola.com —— 授权对象必须就是 dola，不能是别的客户端；
+  //   5) 全页**只有一个** Continue/Allow 按钮；多于一个一律交人工。
+  if (step.kind === 'manual' && step.reason === 'google_step' && expectedEmail
+      && originOf(page.url()) === GOOGLE_ORIGIN && CONSENT_PATH.test(new URL(page.url()).pathname)
+      && /dola\.com/i.test(text) && displaysEmail(text, expectedEmail)) {
+    const matches = await visibleMatches(page.getByRole('button', { name: CONSENT_LABEL }));
+    if (matches.length === 1) return { kind: 'consent', text, input: matches[0], otpRejected };
+  }
   return { ...step, text, input: ({ email, password, recovery, email_otp: pin, authenticator_otp: totp })[step.kind]?.[0], otpRejected };
+}
+
+/**
+ * Dola 自己的「确认你的年龄」弹窗。
+ *
+ * 为什么需要（2026-09-29 生产实测 + 截图取证）：OAuth 回调落到
+ * dola.com/auth/callback#state=… 之后，页面上会弹一个
+ * 「确认你的年龄 / 请确认你已满18周岁，未确认可能会影响你继续体验」的模态框（按钮「否」「确认」）。
+ * 不点掉它，SPA 就不会发起登录交换（/passport/web/auth/login/），
+ * 驱动永远采集不到会话绑定标记 → 必然 handoff('binding')。
+ *
+ * 判定刻意做窄：必须同时满足「origin 精确等于 dola.com」+「正文命中年龄提示」+
+ * 「全页只有一个可见可用的『确认』按钮」。任何一条不满足都不点，退回人工。
+ * 「否 / 取消 / Cancel / No」永远不在可点名单里。
+ */
+export const DOLA_AGE_TEXT = /确认你的年龄|请确认你已满\s*18|已满\s*18\s*周岁|confirm your age|are you (?:at least )?18|over 18 years old|18\s*周岁/i;
+const DOLA_AGE_CONFIRM_LABEL = /^(?:确认|確定|确定|确认年龄|Confirm|Yes)$/i;
+
+export async function readDolaAgeConfirm(page) {
+  if (originOf(page.url()) !== DOLA_ORIGIN) return null;
+  const text = await page.locator('body').innerText({ timeout: 2000 });
+  if (!DOLA_AGE_TEXT.test(text)) return null;
+  const matches = await visibleMatches(page.getByRole('button', { name: DOLA_AGE_CONFIRM_LABEL }));
+  return matches.length === 1 ? matches[0] : null;
 }
 
 export function assertGoogleOrigin(page, signal) {

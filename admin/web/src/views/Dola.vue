@@ -1418,7 +1418,12 @@ async function rebuildGeneration(row) {
   batchGenForm.seconds = sec === 15 || sec === 30 ? sec : 30;
   batchGenForm.mode = batchGenForm.seconds === 15 ? 'expert' : 'standard';
   batchGenForm.ratio = row?.ratio || '16:9';
-  batchGenResult.value = null;
+  // ⚠️ 必须清参考图。这里以前只清 batchGenResult，没清 batchGenFiles ——
+  //    而「重建」是**另一个**打开弹窗的入口，不走 openBatchGen()，
+  //    于是上一轮留在弹窗里的图会被静默带进重建任务。
+  //    e2e 实测：先传 2 张图 → 关弹窗 → 点某条失败任务的「重建」，
+  //    弹窗里 labels 仍是 ["图1","图2"]（本该为空）。
+  resetBatchGenTransient();
   batchGenDlg.value = true;
   await loadTokenOptions();
   refreshPoolRoute(batchGenForm.seconds);
@@ -1916,9 +1921,11 @@ async function openBatchGen() {
   batchGenForm.seconds = 30;
   batchGenForm.ratio = '16:9';
   batchGenForm.points = null;
-  // 参考图不跨次保留：每回打开都是干净的一份，避免上次的图悄悄跟去另一批提示词
-  batchGenFiles.value = [];
-  batchGenResult.value = null;
+  // 参考图不跨次保留：每回打开都是干净的一份，避免上次的图悄悄跟去另一批提示词。
+  // ⚠️ 抽成 resetBatchGenTransient() 是因为「打开批量创建弹窗」有两个入口：
+  //    这里的 openBatchGen() 和下面的 rebuildGeneration()。
+  //    只清一处就会漏（曾经就漏了 rebuildGeneration，见那里的注释）。
+  resetBatchGenTransient();
   batchGenDlg.value = true;
   await loadTokenOptions();
   refreshPoolRoute(batchGenForm.seconds);
@@ -2324,6 +2331,19 @@ const testGenUploadRef = ref();
  */
 const batchGenFiles = ref([]);
 const batchGenUploadRef = ref();
+/**
+ * 清空「批量创建弹窗」里一次性、不该跨次保留的状态。
+ *
+ * **凡是打开这个弹窗的入口都必须先调它。** 目前有两个入口：
+ *   - openBatchGen()      —— 点工具栏「批量创建」
+ *   - rebuildGeneration() —— 点失败任务行的「重建」
+ * 漏掉任何一个，上一轮留在弹窗里的参考图就会被静默带进下一次提交
+ * （图片是跟任务走的，带错了不会报错，只会悄悄用错图）。
+ */
+function resetBatchGenTransient() {
+  batchGenFiles.value = [];
+  batchGenResult.value = null;
+}
 /**
  * 移除弹窗里选中的参考图。
  *

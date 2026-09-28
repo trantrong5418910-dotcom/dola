@@ -97,10 +97,35 @@ export function holdUncertainSubmission(db, id, reason = '提交结果待核对�
   });
 }
 
+/**
+ * 落终态。**必须 UPSERT，不能裸 UPDATE。**
+ *
+ * 裸 UPDATE 在 journal 没有行时**静默失效**（影响 0 行、不报错），于是
+ * 「上游已明确拒绝」这个终态事实根本没落库。重启后
+ * `recoverStaleVideoTasks()` 读不到 `rejected`，就会把这条任务当成
+ * 「结果不明」而 `holdUncertainSubmission` —— 三连击：
+ * 任务永不终态、用户积分永不退、账号永久不再被选中。
+ *
+ * 什么时候会「没有行」：换号重试路径会 `DELETE FROM dola_submission_journal`
+ * （generator.js，为了让下一轮能重新记录派发）。若进程恰好在
+ * 「已 DELETE、下一轮 dispatch 尚未落库」的窗口里被杀，就正好命中。
+ *
+ * 生产实例：任务 #231（2026-09-29 02:50），上游 4 次拒绝 code=710022002 后
+ * 卡成 `uncertain`，1 积分未退、账号 #445 被锁，只能人工 resolve。
+ *
+ * `ON CONFLICT` 分支**只改 state / updated_at，绝不碰 evidence**：
+ * 已有 `sse_ack` 这类强证据必须原样保留（它是自动恢复的唯一凭据）。
+ * INSERT 分支写 `evidence='legacy'`，与 `holdUncertainSubmission` 同语义 ——
+ * 明确标注「这条终态是补写的，没有 dispatching 前置记录」，
+ * 让运维一眼看出这不是一条可信的完整链路。
+ */
 export function closeSubmission(db, id, state) {
   if (!['rejected', 'completed'].includes(state)) throw new TypeError('Invalid terminal submission state');
-  db.prepare('UPDATE dola_submission_journal SET state=?,updated_at=? WHERE task_id=?')
-    .run(state, new Date().toISOString(), id);
+  const at = new Date().toISOString();
+  db.prepare(`INSERT INTO dola_submission_journal (task_id, account_id, state, evidence, updated_at)
+    VALUES (?, (SELECT account_id FROM dola_videos WHERE id=?), ?, 'legacy', ?)
+    ON CONFLICT(task_id) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at`)
+    .run(id, id, state, at);
 }
 
 /** Commit the explicit rejection and its task/billing changes together. */

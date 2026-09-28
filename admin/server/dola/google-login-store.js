@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { matchesGoogleIdentity, normalizeEmail } from './google-login-core.js';
 import { missingRequired } from './provider.js';
-import { requireLoginProxy } from './google-login-proxy.js';
+import { storedLoginProxy } from './google-login-proxy.js';
 import { isIP } from 'node:net';
 
 const busy = (db, id) => db.prepare("SELECT id FROM dola_videos WHERE account_id=? AND status IN ('queued','submitting','generating','resolving') LIMIT 1").get(id);
@@ -29,7 +29,9 @@ export function createGoogleAccountStore(db, { registry = null } = {}) {
           || row.proxy !== snapshot.proxy || row.updated_at !== snapshot.updated_at || row.status === 'disabled' || busy(db, row.id)))) {
         throw new Error('account_changed_during_login');
       }
-      const proxy = requireLoginProxy(loginProxy);
+      // 直连登录时 loginProxy 是 DIRECT_LOGIN_PROXY 哨兵，落库统一成空串
+      // （出口 IP 由 exit_ip 记录）。其余情况仍然 fail-closed。
+      const proxy = storedLoginProxy(loginProxy);
       if (row?.proxy && row.proxy !== proxy) throw new Error('login_proxy_changed');
       const verifiedIp = isIP(exitIp || '') ? exitIp : row?.exit_ip || null;
       const id = String(profile.entityId || profile.id);

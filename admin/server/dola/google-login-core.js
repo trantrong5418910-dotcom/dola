@@ -50,6 +50,7 @@ const stageLabels = {
   email_otp: '邮件验证码验证',
   authenticator_otp: '验证器动态码验证',
   google_identity: '核验 Google 身份',
+  dola_age_confirm: '确认 Dola 年龄提示',
   dola_binding: '确认 Dola 登录绑定',
   dola_session: '核验 Dola 会话',
   session_save: '保存登录会话',
@@ -61,6 +62,19 @@ const failureMessages = {
   browser_closed: '登录窗口已关闭，登录未完成；未写入号池',
   credentials_rejected: 'Google 拒绝了账号或密码，请核对登录凭据；未写入号池',
   identity_mismatch: '返回的 Google 账号与输入邮箱不一致，已停止登录；未写入号池',
+};
+// 浏览器**启动失败**的具体原因（2026-09-29 加）。在此之前这里是一个裸 `catch`，
+// 把 driver 抛出的原因码整个丢掉，运营端只剩一句「登录窗口启动失败」——
+// 「手动登录窗口打不开」时一点线索都没有。下面只映射**固定原因码**，
+// 不含任何上游文本 / URL / 凭据；不在表里的一律退回原来的通用文案。
+const launchFailureMessages = {
+  browser_missing: '运行环境缺少浏览器内核',
+  manual_browser_unavailable: '本机没能启动独立窗口（未找到可用的 Chrome，或以 root 身份无法启动）',
+  manual_browser_proxy_unsupported: '独立窗口需要「不带账号密码」的代理出口，而当前账号用的是带认证代理',
+  manual_browser_context_missing: '独立窗口已启动但没有可用的页面上下文',
+  cdp_browser_unavailable: '本机没能启动独立窗口（Chrome 未就绪）',
+  cdp_browser_proxy_unsupported: '独立窗口的代理出口格式不被支持',
+  cdp_context_missing: '独立窗口已启动但没有可用的页面上下文',
 };
 const allowedMessage = (messages, value) => typeof value === 'string' && Object.hasOwn(messages, value) ? messages[value] : '';
 function withStage(item, message, last = false) {
@@ -250,13 +264,15 @@ export class GoogleLoginManager {
       item.timer = setInterval(() => this.inspect(batch, item), this.pollMs);
       item.timer.unref?.();
       await this.inspect(batch, item);
-    } catch {
+    } catch (error) {
       eraseSecrets(secret);
       delete item.pendingSecret;
       if (this.isCurrent(batch, item)) {
         if (this.clock() >= item.deadlineAt) return await this.expire(batch, item);
         this.cancelQueued(batch, '前序账号或代理启动失败，已停止后续登录并清除密码；请检查后重新提交');
-        await this.finish(batch, item, 'failed', '登录窗口启动失败，或账号已停用/正在使用；请检查本机浏览器及代理');
+        const base = '登录窗口启动失败，或账号已停用/正在使用；请检查本机浏览器及代理';
+        const reason = allowedMessage(launchFailureMessages, error?.message);
+        await this.finish(batch, item, 'failed', reason ? `${reason}；${base}` : base);
       }
     }
   }
@@ -434,6 +450,29 @@ export class GoogleLoginManager {
     const picture = await item.session.preview();
     if (!this.isCurrent(batch, item)) throw error('登录页面已变化，请刷新批次', 409);
     return picture;
+  }
+
+  // 可交互画面（2026-09-29）：服务器上的浏览器窗口运营看不见，
+  // 于是把「截图 + 尺寸」回传，由后台页面渲染成可点击的画布。
+  async surface(id, ownerId) {
+    const batch = this.batches.get(id);
+    if (!batch || batch.ownerId !== ownerId) throw error('找不到此登录批次', 404);
+    const item = batch.items[batch.currentIndex];
+    if (!item || !this.isCurrent(batch, item) || !item.session?.surface) throw error('当前没有可操作的登录窗口', 409);
+    const surface = await item.session.surface();
+    if (!this.isCurrent(batch, item)) throw error('登录页面已变化，请刷新批次', 409);
+    return surface;
+  }
+
+  // 把运营的点击 / 按键 / 文本转进真实窗口。
+  // ⚠️ 故意**不写审计日志**：这里的事件可能携带账号密码，
+  // 而审计表是明文落库的。批次的创建与动作已有审计，足够追溯。
+  async interact(id, ownerId, event) {
+    const batch = this.batches.get(id);
+    if (!batch || batch.ownerId !== ownerId) throw error('找不到此登录批次', 404);
+    const item = batch.items[batch.currentIndex];
+    if (!item || !this.isCurrent(batch, item) || !item.session?.interact) throw error('当前没有可操作的登录窗口', 409);
+    return await item.session.interact(event);
   }
 
   async close() {

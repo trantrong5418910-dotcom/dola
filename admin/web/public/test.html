@@ -361,12 +361,32 @@
     /* 工作台精简视觉：保留原有节点和交互，只收紧层级与首屏信息量。 */
     :root{--page:#f6f7fb;--surface:#fff;--line:#e5e9f1;--ink:#172033;--muted:#78859a;--accent:#4f6fe0;--soft:#f3f6fb}
     body{background:var(--page);color:var(--ink)}
-    .topbar{position:sticky;top:0;z-index:20;height:64px;padding:0 max(20px,calc((100vw - 1240px)/2));gap:12px;background:#172238;box-shadow:0 1px 0 #ffffff12,0 8px 24px #15223b14}
+    /* ★ 全屏适配（2026-09-29）：正文与顶栏都不再限制最大宽度，铺满整个视口。
+       之前是 main{max-width:1240px;margin:auto}，1920 视口下左右各留 360px 空白，
+       内容只占中间 1240px。现在改成 100% 宽度 + 固定内边距。
+
+       ⚠️ 关键点：顶栏与 main 必须用**同一个内边距数值**。
+       历史坑：原写法 `.topbar{padding:0 max(20px,calc((100vw-1240px)/2))}` 配
+       `main{max-width:1240px;margin:auto;padding:0 20px}` 是两套规则，
+       视口 >1240px 时正文比顶栏靠右 20px（实测 1920→360 vs 340）。
+       去掉 max-width 后这个坑自然消失：两边都是 0 20px，永远同一条基准线。
+
+       顺带：顶栏 sticky 用的是 `padding:0 20px`，与 main 的 `0 20px` 一致；
+       小屏断点两处也同步（900px 以下 16px、560px 以下 11px），别只改一处。 */
+    .topbar{position:sticky;top:0;z-index:20;height:64px;padding:0 20px;gap:12px;background:#172238;box-shadow:0 1px 0 #ffffff12,0 8px 24px #15223b14}
+    @media(max-width:900px){.topbar{padding:0 16px}}
     .brand{width:32px;height:32px;border-radius:9px;font-size:15px}
     .top-title{font-size:15px;letter-spacing:.1px}.top-sub{font-size:11px;color:#b7c3d6}.origin{font-size:11px;color:#aab8cc}
     .top-balance,.top-btn,.theme-toggle{border-radius:7px;padding:7px 10px;font-size:11px}
     .topbar a{font-size:12px;color:#dce5f3}
-    main{max-width:1240px;margin:20px auto;padding:0 20px 36px}
+    /* ★ 全屏：不再 max-width，铺满视口；左右各留 20px 呼吸位。
+       ⚠️ 必须显式写 `max-width:none`。第一个 <style> 里还有一条
+       `main{max-width:1440px;margin:24px auto;padding:0 22px 40px}` ——
+       原来靠本块的 `max-width:1240px` 压住它；只写 `width:100%` 而不写
+       max-width 的话，1440 这条会重新生效，≥1440 视口仍被压到 1440 宽
+       （实测 1920 下 main 只有 1440 宽，顶栏却已铺满 ⇒ 又错位）。
+       内边距数值必须与上面 .topbar 保持一致（900px 以下两处同步改 16px）。 */
+    main{width:100%;max-width:none;margin:20px auto;padding:0 20px 36px}
     .notice{border-radius:10px;margin-bottom:12px;padding:11px 14px;font-size:12px;line-height:1.55;box-shadow:none}
     .notice-details>summary{display:flex;align-items:center;justify-content:space-between;gap:16px}
     .notice-details>summary span{margin-left:auto;color:#738198;font-weight:400;text-align:right}
@@ -377,7 +397,36 @@
     .security-details>summary b{color:#35527f;white-space:nowrap}
     .security-details>summary span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .security-details-body{margin-top:8px;padding-top:8px;border-top:1px solid var(--line);font-size:11px;color:var(--muted)}
-    .layout{grid-template-columns:minmax(320px,380px) minmax(0,1fr);gap:20px}
+    /* ★ 两栏必须等高。
+       原基础规则里的 `align-items:start` 让两栏各按自身内容高度、互不拉伸：
+       实测 1440 视口下左栏（新建视频任务）951px，右栏「当前任务」514px、
+       「任务列表」仅 306px —— 切到任务列表后两栏底部相差 644px，完全不对称。
+       改 stretch 让右栏卡片跟着左栏撑满，底部对齐。
+       窄屏（<900px）`.layout` 变单列，每行只有一个 item，stretch 不影响堆叠高度。 */
+    .layout{grid-template-columns:minmax(320px,380px) minmax(0,1fr);gap:20px;align-items:stretch}
+    /* ★ 右栏必须能收缩，否则页面在 901~1100px 视口横向滚动。
+       `.right{display:grid}` 的隐式列默认是 `auto`（下限=内容 min-content），
+       而任务表 `.jobs{min-width:680px}` 的 min-content 会一路顶穿上来：
+       实测 vw=1024 时 `.task-card` 被撑到 662px（轨道只有 580px），
+       scrollWidth=1082 ⇒ 整页横向滚 58px；vw=1000 时滚 82px。
+       ⚠️ 这是**既有缺陷**，不是本轮改动引入的 —— A/B 对照（把本轮的
+       stretch / flex 三行全部回退）在 1024/1000 上同样是 58/82px。
+       两处一起改才有效：轨道显式写成 minmax(0,1fr) 允许收缩到 0，
+       grid item 再加 min-width:0 才能真的缩下去（grid item 的
+       min-width:auto 同样等于 min-content，会把自己撑回 662px）。
+       超宽表格交给 `.list-wrap{overflow:auto}` 内部滚动，页面永不横滚。 */
+    .right{grid-template-columns:minmax(0,1fr)}
+    /* 等高之后，右栏内容（表头 + 表格）只占卡片顶部，下面留一大片空白（实测空列表时
+       内容约 210px、卡片 951px），看着"头重脚轻"。让标题/页签钉在顶部不动，
+       只把内容区在剩余空间里垂直居中：数据少时上下留白对称，数据多时表格自然撑满。
+
+       ⚠️ 这里刻意**不用** justify-content:center —— 它在内容超出容器时会把顶部裁掉
+       且无法滚动到（flex 居中的经典陷阱，任务列表 30 行就会命中）。
+       改用前后各一个 margin:auto 的伪元素来平分剩余空间：空间不足时
+       margin:auto 自动退化为 0，内容回到顶对齐，永远不会裁掉表头。 */
+    .task-card{display:flex;flex-direction:column;min-width:0}
+    .task-card .pane.active{display:flex;flex-direction:column;flex:1;min-height:0}
+    .task-card .pane.active::before,.task-card .pane.active::after{content:'';margin:auto}
     .card{border-color:var(--line);border-radius:14px;box-shadow:0 8px 28px #182a4810}
     .composer,.task-card{padding:20px}
     .card-head{margin-bottom:14px}.card h1,.card h2{font-size:16px}.card-head p{font-size:11px;color:var(--muted)}
@@ -426,7 +475,7 @@
     :root[data-theme="dark"] .filebox,:root[data-theme="dark"] .stat{background:#111c2b;border-color:var(--line)}
     :root[data-theme="dark"] .tabbar{border-color:var(--line)}
     @media(max-width:900px){main{margin-top:14px;padding:0 16px 30px}.layout{grid-template-columns:1fr}.composer{order:0}.right{order:1}}
-    @media(max-width:560px){main{padding:0 11px 24px}.topbar{height:58px;padding:0 12px}.top-sub,.origin,.topbar a{display:none}.top-balance{margin-left:auto}.security-details>summary span{max-width:58%;}.row{gap:8px}.composer,.task-card{padding:16px}.task-actions{width:100%;justify-content:flex-start}.stat-strip{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    @media(max-width:560px){main{padding:0 11px 24px}.topbar{height:58px;padding:0 11px}.top-sub,.origin,.topbar a{display:none}.top-balance{margin-left:auto}.security-details>summary span{max-width:58%;}.row{gap:8px}.composer,.task-card{padding:16px}.task-actions{width:100%;justify-content:flex-start}.stat-strip{grid-template-columns:repeat(2,minmax(0,1fr))}}
 
     /* ── 深色补丁：脚本分镜页（2026-09-28）──────────────────────────────
        背景：深色规则主要写在块1，块2/块3 后来做了一轮「浅色改版」

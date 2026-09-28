@@ -3,7 +3,7 @@ import { db } from '../db.js';
 import { requireAuth, requirePerm } from '../auth.js';
 import { audit } from '../audit.js';
 import { GoogleLoginManager } from '../dola/google-login-core.js';
-import { googleBrowserDriver } from '../dola/google-login-browser.js';
+import { createGoogleBrowserDriver } from '../dola/google-login-browser.js';
 import { createGoogleAccountStore } from '../dola/google-login-store.js';
 import { createLoginProxyResolver } from '../dola/google-login-proxy.js';
 import { parseAccountLoginEntries } from '../dola/account-login-format.js';
@@ -13,8 +13,16 @@ let manager;
 const service = () => {
   if (!manager) {
     const registry = createLoginProfileRegistry(db);
-    manager = new GoogleLoginManager({ driver: googleBrowserDriver, ...createGoogleAccountStore(db, { registry }),
-      ...createLoginProxyResolver(db), reserveProfiles: entries => registry.reserve(entries) });
+    // 浏览器启动方式：默认 'cdp' = spawn + connectOverCDP。
+    // Playwright 的 launch() 会注入 --enable-automation，页面里 navigator.webdriver === true，
+    // Google 据此在「输入账号密码」这一步直接判「此浏览器或应用可能不安全」（2026-09-29 实测）。
+    // 需要临时回退旧行为：设 DOLA_LOGIN_LAUNCH_MODE=launch 并重启 dola-admin。
+    const launchMode = /^(?:launch|persistent)$/i.test(process.env.DOLA_LOGIN_LAUNCH_MODE || '') ? 'launch' : 'cdp';
+    manager = new GoogleLoginManager({ driver: createGoogleBrowserDriver({ launchMode }), ...createGoogleAccountStore(db, { registry }),
+      // 直连兜底默认开启（2026-09-29 飞哥确认：优先现有的 IPWeb 代理，腾讯直连 IP 备用）。
+      // 需要临时关掉时设 DOLA_LOGIN_ALLOW_DIRECT=0 并重启 dola-admin。
+      ...createLoginProxyResolver(db, { allowDirect: !/^(?:0|false|off|no)$/i.test(process.env.DOLA_LOGIN_ALLOW_DIRECT || '') }),
+      reserveProfiles: entries => registry.reserve(entries) });
   }
   return manager;
 };
@@ -46,6 +54,27 @@ export function createGoogleLoginRouter(getManager = service) {
       const image = await getManager().preview(req.params.id, req.user.id);
       res.json({ ok: true, image: `data:image/png;base64,${image.toString('base64')}` });
     } catch (e) { res.status(e.status || 500).json({ ok: false, message: e.status ? e.message : '登录窗口预览暂不可用' }); }
+  });
+  // 可交互画面：后台跑在服务器上时，运营看不到那个有界窗口，
+  // 所以把画面 + viewport 尺寸回传，由前端渲染成能点的画布。
+  router.get('/batches/:id/surface', async (req, res) => {
+    try {
+      const surface = await getManager().surface(req.params.id, req.user.id);
+      res.json({ ok: true, image: `data:image/png;base64,${surface.image.toString('base64')}`, viewport: surface.viewport });
+    } catch (e) { res.status(e.status || 500).json({ ok: false, message: e.status ? e.message : '登录窗口画面暂不可用' }); }
+  });
+  // 点击 / 滚动 / 按键 / 文本 → 真实窗口。
+  // ⚠️ 走同一套鉴权（requireAuth + dola:import + 本机限制），
+  // 且**绝不落审计详情、绝不回显事件内容**（可能含账号密码）。
+  router.post('/batches/:id/interact', async (req, res) => {
+    try {
+      const event = req.body?.event;
+      if (!event || typeof event !== 'object' || Array.isArray(event)) throw Object.assign(new Error('输入事件无效'), { status: 400 });
+      await getManager().interact(req.params.id, req.user.id, event);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(e.status || 500).json({ ok: false, message: e.status ? e.message : '窗口操作暂不可用' });
+    } finally { if (req.body) delete req.body.event; }
   });
   router.post('/batches', (req, res) => {
     try {

@@ -101,3 +101,37 @@ test('journal proof survives SQLite backup/reopen without any account credential
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// ---- 回归：#231（2026-09-29）上游 4 次拒绝后卡成 uncertain -------------------
+// 根因：closeSubmission 原本是裸 UPDATE，journal 没有行时静默失效，
+//       「已拒绝」终态丢失，重启后 recoverStaleVideoTasks 误判成「结果不明」。
+
+test('#231 regression: closeSubmission records a terminal state even with no prior journal row', t => {
+  const h = fixture(t);
+  // 复现现场：换号重试路径 DELETE 掉了 journal 行，下一轮 dispatch 还没落库
+  assert.equal(getSubmission(h.db, 1), undefined);
+  closeSubmission(h.db, 1, 'rejected');
+  const receipt = getSubmission(h.db, 1);
+  assert.equal(receipt.state, 'rejected', '裸 UPDATE 会静默丢行，这里必须真的写进去');
+  assert.equal(receipt.evidence, 'legacy', '补写的终态要明确标注为 legacy');
+  assert.equal(receipt.account_id, 1, 'account_id 从 dola_videos 回填');
+  // rejected 不在 PENDING_SUBMISSION_STATES 里 → 账号不该继续被锁
+  assert.equal(accountHasUnsettledSubmission(h.db, 1), false, '落终态后账号必须解锁');
+});
+
+test('#231 regression: closeSubmission never downgrades sse_ack evidence on an existing row', t => {
+  const h = fixture(t); h.dispatch();
+  recordSubmissionConversation(h.db, 1, '1234567890123', 'sse_ack');
+  closeSubmission(h.db, 1, 'completed');
+  const receipt = getSubmission(h.db, 1);
+  assert.equal(receipt.state, 'completed');
+  assert.equal(receipt.evidence, 'sse_ack', 'sse_ack 是自动恢复的唯一凭据，不能被 legacy 覆盖');
+  assert.equal(receipt.conversation_id, '1234567890123', 'conversation_id 不能被抹掉');
+  assert.equal(canRecoverSubmission(receipt, h.row(), h.account), true);
+});
+
+test('#231 regression: closeSubmission still rejects an invalid terminal state', t => {
+  const h = fixture(t);
+  assert.throws(() => closeSubmission(h.db, 1, 'uncertain'), /Invalid terminal submission state/);
+  assert.equal(getSubmission(h.db, 1), undefined, '非法状态不得落库');
+});

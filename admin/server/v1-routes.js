@@ -708,14 +708,19 @@ router.get('/videos/:id/reference-images', requireApiToken, async (req, res) => 
   } catch (e) {
     return fail(res, 500, `读取参考图失败：${e.message}`, 'REFERENCE_IMAGE_READ_FAILED');
   }
+  // ⚠️ 必须单独查这两列：getVideoTask() 走的是 PUBLIC_FIELDS 投影，**不含**它们
+  //    （踩过：直接用 row.has_reference_images 会恒为 undefined，于是 cleared 永远是
+  //    false —— 前端就把「图已被清理」误判成「本来就没带图」，少提示一句「请重新上传」）。
+  const record = db.prepare('SELECT has_reference_images, reference_image_count FROM dola_videos WHERE id = ?')
+    .get(row.id) || {};
   const expiresMinutes = Math.round(REFERENCE_TICKET_HOURS * 60);
   return ok(res, {
     task_id: row.id,
     count: entries.length,
     // 记录里说带过图、但暂存目录空了 → 就是「已被清理」。让调用方能明确区分
     // 「没带图」和「图没了」，才能给出「请重新上传」而不是「无需上传」。
-    cleared: entries.length === 0 && Boolean(row.has_reference_images),
-    recorded_count: Number(row.reference_image_count || 0),
+    cleared: entries.length === 0 && Boolean(record.has_reference_images),
+    recorded_count: Number(record.reference_image_count || 0),
     expires_in_minutes: expiresMinutes,
     items: entries.map((entry) => ({
       name: entry.name,

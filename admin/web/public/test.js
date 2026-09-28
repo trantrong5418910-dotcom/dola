@@ -700,47 +700,86 @@
 
   // ─────────────────────────────────────────────────────────── 参考图
 
+  /**
+   * 缩略图用的 object URL：挂在 File 上**懒建**（同一张图反复渲染只建一次），
+   * 删图/清空时必须 revoke —— 否则 blob 会一直占着内存到刷新为止。
+   */
+  function thumbUrlOf(file) {
+    if (!file._thumbUrl) file._thumbUrl = URL.createObjectURL(file);
+    return file._thumbUrl;
+  }
+  function dropThumb(file) {
+    if (file._thumbUrl) { URL.revokeObjectURL(file._thumbUrl); delete file._thumbUrl; }
+  }
+
+  /**
+   * 「参考图片」框里的一行：缩略图 + 名字 + 体积 + 移除。
+   * ★ 缩略图用 `object-fit: contain` —— 完整比例、**不裁切**（2026-09-29 工单 P2）。
+   *   原来是纯文件名堆叠，6 张图分不清谁是谁；改成缩略图后一眼能认。
+   */
+  function refItemNode(file, onRemove) {
+    const item = document.createElement('li');
+    item.className = 'ref-item';
+    const link = document.createElement('a');
+    link.className = 'ref-thumb-link';
+    link.href = thumbUrlOf(file);
+    link.target = '_blank';
+    link.rel = 'noreferrer';
+    link.title = `点击查看大图：${file.name}`;
+    const img = document.createElement('img');
+    img.className = 'ref-thumb';
+    img.src = thumbUrlOf(file);
+    img.alt = file.name;
+    link.appendChild(img);
+    const meta = document.createElement('div');
+    const name = document.createElement('span');
+    name.className = 'ref-item-name';
+    name.textContent = file.name;
+    const size = document.createElement('span');
+    size.className = 'ref-item-size';
+    size.textContent = `${(file.size / 1024).toFixed(0)} KB`;
+    meta.append(name, size);
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'ref-item-remove';
+    remove.textContent = '移除';
+    remove.setAttribute('aria-label', `移除 ${file.name}`);
+    remove.addEventListener('click', onRemove);
+    item.append(link, meta, remove);
+    return item;
+  }
+
   function renderFiles() {
-    if (state.files.length > 9) state.files = state.files.slice(0, 9);
+    if (state.files.length > 9) {
+      for (const file of state.files.slice(9)) dropThumb(file);
+      state.files = state.files.slice(0, 9);
+    }
     const list = $('fileList');
     list.replaceChildren();
     state.files.forEach((file, index) => {
-      const item = document.createElement('li');
-      const name = document.createElement('span');
-      name.textContent = `${file.name} · ${(file.size / 1024).toFixed(0)} KB`;
-      const remove = document.createElement('button');
-      remove.type = 'button';
-      remove.textContent = '移除';
-      remove.setAttribute('aria-label', `移除 ${file.name}`);
-      remove.addEventListener('click', () => {
+      list.append(refItemNode(file, () => {
+        dropThumb(file);
         state.files.splice(index, 1);
         renderFiles();
         renderCapability();
-      });
-      item.append(name, remove);
-      list.append(item);
+      }));
     });
   }
 
   /** 与 renderFiles 同款，只是作用于批量弹窗自己的 batchFiles / batchFileList。 */
   function renderBatchFiles() {
-    if (state.batchFiles.length > 9) state.batchFiles = state.batchFiles.slice(0, 9);
+    if (state.batchFiles.length > 9) {
+      for (const file of state.batchFiles.slice(9)) dropThumb(file);
+      state.batchFiles = state.batchFiles.slice(0, 9);
+    }
     const list = $('batchFileList');
     list.replaceChildren();
     state.batchFiles.forEach((file, index) => {
-      const item = document.createElement('li');
-      const name = document.createElement('span');
-      name.textContent = `${file.name} · ${(file.size / 1024).toFixed(0)} KB`;
-      const remove = document.createElement('button');
-      remove.type = 'button';
-      remove.textContent = '移除';
-      remove.setAttribute('aria-label', `移除 ${file.name}`);
-      remove.addEventListener('click', () => {
+      list.append(refItemNode(file, () => {
+        dropThumb(file);
         state.batchFiles.splice(index, 1);
         renderBatchFiles();
-      });
-      item.append(name, remove);
-      list.append(item);
+      }));
     });
   }
 
@@ -766,7 +805,19 @@
   };
   /** 图库上限按「目标列表里已有的 + 本次勾的」一起算，避免加入时才被服务端拒绝。 */
   function libPickTargetFiles() {
-    return libPick.target === 'batch' ? state.batchFiles : state.files;
+    return isBatchTarget(libPick.target) ? state.batchFiles : state.files;
+  }
+  /**
+   * 落点是不是「批量弹窗那一份」。
+   * 'batch' = 弹窗里的「从参考图库选」；'mention-batch' = 在**批量提示词框**里打 @ 触发。
+   * 两者最终都落在 state.batchFiles，区别只在于要不要往提示词里插 @ 标记。
+   */
+  function isBatchTarget(target = libPick.target) {
+    return target === 'batch' || target === 'mention-batch';
+  }
+  /** 落点是不是「要插 @ 标记的 @ 引用」。 */
+  function isMentionTarget(target = libPick.target) {
+    return target === 'mention' || target === 'mention-batch';
   }
 
   function renderLibPickSelected() {
@@ -864,15 +915,15 @@
     libPick.target = target;
     // @ 触发的位置只对本次 mention 会话有效；走普通入口时必须清掉，
     // 否则残留的位置会把标记插到无关的旧光标处。
-    if (target !== 'mention') mentionCaret = -1;
+    if (!isMentionTarget(target)) mentionCaret = -1;
     libPick.selected = new Map();
     libPick.keyword = '';
     libPick.page = 1;
     $('libPickSearch').value = '';
-    $('libPickNote').textContent = libPick.target === 'batch'
-      ? `图库里的图存在服务端（不是这台浏览器）。勾选的图会加进「批量创建」的参考图，本批每条任务都带同一组。当前已选 ${state.batchFiles.length} 张，合计上限 9 张。`
-      : libPick.target === 'mention'
-        ? `勾选的图会加入下方参考图列表（与「从参考图库选」同一份、自动去重），并在提示词里插入 @[图片名] 标记。标记只在本地展示，提交时会被剥掉、不会发给上游。当前 ${state.files.length} 张，合计上限 9 张。`
+    $('libPickNote').textContent = isMentionTarget(libPick.target)
+      ? `勾选的图会加入${isBatchTarget() ? '批量弹窗' : '下方'}参考图列表（与「从参考图库选」同一份、自动去重），并在${isBatchTarget() ? '批量提示词' : '提示词'}里插入 @[图片名] 标记。标记只在本地展示，提交时会被剥掉、不会发给上游。当前 ${libPickTargetFiles().length} 张，合计上限 9 张。`
+      : isBatchTarget(libPick.target)
+        ? `图库里的图存在服务端（不是这台浏览器）。勾选的图会加进「批量创建」的参考图，本批每条任务都带同一组。当前已选 ${state.batchFiles.length} 张，合计上限 9 张。`
         : `图库里的图存在服务端（不是这台浏览器），分镜页出的图会自动收进去。当前已选 ${state.files.length} 张本机参考图，合计上限 9 张。`;
     renderLibPickSelected();
     openDialog('libPickDlg');
@@ -886,47 +937,56 @@
     $('libPickError').textContent = '';
     // 落点由打开选择器的按钮决定：主工作台的 files，或批量弹窗的 batchFiles。
     const targetFiles = libPickTargetFiles();
-    const isBatch = libPick.target === 'batch';
+    const isBatch = isBatchTarget();
+    // @ 引用落点：主提示词框写 mentionLinks + state.files，
+    // 批量提示词框写 batchMentionLinks + state.batchFiles。两套互不干扰。
+    const isMention = isMentionTarget();
+    const links = isBatch ? batchMentionLinks : mentionLinks;
+    const area = isBatch ? $('batchPrompts') : $('prompt');
     let added = 0;
     const problems = [];
+    /**
+     * 本次真正落到列表里的图：`{ row, file }`。
+     * ⚠️ 必须收集**实际那个 file**，不能用 picks 反推 —— 重复选同一张时走的是
+     * 「已存在就跳过」分支，列表里留着的是**旧的那个** File 对象；@ 引用要靠它
+     * 把标记绑到正确的图上（见下面 mentionLinks，P3：删标记要能删对图）。
+     */
+    const picked = [];
     for (const row of picks) {
       try {
         const blob = await DolaRefLib.fetchBlob(row);
         const ext = row.mime === 'image/jpeg' ? 'jpg' : 'png';
         const name = `${(row.name || `ref-${row.id}`).replace(/[^\w\u4e00-\u9fa5.-]+/g, '_').slice(0, 60)}.${ext}`;
         const file = new File([blob], name, { type: row.mime || 'image/png' });
-        if (targetFiles.some((f) => f.name === file.name && f.size === file.size)) continue;
+        const existing = targetFiles.find((f) => f.name === file.name && f.size === file.size);
+        if (existing) { picked.push({ row, file: existing }); continue; }
         if (targetFiles.length >= 9) { problems.push(`已满 9 张，${name} 未加入`); break; }
         targetFiles.push(file);
+        picked.push({ row, file });
         added += 1;
       } catch (error) {
         problems.push(`${row.name || `#${row.id}`}：${error.message}`);
       }
     }
     if (isBatch) renderBatchFiles();
-    else {
-      renderFiles();
-      if (libPick.target === 'mention') {
-        renderCapability();
-        // @ 引用：把触发选择器的那个裸 @ 换成 @[名称]。重复选同一张（去重跳过、没真加）
-        // 也要插标记 —— 用户看到标记才知道「这图已经在列表里了」，不然像没点上。
-        if (mentionCaret >= 0) {
-          const area = $('prompt');
-          const text = area.value;
-          const insert = picks.map((row) => `@[${mentionLabel(row.name)}]`).join(' ');
-          area.value = text.slice(0, mentionCaret) + insert + text.slice(mentionCaret + 1);
-          const caret = mentionCaret + insert.length;
-          area.focus();
-          area.setSelectionRange(caret, caret);
-          mentionCaret = -1;
-        }
-      } else {
-        renderCapability();
-      }
+    else { renderFiles(); renderCapability(); }
+    if (isMention && mentionCaret >= 0) {
+      // @ 引用：把触发选择器的那个裸 @ 换成 @[名称]。重复选同一张（去重跳过、没真加）
+      // 也要插标记 —— 用户看到标记才知道「这图已经在列表里了」，不然像没点上。
+      const text = area.value;
+      const insert = picked.map(({ row }) => `@[${mentionLabel(row.name)}]`).join(' ');
+      area.value = text.slice(0, mentionCaret) + insert + text.slice(mentionCaret + 1);
+      const caret = mentionCaret + insert.length;
+      area.focus();
+      area.setSelectionRange(caret, caret);
+      mentionCaret = -1;
+      // ★ 标记 ↔ 图片 绑定（工单 P3）：之后用户把标记删掉，图要跟着走，
+      //   不能留成「提示词里没了、提交时图还在」的幽灵图。
+      for (const { row, file } of picked) links.set(`@[${mentionLabel(row.name)}]`, file);
     }
     closeDialog('libPickDlg');
     if (problems.length) setError(`从图库加入 ${added} 张，${problems.length} 张失败：${problems.join('；')}`);
-    else showConnection(`已从参考图库加入 ${added} 张${isBatch ? '（批量创建用）' : libPick.target === 'mention' ? '（@ 引用）' : ''}`, 'good');
+    else showConnection(`已从参考图库加入 ${added} 张${isMention ? '（@ 引用）' : isBatch ? '（批量创建用）' : ''}`, 'good');
   }
 
   // ─────────────────────────────────────────────────────────── 当前任务面板
@@ -1633,8 +1693,57 @@
   /** 触发 @ 选择器时记下 @ 的位置：confirmLibPick 要把标记插回这里（把裸 @ 换成 @[名称]）。 */
   let mentionCaret = -1;
 
+  /**
+   * @ 标记 → 图片的绑定表：`'@[名称]' -> File`。
+   * 存在的唯一理由（工单 P3）：把提示词里的标记删掉时，得知道该删哪张图。
+   * 没有它，「提示词里没了、图还在列表里」的幽灵图就会被悄悄提交上去。
+   */
+  const mentionLinks = new Map();
+  /** 批量弹窗那一套：@ 标记 → state.batchFiles 里的 File。 */
+  const batchMentionLinks = new Map();
+
+  /**
+   * 提示词 ↔ 参考图列表对齐：凡是绑过、但提示词里已经没有了的标记，
+   * 对应图片一并从列表移除。
+   *
+   * 为什么按「提示词当前内容」而不是「删除事件」来判定：用户删标记的方式很多
+   * （退格、整段选中删除、粘贴覆盖、套用素材整体替换 prompt）—— 监听删除动作
+   * 必然漏，而每次输入后按内容对账只有一条路径，不会漏。
+   *
+   * 抽成通用函数是因为有**两套**落点（主工作台 / 批量弹窗）：
+   * 输入框、图片数组、绑定表、重渲染函数都不一样，但规则完全一致。
+   */
+  function syncMentionsOf({ area, files, links, render }) {
+    const present = new Set((area.value.match(MENTION_RE) || []));
+    let changed = false;
+    for (const [token, file] of links) {
+      if (present.has(token)) continue;
+      links.delete(token);
+      // 同一张图可能被多个标记引用（用户 @ 了两次）：还有标记指着它就别删
+      if ([...links.values()].includes(file)) continue;
+      const at = files.indexOf(file);
+      if (at >= 0) { dropThumb(file); files.splice(at, 1); changed = true; }
+    }
+    if (changed) render();
+  }
+  function syncMentionsFromPrompt() {
+    syncMentionsOf({
+      area: $('prompt'), files: state.files, links: mentionLinks,
+      render: () => { renderFiles(); renderCapability(); },
+    });
+  }
+  function syncBatchMentions() {
+    syncMentionsOf({
+      area: $('batchPrompts'), files: state.batchFiles, links: batchMentionLinks,
+      render: renderBatchFiles,
+    });
+  }
+
   async function createTask() {
     const epoch = state.epoch;
+    // 提交前再对齐一次（P3 兜底）：粘贴、套用素材等非键盘路径不经过 input 事件，
+    // 靠这一枪保证「提示词里没有的标记，图也一定不会被提交」。
+    syncMentionsFromPrompt();
     const prompt = stripMentions($('prompt').value);
     if (!prompt) { setError('请填写提示词（只有 @ 引用标记、没有正文时，标记会被剥掉，等于没有提示词）'); return; }
     if (state.files.length > 9) { setError('参考图片最多 9 张'); return; }
@@ -2107,7 +2216,9 @@
     const seen = new Set();
     const unique = [];
     for (const line of $('batchPrompts').value.split('\n')) {
-      const value = line.trim();
+      // 逐行剥掉 @[…] 标记（与单条一致）：标记只是本地的可读占位，不能发给上游。
+      // ⚠️ 先剥再去重：同一句带/不带标记应算同一行，剥完自然就相同了。
+      const value = stripMentions(line);
       if (!value || seen.has(value)) continue;
       seen.add(value);
       unique.push(value);
@@ -2146,6 +2257,9 @@
   }
 
   async function runBatchCreate() {
+    // 提交前对账一次（P3 兜底）：粘贴整段提示词这类非键盘改动不经过 input 事件，
+    // 靠这一枪保证「提示词里没有的标记，图也一定不会被提交」。
+    syncBatchMentions();
     const prompts = batchLines();
     if (!prompts.length) { setBatchError('请至少写一行提示词'); return; }
     if (prompts.length > BATCH_MAX_LINES) {
@@ -2321,7 +2435,11 @@
     if (material.ratio && [...$('ratio').options].some((option) => option.value === material.ratio)) {
       $('ratio').value = material.ratio;
     }
+    // 套用素材是**整体替换**（提示词 + 参考图），旧的 @ 绑定全部作废；
+    // 顺手把上一批图的 object URL 释放掉（否则 blob 一直挂着到刷新）。
+    for (const file of state.files) dropThumb(file);
     state.files = [];
+    mentionLinks.clear();
     for (const image of material.images || []) {
       try {
         // dataURL → Blob → File：参考图在提交时是按 File 进 FormData 的，必须还原成同一形状。
@@ -2449,15 +2567,27 @@
   // ★ 「@ 引用参考图」：在提示词里打 @ 直接弹出图库选择器。
   //    触发条件收窄为「行首或空白符后的裸 @」—— 邮箱（a@b.com）这类中间的 @ 不该抢。
   //    只监听 input（拿得到插入语义），不监听 keydown：粘贴/输入法/右键菜单都能触发。
-  $('prompt').addEventListener('input', () => {
-    const area = $('prompt');
-    const caret = area.selectionStart ?? -1;
-    if (caret < 1 || area.value[caret - 1] !== '@') return;
-    const before = caret >= 2 ? area.value[caret - 2] : '\n';
-    if (!/[\s\n]/.test(before)) return;   // 前一个字符不是空白 ⇒ 是词中间的 @，不触发
-    mentionCaret = caret - 1;
-    openLibPick('mention').catch((error) => setError(error.message || '参考图库加载失败'));
-  });
+  /**
+   * 挂 @ 触发到任意提示词输入框。主工作台与批量弹窗共用同一条规则；
+   * 差别只在落点（'mention' → state.files / 'mention-batch' → state.batchFiles）。
+   */
+  function bindMentionTrigger(id, target, sync) {
+    $(id).addEventListener('input', () => {
+      sync();   // ★ P3：先按提示词的当前内容对齐参考图列表
+      const area = $(id);
+      const caret = area.selectionStart ?? -1;
+      if (caret < 1 || area.value[caret - 1] !== '@') return;
+      const before = caret >= 2 ? area.value[caret - 2] : '\n';
+      if (!/[\s\n]/.test(before)) return;   // 前一个字符不是空白 ⇒ 是词中间的 @，不触发
+      mentionCaret = caret - 1;
+      openLibPick(target).catch((error) => setError(error.message || '参考图库加载失败'));
+    });
+  }
+  bindMentionTrigger('prompt', 'mention', syncMentionsFromPrompt);
+  // 批量弹窗的提示词框也要能 @（工单 v2：批量一起修）。
+  // 批量语义是「本批每条任务都带同一组图」，所以 @ 选的图同样进 batchFiles，
+  // 标记插在当前行；删标记会让它从整批里撤掉（由 syncBatchMentions 对账）。
+  bindMentionTrigger('batchPrompts', 'mention-batch', syncBatchMentions);
   $('libPickSearchBtn').addEventListener('click', () => {
     libPick.keyword = $('libPickSearch').value.trim();
     loadLibPick(1).catch((error) => setError(error.message));

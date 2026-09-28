@@ -274,9 +274,24 @@
     .ref-pick{display:grid;grid-template-columns:auto 1fr;align-items:center;gap:5px;box-sizing:border-box;padding:6px;border:1px solid #e4eaf3;border-radius:8px;background:#fff;cursor:pointer}
     .ref-pick:hover{border-color:#9dbbff}
     .ref-pick.on{border-color:#416fe0;background:#f2f6ff}
-    .ref-pick img{box-sizing:border-box;display:block;width:100%;height:58px;object-fit:cover;border-radius:5px}
+    /* ★ object-fit 从 cover 改成 contain（2026-09-29 工单 P2）：cover 会把横图/竖图
+       裁掉一截，用户看不出自己选的是哪张；contain 保证 100% 完整比例显示，
+       空出来的地方用背景色补白（深色模式下换成暗底）。 */
+    .ref-pick img{box-sizing:border-box;display:block;width:100%;height:58px;object-fit:contain;background:#f4f7fb;border-radius:5px;padding:2px}
     .ref-pick .ref-name{grid-column:1/-1;font-size:11px;color:#5d6b7d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .ref-pick input{accent-color:#416fe0}
+    /* ── 「参考图片」框的缩略图行（2026-09-29 工单 P2）────────────────────────
+       原来是「文件名 · 2506 KB」一行纯文字，6 张图堆在一起分不清谁是谁。
+       改成：缩略图（contain，完整比例不裁切）+ 文件名 + 体积 + 移除按钮，
+       缩略图本身是个链接，点开看大图。
+       ⚠️ 选择器必须写成 `.file-list li.ref-item`：上面 `.file-list li` 是 (0,1,1)，
+       比单独的 `.ref-item`(0,1,0) 权重高，直接写会被 flex 布局盖回去。 */
+    .file-list li.ref-item{display:grid;grid-template-columns:56px 1fr auto;gap:9px;align-items:center;justify-content:normal;padding:5px 6px;border:1px solid #eaf0f8;border-radius:9px;background:#fff}
+    .ref-thumb-link{display:block;line-height:0}
+    .ref-thumb{box-sizing:border-box;display:block;width:56px;height:56px;object-fit:contain;background:#f4f7fb;border-radius:6px;padding:2px}
+    .file-list li.ref-item .ref-item-name{display:block;color:#3d4d63;font-size:11px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .file-list li.ref-item .ref-item-size{display:block;color:#8794a6;font-size:10px;margin-top:2px}
+    .ref-item-remove{border:0;background:none;color:#a54842;cursor:pointer;font:inherit;font-size:11px;white-space:nowrap}
     .ref-batch{border:1px solid #e4eaf3;border-radius:10px;padding:9px 10px;margin-bottom:10px;background:#fbfcfe}
     .ref-batch-head{display:flex;align-items:center;gap:9px;margin-bottom:7px;font-size:11px;color:#6b7a8d}
     .ref-batch-head b{color:#22303f;font-size:12px}
@@ -290,6 +305,9 @@
     :root[data-theme="dark"] .ref-pick{background:#131c29;border-color:#2a374a}
     :root[data-theme="dark"] .ref-pick.on{background:#16233a;border-color:#416fe0}
     :root[data-theme="dark"] .ref-pick .ref-name{color:#9aa9bd}
+    :root[data-theme="dark"] .ref-pick img,:root[data-theme="dark"] .ref-thumb{background:#0f1725}
+    :root[data-theme="dark"] .file-list li.ref-item{background:#131c29;border-color:#2a374a}
+    :root[data-theme="dark"] .file-list li.ref-item .ref-item-name{color:#dbe4f0}
     :root[data-theme="dark"] .ref-batch{background:#131c29;border-color:#2a374a}
     :root[data-theme="dark"] .ref-batch-head{color:#9aa9bd}
     :root[data-theme="dark"] .ref-batch-head b{color:#e6edf7}

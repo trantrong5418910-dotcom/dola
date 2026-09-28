@@ -1789,6 +1789,13 @@
     $('prompt').value = job.prompt || '';
     if (job.seconds && [...$('seconds').options].some((o) => o.value === String(job.seconds))) {
       $('seconds').value = String(job.seconds);
+      // ★ 设完时长**必须**走一次联动：seconds ↔ model 是绑死的
+      //   （15 秒→seedance_v2.0、30 秒→seedance_v2.5，服务端 assertModelSeconds 硬校验）。
+      //   直接写 select.value 不触发联动，就会留下「时长 30 秒 + 模型还是 2.0」这种非法组合，
+      //   点提交必被 400 拒掉 —— 2026-09-29 实测踩到：nginx 日志
+      //   `01:36:41 POST /v1/videos → 400`，页面却看不出哪里不对。
+      //   联动的结果与"回填原任务参数"是一致的：原任务能跑，说明它的 时长→模型 本来就配对。
+      syncDurationModel();
     }
     if (job.ratio && [...$('ratio').options].some((o) => o.value === String(job.ratio))) {
       $('ratio').value = String(job.ratio);

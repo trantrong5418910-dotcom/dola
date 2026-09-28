@@ -36,6 +36,7 @@ import { validateReferenceImages } from '../dola/reference-images.js';
 import { saveReferenceImages, cleanupReferenceImages } from '../dola/reference-image-store.js';
 import { findUnsettledPrompt } from '../dola/submission-journal.js';
 import { sanitizePreflightDiagnostic } from '../dola/preflight-diagnostics.js';
+import { SUPPORTED_VIDEO_SECONDS, RETIRED_VIDEO_SECONDS } from '../dola/generation-policy.js';
 import { resolveTaskPoints, quotaView, usageSnapshot, parseModelCosts, QUOTA_SETTING_KEYS } from '../dola/gateway-quota.js';
 import { switchView, SWITCH_KEYS } from '../dola/feature-switch.js';
 import { readinessSummary } from '../dola/readiness.js';
@@ -446,7 +447,9 @@ router.get('/health', (req, res) => {
     // These are accepted native request targets. 15s is the expert Seedance
     // 2.0 path; readiness is reported only when a matching account has a
     // read-only page probe plus an exclusive verified exit.
-    supportedSeconds: [10, 15, 20, 30],
+    // 档位精简（2026-09-27）：10 秒与 20 秒已下线，只对外宣告 15 / 30。
+    supportedSeconds: [...SUPPORTED_VIDEO_SECONDS],
+    retiredSeconds: [...RETIRED_VIDEO_SECONDS],
     expertSeconds: [15],
     expertSecondsReady: native15.ready,
     fixedSeconds: 30,
@@ -513,8 +516,8 @@ export class GatewayTaskError extends Error {
  * @param {string} input.tokenValue 用户令牌原文
  * @param {string} input.prompt
  * @param {string} [input.mode='standard'] standard|expert
- * @param {number} [input.seconds=10]
- * @param {number|null} [input.forceSeconds=null]
+ * @param {number} [input.seconds=30] 15 或 30（10/20 已下线，会被 DURATION_RETIRED 拒绝）
+ * @param {number|null} [input.forceSeconds=null] 同上白名单；不填则等于 seconds
  * @param {string} [input.ratio='16:9']
  * @param {Array} [input.images=[]] 参考图（base64 数组）
  * @param {number|null} [input.accountId=null] 指定账号
@@ -540,9 +543,49 @@ export async function submitGenerationTask(input = {}) {
   if (!['standard', 'expert'].includes(mode)) {
     fail({ status: 400, code: 'UNSUPPORTED_MODE', message: 'mode 仅支持 standard 或 expert' });
   }
-  const requestedSeconds = Number(input.seconds ?? 10);
+  // 档位精简（2026-09-27）：10 秒与 20 秒**直接拒绝**，不做静默降级、不受理。
+  // 放在令牌校验之前：这种请求根本不该消耗任何后端资源（令牌查询、额度判定、账号体检都不跑）。
+  // 默认档位从 10 秒改为 30 秒 —— 30 秒是精简后的主档位，旧调用方不传 seconds 时
+  // 拿到的是更长的成片、更低的单价（2 额度），而不是报错。
+  const requestedSeconds = Number(input.seconds ?? 30);
+  if (RETIRED_VIDEO_SECONDS.includes(requestedSeconds)) {
+    fail({
+      status: 400,
+      code: 'DURATION_RETIRED',
+      message: `${requestedSeconds} 秒档位已下线，请选择 15 秒（专家模式）或 30 秒；任务未提交，也未扣积分`,
+      fields: { supportedSeconds: [...SUPPORTED_VIDEO_SECONDS] },
+    });
+  }
+  if (!SUPPORTED_VIDEO_SECONDS.includes(requestedSeconds)) {
+    fail({
+      status: 400,
+      code: 'DURATION_UNSUPPORTED',
+      message: `seconds 仅支持 15 或 30；任务未提交，也未扣积分`,
+      fields: { supportedSeconds: [...SUPPORTED_VIDEO_SECONDS] },
+    });
+  }
   if (requestedSeconds === 15 && mode !== 'expert') {
     fail({ status: 400, code: 'EXPERT_MODE_REQUIRED', message: '15 秒视频只能在专家模式提交，任务未提交，也未扣积分' });
+  }
+  // forceSeconds 会真的改变上游时长，必须一起受档位精简约束，否则
+  // 「seconds=30（合法）+ forceSeconds=10（已下线）」就能绕过上面的拦截。
+  const rawForced = input.forceSeconds;
+  if (rawForced !== null && rawForced !== undefined && String(rawForced).trim() !== '') {
+    const forcedSeconds = Number(rawForced);
+    if (RETIRED_VIDEO_SECONDS.includes(forcedSeconds)) {
+      fail({
+        status: 400, code: 'DURATION_RETIRED',
+        message: `forceSeconds=${forcedSeconds} 档位已下线，仅支持 15 或 30；任务未提交，也未扣积分`,
+        fields: { supportedSeconds: [...SUPPORTED_VIDEO_SECONDS] },
+      });
+    }
+    if (!SUPPORTED_VIDEO_SECONDS.includes(forcedSeconds)) {
+      fail({
+        status: 400, code: 'DURATION_UNSUPPORTED',
+        message: 'forceSeconds 仅支持 15 或 30；任务未提交，也未扣积分',
+        fields: { supportedSeconds: [...SUPPORTED_VIDEO_SECONDS] },
+      });
+    }
   }
 
   const t = db.prepare('SELECT * FROM tokens WHERE value = ?').get(tokenValue);
@@ -601,7 +644,9 @@ export async function submitGenerationTask(input = {}) {
     });
   }
 
-  // 参考图：先校验，再看号池是否就绪；两者都在建任务/扣积分之前。
+  // 参考图：只做输入校验；页面上传控件和对象存储上传必须在真实提交阶段确认。
+  // 不能把历史只读探测的 unknown 当成“不可用”，否则任务还没落库就会被判失败，
+  // 也无法让 Dola 的本次页面回执给出最终结论。
   let inspectedImages = [];
   try {
     inspectedImages = await validateReferenceImages(input.images, { prompt });
@@ -609,27 +654,14 @@ export async function submitGenerationTask(input = {}) {
     releasePromptReservation(t.id, prompt);
     fail({ status: error.status || 400, code: error.code || 'REFERENCE_IMAGE_INVALID', message: error.message });
   }
-  if (inspectedImages.length) {
-    const refPool = referenceImagePoolStats();
-    if (!refPool.ready) {
-      releasePromptReservation(t.id, prompt);
-      fail({
-        status: 409,
-        code: 'REFERENCE_IMAGES_NOT_READY',
-        message: '当前没有已确认支持参考图且代理隔离的可用账号，任务未提交，也未扣积分',
-        fields: { referenceImages: { ready: false, eligible: refPool.eligible } },
-      });
-    }
-  }
-
-  // ① 建任务（内部会**先给账号做会话体检**再挑号；挑不到直接 409，此时还没扣费）
+  // ① 建任务（内部只做账号安全复核；模型/时长/参考图能力在真实提交阶段确认）
   let task;
   try {
     task = await createVideoTask({
       prompt,
       ratio: input.ratio || '16:9',
       mode,
-      seconds: input.seconds ?? 10,
+      seconds: requestedSeconds,
       forceSeconds: input.forceSeconds ?? null,
       accountId: input.accountId ?? null,
       strictAccount: input.strictAccount === true,
@@ -650,7 +682,7 @@ export async function submitGenerationTask(input = {}) {
           diagnostic,
           preflightAudit: {
             code: e.code,
-            seconds: [10, 15, 20, 30].includes(requestedSeconds) ? requestedSeconds : null,
+            seconds: SUPPORTED_VIDEO_SECONDS.includes(requestedSeconds) ? requestedSeconds : null,
             mode, diagnostic, taskCreated: false, charged: false,
           },
         },
@@ -746,6 +778,12 @@ export async function submitGenerationTask(input = {}) {
 
 /** POST /api/gateway/gen —— 提交一次生成（扣积分 + 建任务） */
 router.post('/gen', async (req, res) => {
+  // HTTP callers use server pricing; explicit prices remain an internal admin option.
+  if (Object.hasOwn(req.body ?? {}, 'points')) {
+    return res.status(400).json({
+      ok: false, code: 'UNSUPPORTED_PARAMETER', message: 'points 由服务端定价，不支持客户端指定',
+    });
+  }
   try {
     const result = await submitGenerationTask({
       tokenValue: userTokenOf(req),
@@ -757,7 +795,6 @@ router.post('/gen', async (req, res) => {
       images: req.body?.images,
       accountId: req.body?.accountId,
       strictAccount: req.body?.strictAccount,
-      points: req.body?.points,
     });
     audit(req, 'gateway.gen.create', 'dola_video', String(result.taskId), {
       prompt: String(req.body?.prompt || '').slice(0, 80),

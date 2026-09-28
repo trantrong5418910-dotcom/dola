@@ -92,25 +92,27 @@ test('gate stays closed: no create, no billing; health declares unsupported imag
   assert.equal(f.state.points.get(USER_A), 100);
 });
 
-test('10s and 20s stay open, while expert mode adds native 15s', async (t) => {
+test('retired 10s/20s are rejected outright, while expert mode adds native 15s', async (t) => {
   const f = await fixture(t, { gate: false });
+  // 档位精简：10/20 不再受理（gate 关着也不受理），且必须给出 DURATION_RETIRED
   for (const seconds of [10, 20]) {
     const result = await create(f, { seconds });
-    assert.equal(result.status, 202);
-    assert.equal(f.state.lastCreate.seconds, seconds);
-    assert.equal(f.state.lastCreate.forceSeconds, seconds);
+    assert.equal(result.status, 400, `seconds=${seconds} 必须被拒`);
+    assert.equal(result.body.code, 'DURATION_RETIRED');
   }
+  assert.equal(f.state.creates, 0, '已下线档位不得建任务、不得扣积分');
+  // 30 秒是主档位：gate 关着时后端会挡（FIXED_DURATION_UNAVAILABLE），但入口是受理的
   const standard15 = await create(f, { seconds: 15, mode: 'standard' });
   assert.equal(standard15.status, 400);
   assert.equal(standard15.body.code, 'EXPERT_MODE_REQUIRED');
   const health = await request(f, '/api/health');
-  assert.deepEqual(health.body.supportedSeconds, [10, 15, 20, 30]);
+  assert.deepEqual(health.body.supportedSeconds, [15, 30]);
   assert.deepEqual(health.body.expertSeconds, [15]);
   assert.equal(health.body.expertSecondsReady, false);
   const blocked15 = await create(f, { seconds: 15, mode: 'expert' });
   assert.equal(blocked15.status, 409);
   assert.equal(blocked15.body.code, 'EXPERT_DURATION_UNAVAILABLE');
-  assert.equal(f.state.creates, 2);
+  assert.equal(f.state.creates, 0);
 
   const open = await fixture(t, { gate: true });
   const expert15 = await create(open, { seconds: 15, mode: 'expert' });
@@ -154,7 +156,7 @@ test('when referenceImagesReady, images are forwarded and charged only after gat
   await provider.login(USER_A);
   await provider.createTask({
     prompt: 'synthetic with image',
-    seconds: 10,
+    seconds: 30,
     images: [{ name: 'via-provider.png', data: png }],
   });
   assert.equal(f.state.creates, 2);

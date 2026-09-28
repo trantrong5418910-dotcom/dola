@@ -76,12 +76,32 @@
       </el-header>
 
       <el-main class="main">
+        <!--
+          路由切换时的兜底骨架：懒加载的页面 chunk 在弱网/首次访问时会有一段时间没有内容，
+          期间必须先给个「正在加载」，否则就是一片无提示的空白（Bug-1 的观感来源之一）。
+          延迟 120ms 才显示，避免瞬时完成的导航闪一下骨架。
+          注意：这是**覆盖层**，不能写成 v-if/v-else 去替换 router-view —— 那样每次切换都会
+          卸载重建 keep-alive，把页面缓存全丢掉。
+        -->
+        <div v-if="showRouteLoading" class="route-loading" aria-busy="true" aria-live="polite">
+          <el-skeleton :rows="6" animated />
+          <div class="route-loading-tip">正在加载页面…</div>
+        </div>
+
         <router-view v-slot="{ Component }">
-          <transition name="fade" mode="out-in">
-            <!--
-              keep-alive：切菜单不再销毁重建，表单填一半切走再切回不丢、滚动位置不丢、
-              也不重新发一轮请求。include 只列「安全可缓存」的页面，理由见 KEEP_ALIVE 注释。
-            -->
+          <!--
+            ★ 这里的 <transition> **不能加 mode="out-in"**（2026-09-27 血泪）。
+            原因：out-in 要求子节点是「可对比的单个 vnode」，而它的直接子节点是 <keep-alive>，
+            两者 type/key 都不变 ⇒ 过渡机制不接管（连 before-leave/before-enter 都不会触发），
+            同时 keep-alive 的子树会被渲染成一个空的注释占位节点。
+            表现极具误导性：**第一次点菜单正常，从第二次开始内容区永久空白**，且
+            console 零报错、无失败请求；F5 之后恢复正常（重新挂载）。
+            已验证：加 mode="out-in" → 第 2 次导航起全部空白；去掉 → 14 个页面 × 深浅两色全通过。
+            也验证过「给 component 加 :key」和「把 keep-alive 挪到 transition 外层」都救不回来。
+            交叉淡入（无 mode）有约 160ms 的重叠，可接受；如需回到 out-in 请连同 keep-alive 一起重构。
+            ⚠ 维护提示：本段注释内禁止出现「两个连续短横线」，否则注释会被提前闭合，后半段正文会直接漏到页面上。
+          -->
+          <transition name="fade">
             <keep-alive :include="KEEP_ALIVE">
               <component :is="Component" />
             </keep-alive>
@@ -93,12 +113,12 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { api } from '../api.js';
 import { state, toggleTheme, logout, can } from '../store.js';
-import { menuItems } from '../router.js';
+import { menuItems, routePending } from '../router.js';
 import { isBusy, busyText } from '../busy.js';
 
 /**
@@ -109,7 +129,10 @@ import { isBusy, busyText } from '../busy.js';
  *      `defineOptions({ name: 'Users' })`）。名字对不上就**静默不缓存**，不报错。
  *   2. 页面里如果自己挂了轮询定时器，必须自己处理启停 —— 组件被缓存后
  *      onUnmounted 不再触发，定时器会在后台一直跑，白烧服务端。
- *      （DolaGenerationAnalytics.vue 已经按这个要求改好了，可以当样板。）
+ *      （Dashboard.vue 已经按这个要求改好了，可以当样板 —— 30 秒轮询
+ *        onDeactivated 停 / onActivated 续、start 幂等。
+ *        注：DolaGenerationAnalytics.vue 也满足这个要求，它挂在 /dola 的
+ *        「生成与复核」tab 上，仍然在用；2026-09-27 起仪表盘不再复用它。）
  *
  * 下面这 11 个页面都是「只读或慢改、没有自家定时器」，缓存是安全的。
  */
@@ -118,6 +141,9 @@ const KEEP_ALIVE = [
   'Cards', 'Materials', 'Settings', 'Logs', 'Profile',
   // 代理池：纯手动刷新，没有轮询定时器，缓存安全
   'ProxyPool',
+  // 参考图库：只有「读取凭证」这一个会过期的状态，load() 每次都会重发凭证；
+  // 没有轮询定时器，缓存安全（缓存它能让来回切菜单时缩略图不重新请求）。
+  'ReferenceImages',
   // 成片库：有「扫描凭证倒计时」一个定时器，但已经按 keep-alive 的规矩处理好了
   // —— 倒计时按截止时刻算而非累减，且 onDeactivated 停表、onActivated 重算。
   // 缓存它的实际收益很大：扫描会话是唯一有出站成本的动作，切个菜单就重扫一遍很浪费。
@@ -130,6 +156,22 @@ const KEEP_ALIVE = [
 
 const route = useRoute();
 const router = useRouter();
+
+/**
+ * 路由加载骨架：延迟 120ms 才显示（见模板里的说明）。
+ * routePending 由 router.js 在 beforeEach/afterEach 里维护 —— 它覆盖了
+ * 「守卫执行 + 懒加载 chunk 拉取」整段时间，正是会出现无提示空白的那段。
+ */
+const showRouteLoading = ref(false);
+let routeLoadingTimer = null;
+watch(routePending, (pending) => {
+  clearTimeout(routeLoadingTimer);
+  if (pending) {
+    routeLoadingTimer = setTimeout(() => { showRouteLoading.value = true; }, 120);
+  } else {
+    showRouteLoading.value = false;
+  }
+});
 const collapsed = ref(false);
 const menus = computed(() => menuItems());
 const currentTitle = computed(() => route.meta?.title || '');
@@ -251,7 +293,17 @@ async function onCommand(cmd) {
 .uname { font-size: 13px; }
 .role-tag { transform: scale(.92); }
 .caret { font-size: 12px; color: var(--el-text-color-secondary); }
-.main { background: var(--el-bg-color-page); padding: 18px; }
+.main { background: var(--el-bg-color-page); padding: 18px; position: relative; }
+/* 路由加载骨架（覆盖层，见模板注释：必须覆盖而非替换 router-view） */
+.route-loading {
+  position: absolute; inset: 18px; z-index: 1;
+  background: var(--el-bg-color-page);
+  padding: 18px; box-sizing: border-box;
+}
+.route-loading-tip {
+  margin-top: 14px; text-align: center;
+  font-size: 13px; color: var(--el-text-color-secondary);
+}
 .fade-enter-active, .fade-leave-active { transition: opacity .16s; }
 .fade-enter-from, .fade-leave-to { opacity: 0; }
 @media (max-width: 700px) { .uname { display: none; } }

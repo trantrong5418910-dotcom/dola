@@ -5,14 +5,11 @@ import {
   isNativeVideoRequest, isNativeThirtySecondRequest, isActiveGenerationStatus, validateArchivedVideo, hasConfirmedZeroVideoQuota,
   isVerifiedNativeCapability,
 } from '../server/dola/generation-policy.js';
+import { DURATION_SOURCE } from '../server/dola/generation-duration.js';
 
 test('duration defaults and explicit/native 30s normalize to one contract', () => {
-  assert.equal(normalizeVideoDuration().seconds, 10);
-  for (const input of [{ seconds: 20 }, { forceSeconds: 20 }, { seconds: '20', forceSeconds: 20 }]) {
-    assert.deepEqual(normalizeVideoDuration(input), {
-      seconds: 20, forceSeconds: 20, requireSessionRecheck: true, targetModel: 'seedance_v2.5',
-    });
-  }
+  // 档位精简（2026-09-27）：默认档位从 10 秒改为 30 秒（10/20 已下线）。
+  assert.equal(normalizeVideoDuration().seconds, 30);
   for (const input of [{ seconds: 30 }, { forceSeconds: 30 }, { seconds: '30', forceSeconds: 30 }]) {
     assert.deepEqual(normalizeVideoDuration(input), {
       seconds: 30, forceSeconds: 30, requireSessionRecheck: true, targetModel: 'seedance_v2.5',
@@ -31,8 +28,11 @@ for (const value of [0, -1, 5, 31, 30.5, 40, NaN, Infinity, '', false, true, [],
   });
 }
 test('seconds and forceSeconds mismatch is rejected in both directions', () => {
-  assert.throws(() => normalizeVideoDuration({ seconds: 10, forceSeconds: 30 }), /必须一致/);
-  assert.throws(() => normalizeVideoDuration({ seconds: 30, forceSeconds: 10 }), /必须一致/);
+  assert.throws(() => normalizeVideoDuration({ seconds: 15, forceSeconds: 30 }), /必须一致/);
+  assert.throws(() => normalizeVideoDuration({ seconds: 30, forceSeconds: 15 }), /必须一致/);
+  // 已下线档位单独一类错误：先报 DURATION_RETIRED，不与"必须一致"混为一谈
+  assert.throws(() => normalizeVideoDuration({ seconds: 10 }), /档位已下线/);
+  assert.throws(() => normalizeVideoDuration({ seconds: 20 }), /档位已下线/);
 });
 
 test('explicit proxy schemes and authenticated IPWeb are accepted without connecting', () => {
@@ -86,21 +86,24 @@ test('native 30s guard accepts only explicit matching model/duration and never c
   assert.equal(native, body('seedance_v2.5', 30));
 });
 
-test('native 20s guard accepts the same model with an explicit 20s duration', async () => {
-  const native = body('seedance_v2.5', 20);
+test('native 30s guard accepts the same model with an explicit 30s duration', async () => {
+  const native = body('seedance_v2.5', 30);
   const { isNativeVideoRequest } = await import('../server/dola/generation-policy.js');
-  assert.equal(isNativeVideoRequest(native, 20), true);
-  assert.equal(isNativeVideoRequest(body('seedance_v2.5', 30), 20), false);
-  assert.equal(isNativeVideoRequest(body('other-model', 20), 20), false);
+  assert.equal(isNativeVideoRequest(native, 30), true);
+  assert.equal(isNativeVideoRequest(body('seedance_v2.5', 15), 30), false);
+  assert.equal(isNativeVideoRequest(body('other-model', 30), 30), false);
+  // 档位精简：已下线的 10/20 不再被认作合法视频请求
+  assert.equal(isNativeVideoRequest(body('seedance_v2.5', 10), 10), false);
+  assert.equal(isNativeVideoRequest(body('seedance_v2.5', 20), 20), false);
 });
 
 test('wire guard cannot use prompt or arbitrary metadata as proof of a video request', () => {
-  const video = JSON.parse(body('seedance_v2.5', 10));
+  const video = JSON.parse(body('seedance_v2.5', 30));
   for (const input of [{ prompt: video }, { content: video }, { metadata: video },
     { messages: [{ content: video }] }, { unrelated_ability: video }]) {
-    assert.equal(isNativeVideoRequest(JSON.stringify(input), 10), false);
+    assert.equal(isNativeVideoRequest(JSON.stringify(input), 30), false);
   }
-  assert.equal(isNativeVideoRequest(JSON.stringify({ ...video, prompt: { chat_ability: { ability_type: 999 } } }), 10), true);
+  assert.equal(isNativeVideoRequest(JSON.stringify({ ...video, prompt: { chat_ability: { ability_type: 999 } } }), 30), true);
 });
 
 test('wire guard rejects multi-video requests, malformed abilities and excessive nesting', () => {
@@ -120,31 +123,68 @@ test('native 15s expert guard accepts only Seedance 2.0', async () => {
   assert.equal(isNativeVideoRequest(body('seedance_v2.0', 10), 15, 'seedance_v2.0'), false);
 });
 
-test('preflight requires exact carrier evidence for 20/30s, native for 10/15s', () => {
-  // 10/15s: native evidence (uiSeconds=seconds, no rewrite)
-  for (const seconds of [10, 15]) {
+test('preflight requires carrier evidence for 30s, native for 15s', () => {
+  // 15s: native evidence (uiSeconds=seconds, no rewrite)。10s 已下线，不再有"10 秒原生"这一档。
+  for (const seconds of [15]) {
     const good = { ok: true, state: 'available', seconds, uiSeconds: seconds, native: true,
-      rewriteCarrier: false, model: seconds === 15 ? 'seedance_v2.0' : 'seedance_v2.5' };
+      rewriteCarrier: false, source: DURATION_SOURCE.NATIVE_SINGLE,
+      model: seconds === 15 ? 'seedance_v2.0' : 'seedance_v2.5' };
     assert.equal(isVerifiedNativeCapability(good, seconds), true);
     assert.equal(isVerifiedNativeCapability({ ...good, uiSeconds: 10, native: false, rewriteCarrier: true }, seconds), false);
     assert.equal(isVerifiedNativeCapability({ ...good, model: 'seedance_v2.0' }, seconds), seconds === 15);
     assert.equal(isVerifiedNativeCapability({ ...good, state: 'adapter_only' }, seconds), false);
     assert.equal(isVerifiedNativeCapability({ ...good, seconds: seconds + 1 }, seconds), false);
   }
-  // 20/30s: carrier evidence (20→10s, 30→15s, rewriteCarrier=true)
-  for (const [seconds, carrier] of [[20, 10], [30, 15]]) {
+  // 30s: carrier evidence (30→15s 历史口径, rewriteCarrier=true)
+  for (const [seconds, carrier] of [[30, 15]]) {
     const good = { ok: true, state: 'available', seconds, uiSeconds: carrier, native: false,
       rewriteCarrier: true, model: 'seedance_v2.5' };
     assert.equal(isVerifiedNativeCapability(good, seconds), true);
     // Wrong carrier is rejected
     const wrongCarrier = carrier === 10 ? 15 : 10;
     assert.equal(isVerifiedNativeCapability({ ...good, uiSeconds: wrongCarrier }, seconds), false);
-    // Native claim without rewrite is rejected for 20/30
-    assert.equal(isVerifiedNativeCapability({ ...good, uiSeconds: seconds, native: true, rewriteCarrier: false }, seconds), false);
+    // A native claim without the explicit source is rejected, even when the
+    // UI fields happen to match the target. The future native-30s path remains
+    // available when the duration probe supplies native_single evidence.
+    const native30 = { ...good, uiSeconds: seconds, native: true, rewriteCarrier: false,
+      source: DURATION_SOURCE.NATIVE_SINGLE };
+    assert.equal(isVerifiedNativeCapability(native30, seconds), true);
+    assert.equal(isVerifiedNativeCapability({ ...native30, source: undefined }, seconds), false);
     assert.equal(isVerifiedNativeCapability({ ...good, state: 'adapter_only' }, seconds), false);
     assert.equal(isVerifiedNativeCapability({ ...good, seconds: seconds + 1 }, seconds), false);
   }
-  assert.equal(isVerifiedNativeCapability({ ok: true, state: 'available', seconds: 10, model: 'seedance_v2.5' }, 10), false);
+  // 已下线档位：即使证据形态齐全也不能被认作可用能力
+  assert.equal(isVerifiedNativeCapability({ ok: true, state: 'available', seconds: 10, uiSeconds: 10, native: true, rewriteCarrier: false, model: 'seedance_v2.5' }, 10), false);
+  assert.equal(isVerifiedNativeCapability({ ok: true, state: 'available', seconds: 20, uiSeconds: 10, native: false, rewriteCarrier: true, model: 'seedance_v2.5' }, 20), false);
+});
+
+test('30s carrier rewrite stays behind its own opt-in', () => {
+  // 30s 用页面真实存在的 10s 档做载体（实测服务端只下发 5s/10s，没有 15s）
+  const tenCarrier = { ok: true, state: 'available', seconds: 30, uiSeconds: 10, native: false,
+    rewriteCarrier: true, model: 'seedance_v2.5' };
+  // 默认 = 现行为：只认历史口径的 15s 载体，10s 载体不算证据
+  assert.equal(isVerifiedNativeCapability(tenCarrier, 30), false);
+  // 显式放行后才接受任意"真实存在的更短载体"
+  assert.equal(isVerifiedNativeCapability(tenCarrier, 30, { allowCarrierRewrite: true }), true);
+  assert.equal(isVerifiedNativeCapability({ ...tenCarrier, uiSeconds: 15 }, 30, { allowCarrierRewrite: true }), true);
+  // 证据必须齐全：没有改写标记、或声明成了原生 30s，都不算
+  assert.equal(isVerifiedNativeCapability({ ...tenCarrier, rewriteCarrier: false }, 30, { allowCarrierRewrite: true }), false);
+  assert.equal(isVerifiedNativeCapability({ ...tenCarrier, native: true }, 30, { allowCarrierRewrite: true }), false);
+  // 载体必须是真实档位且严格短于目标 —— 不能拿 30/40 冒充载体，也不能是脏值
+  for (const uiSeconds of [0, -1, 30, 40, 10.5, '10', null, undefined, NaN]) {
+    assert.equal(
+      isVerifiedNativeCapability({ ...tenCarrier, uiSeconds }, 30, { allowCarrierRewrite: true }),
+      false, String(uiSeconds),
+    );
+  }
+  // 档位精简：20 秒已下线，这个开关现在只服务于 30 秒；
+  // 已下线档位即使打开开关也不得被认作可用能力（否则会有号被派去跑已下线的档）。
+  const twenty = { ok: true, state: 'available', seconds: 20, uiSeconds: 10, native: false,
+    rewriteCarrier: true, model: 'seedance_v2.5' };
+  assert.equal(isVerifiedNativeCapability(twenty, 20, { allowCarrierRewrite: true }), false);
+  const ten = { ok: true, state: 'available', seconds: 10, uiSeconds: 10, native: true,
+    rewriteCarrier: false, model: 'seedance_v2.5' };
+  assert.equal(isVerifiedNativeCapability(ten, 10, { allowCarrierRewrite: true }), false);
 });
 
 test('upstream concat evidence is admitted only with an explicit opt-in', () => {
@@ -171,8 +211,8 @@ test('archive and independently measured duration are both necessary', () => {
   }
   assert.equal(validateArchivedVideo(archive, 10, 30), 'duration_mismatch');
   assert.equal(validateArchivedVideo(archive, 29.97, 30), null);
-  assert.equal(validateArchivedVideo(archive, 19.2, 20), null);
-  assert.equal(validateArchivedVideo(archive, 10, 10), null);
+  assert.equal(validateArchivedVideo(archive, 29.2, 30), null);
+  assert.equal(validateArchivedVideo(archive, 15, 15), null);
 });
 
 test('terminal statuses never qualify for a delayed state write', () => {

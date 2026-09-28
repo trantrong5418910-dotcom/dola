@@ -282,12 +282,13 @@ ok('乱写票据 → 401，不是 500', r.status === 401, `${r.status}`);
 console.log('\n⑤ 提交参数校验（这些分支必须在建任务/扣积分/出站之前挡住）');
 const before = outbound.length;
 const cases = [
-  ['缺 prompt', { seconds: 10 }, 400, 'MISSING_PROMPT'],
+  ['缺 prompt', { seconds: 30 }, 400, 'MISSING_PROMPT'],
   ['seconds 非法（12）', { prompt: 'case-seconds', seconds: 12 }, 400, 'invalid_parameter'],
-  ['model 不认识', { prompt: 'case-model', seconds: 10, model: 'seedance_v9' }, 400, 'UNSUPPORTED_MODEL'],
+  ['model 不认识', { prompt: 'case-model', seconds: 30, model: 'seedance_v9' }, 400, 'UNSUPPORTED_MODEL'],
   ['model 与 seconds 组合做不到（v2.5 + 15 秒）', { prompt: 'case-combo', seconds: 15, model: 'seedance_v2.5' }, 400, 'UNSUPPORTED_MODEL_SECONDS'],
-  ['传了 audio（我们没这个能力）', { prompt: 'case-audio', seconds: 10, audio: 'x' }, 400, 'UNSUPPORTED_PARAMETER'],
-  ['size 宽高为 0', { prompt: 'case-size', seconds: 10, size: '0x0' }, 400, 'invalid_parameter'],
+  ['传了 audio（我们没这个能力）', { prompt: 'case-audio', seconds: 30, audio: 'x' }, 400, 'UNSUPPORTED_PARAMETER'],
+  ['调用方不能覆盖计价', { prompt: 'case-price', seconds: 30, points: 1 }, 400, 'UNSUPPORTED_PARAMETER'],
+  ['size 宽高为 0', { prompt: 'case-size', seconds: 30, size: '0x0' }, 400, 'invalid_parameter'],
 ];
 for (const [name, body, wantStatus, wantCode] of cases) {
   const rr = await req('POST', '/v1/videos', { token: TK_A, body });
@@ -295,19 +296,19 @@ for (const [name, body, wantStatus, wantCode] of cases) {
     rr.status === wantStatus && (rr.data?.error?.code === wantCode || (wantCode === 'invalid_parameter' && rr.data?.error?.code === 'invalid_parameter')),
     `${rr.status} ${JSON.stringify(rr.data)}`);
 }
-ok('上述 6 次非法提交**一次出站都没发**', outbound.length === before, `多了 ${outbound.length - before} 次`);
+ok('上述 7 次非法提交**一次出站都没发**', outbound.length === before, `多了 ${outbound.length - before} 次`);
 
 const pointsBefore = tk('dv_AAAAAA').points;
 ok('非法提交后积分一分没动', pointsBefore === 20, `实际 ${pointsBefore}`);
 
-r = await req('POST', '/v1/videos', { token: TK_Z, body: { prompt: 'case-poor', seconds: 10 } });
+r = await req('POST', '/v1/videos', { token: TK_Z, body: { prompt: 'case-poor', seconds: 30 } });
 ok('零积分令牌 → 402（且不建任务）', r.status === 402, `${r.status} ${JSON.stringify(r.data)}`);
-r = await req('POST', '/v1/videos', { token: TK_D, body: { prompt: 'case-disabled', seconds: 10 } });
+r = await req('POST', '/v1/videos', { token: TK_D, body: { prompt: 'case-disabled', seconds: 30 } });
 ok('停用令牌 → 403', r.status === 403, `${r.status}`);
 
 // ═════════════════════════ ⑥ 走到真实链路（账号池为空 = 隔离环境的终点） ═════════════════════════
 console.log('\n⑥ 走到真实建任务链路（账号池为空）');
-r = await req('POST', '/v1/videos', { token: TK_A, body: { prompt: 'case-nopool', seconds: 10 } });
+r = await req('POST', '/v1/videos', { token: TK_A, body: { prompt: 'case-nopool', seconds: 30 } });
 ok('池里没可用账号 → 409（不是 500）', r.status === 409, `${r.status} ${JSON.stringify(r.data).slice(0, 160)}`);
 ok('409 的 code 不是参考图相关（说明走到了账号选择这一步）',
   r.data?.error?.code !== 'REFERENCE_IMAGES_NOT_READY', JSON.stringify(r.data?.error?.code));
@@ -354,7 +355,7 @@ function multipart(fields, files) {
 }
 
 // ⑦-1 合法 JPEG → 必须通过 validateReferenceImages，然后被账号/参考图池挡下
-let mp = multipart({ prompt: 'case-mp-ok', seconds: '10', auto_start: 'true' }, [
+let mp = multipart({ prompt: 'case-mp-ok', seconds: '30', auto_start: 'true' }, [
   { field: 'input_reference', filename: '参考图测试.jpg', type: 'image/jpeg', data: tinyJpeg({ width: 2559, height: 5 }) },
 ]);
 r = await req('POST', '/v1/videos', { token: TK_A, rawBody: mp.body, contentType: mp.contentType });
@@ -376,7 +377,7 @@ ok('★ 中文文件名没被搞成乱码（头部按 UTF-8 解）',
 // ⑦-3 JSON 里的 images（base64）走同一条校验
 r = await req('POST', '/v1/videos', {
   token: TK_A,
-  body: { prompt: 'case-json-img', seconds: 10, images: [{ dataBase64: tinyJpeg({ width: 1920, height: 1080 }).toString('base64'), name: 'a.jpg' }] },
+  body: { prompt: 'case-json-img', seconds: 30, images: [{ dataBase64: tinyJpeg({ width: 1920, height: 1080 }).toString('base64'), name: 'a.jpg' }] },
 });
 ok('JSON base64 参考图走同一套校验 → REFERENCE_IMAGES_NOT_READY',
   r.status === 409 && r.data?.error?.code === 'REFERENCE_IMAGES_NOT_READY', `${r.status} ${JSON.stringify(r.data).slice(0, 160)}`);
@@ -419,7 +420,7 @@ ok('取消别人的任务 → 404', r.status === 404, `${r.status}`);
 console.log('\n⑧-b auto_start=false 的生命周期（真实启动 + 失败自动退款）');
 insToken.run('生命周期令牌', 'dv_' + 'C'.repeat(32), 'dv_CCCCCC', 19, 'active', null, '', null, now(), now());
 const TK_C = tk('dv_CCCCCC');
-const lifeId = seedVideo(null, '内部账号标签-不该外泄', '生命周期任务', '16:9', 10, 'queued', '排队中',
+const lifeId = seedVideo(null, '内部账号标签-不该外泄', '生命周期任务', '16:9', 30, 'queued', '排队中',
   null, null, '', 0, null, null, null, null, '',
   TK_C.id, 'dv_CCCCCC', '', now(), now(), now());
 // 种子：这笔扣费必须真实存在且 token_id 对得上，否则 startVideoTask 会拒绝启动（这是它的护栏）

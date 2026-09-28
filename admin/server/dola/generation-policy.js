@@ -2,7 +2,16 @@
 import { quotaObservation } from './account-observations.js';
 import { DURATION_SOURCE } from './generation-duration.js';
 const badRequest = message => Object.assign(new Error(message), { status: 400 });
-export const SUPPORTED_VIDEO_SECONDS = Object.freeze([10, 15, 20, 30]);
+// ★ 档位精简（2026-09-27）：10 秒与 20 秒已下线，只保留 30 秒（主档位，2 额度）
+// 与 15 秒（专家模式 / Seedance 2.0）。10/20 在网关入口被 `DURATION_RETIRED` 拒绝，
+// 不做静默降级；历史任务与账本不受影响，所以历史库里仍可能出现 10/20 的值。
+export const SUPPORTED_VIDEO_SECONDS = Object.freeze([15, 30]);
+
+/** 已下线的档位。保留常量是为了让「拒绝」有唯一措辞来源，别在各处散写魔数。 */
+export const RETIRED_VIDEO_SECONDS = Object.freeze([10, 20]);
+
+/** 调用方完全不传 seconds 时的默认档位：30 秒（主档位，2 额度）。 */
+export const DEFAULT_VIDEO_SECONDS = 30;
 
 /** Only a fresh explicit receipt may prove zero quota. Unknown/stale is not zero;
  * positive quota is not proof that it covers a particular model's price.
@@ -14,25 +23,30 @@ export function hasConfirmedZeroVideoQuota(account, at = new Date().toISOString(
 
 function duration(value) {
   if (!['number', 'string'].includes(typeof value) || String(value).trim() === '') {
-    throw badRequest('seconds/forceSeconds 必须是 10、15、20 或 30');
+    throw badRequest('seconds/forceSeconds 必须是 15 或 30');
   }
   const result = Number(value);
-  if (!SUPPORTED_VIDEO_SECONDS.includes(result)) throw badRequest('seconds/forceSeconds 仅支持 10、15、20 或 30');
+  if (RETIRED_VIDEO_SECONDS.includes(result)) {
+    throw Object.assign(badRequest(`seconds=${result} 档位已下线，仅支持 15 秒（专家模式）或 30 秒`), { code: 'DURATION_RETIRED' });
+  }
+  if (!SUPPORTED_VIDEO_SECONDS.includes(result)) throw badRequest('seconds/forceSeconds 仅支持 15 或 30');
   return result;
 }
 
 export function normalizeVideoDuration({ seconds, forceSeconds = null } = {}) {
   const forced = forceSeconds == null ? null : duration(forceSeconds);
-  const expected = duration(seconds ?? forced ?? 10);
+  // 默认档位 30（档位精简后的主档位）。原来是 10 —— 那个默认值会穿过这里直达上游，
+  // 网关入口改了默认值但这里没改的话，"不传 seconds"的调用方仍会拿到已下线的 10 秒。
+  const expected = duration(seconds ?? forced ?? DEFAULT_VIDEO_SECONDS);
   if (forced != null && forced !== expected) throw badRequest('seconds 与 forceSeconds 必须一致');
   return {
     seconds: expected,
-    // 15s is the native Seedance 2.0 expert path; 20s and 30s are native
-    // Seedance 2.5 paths. Keep the explicit 10s compatibility adapter
-    // behavior, while carrying an effective target for native paths.
-    forceSeconds: expected >= 15 ? (forced ?? expected) : forced,
+    // 15 秒 = 原生 Seedance 2.0 专家路径；30 秒 = Seedance 2.5。档位精简后只剩这两档，
+    // 两者都要把时长显式注入请求（没有"不注入、用页面默认"的兼容档了），
+    // 所以 forceSeconds 一律带值，不再保留 10 秒的 null 兼容分支。
+    forceSeconds: forced ?? expected,
     requireSessionRecheck: true,
-    targetModel: expected === 15 ? 'seedance_v2.0' : expected >= 20 ? 'seedance_v2.5' : null,
+    targetModel: expected === 15 ? 'seedance_v2.0' : 'seedance_v2.5',
   };
 }
 
@@ -74,15 +88,29 @@ export function isUpstreamConcatCapability(result, seconds) {
 }
 
 /**
- * A page probe is admission evidence only when it proves the requested native
- * duration itself. A shorter UI carrier plus a request rewrite is useful
- * diagnostics, but it is not proof that the upstream accepts the target
- * duration and must not create/charge a task.
+ * A page probe is admission evidence when it proves either the requested native
+ * duration or the explicitly enabled carrier rewrite path. A shorter UI carrier
+ * is accepted only with the rewrite policy enabled; the archived media duration
+ * remains the final delivery check.
  *
  * `allowUpstreamConcat` 单独开关：上游合成档位默认**不放行**，
  * 因为它改变的是"我们愿意把什么算作 30 秒任务"这个口径，属于要显式拍板的事。
+ *
+ * `allowCarrierRewrite` 是 30 秒专用的第二个口径开关，默认 `false` = 仍要求原生目标档位；
+ * 打开后允许页面上的更短载体（包括 10 秒）在提交阶段改写为 30 秒。
+ *
+ * ⚠️ 为什么需要它（2026-09-25 实测）：服务端 `video-duration` 控件的 `option_list`
+ *    对免费号只下发 `5`/`10`，三个模型都一样 —— **15s 在配置层面不存在**。
+ *    于是 30 秒在整条链上永久不可达：探针选不到 15s 载体 → `native_30s_state`
+ *    恒为 `unknown` → 三处硬门禁（选号 / 只读预检 / 路由诊断）全部要求
+ *    `available` → 永远接不住 30 秒请求，与"上游到底收不收 30 秒"无关。
+ *    打开后改为「任何**真实存在于该账号页面**的更短档位都能当载体」，
+ *    真正的验收口子仍然是归档阶段的 ffprobe 时长校验（不达标 → `fail()` + 自动退款）。
  */
-export function isVerifiedNativeCapability(result, seconds, { allowUpstreamConcat = false } = {}) {
+export function isVerifiedNativeCapability(result, seconds, {
+  allowUpstreamConcat = false,
+  allowCarrierRewrite = false,
+} = {}) {
   const target = Number(seconds);
   if (!SUPPORTED_VIDEO_SECONDS.includes(target) || !result || result.ok !== true
       || result.state !== 'available' || result.seconds !== target) return false;
@@ -90,10 +118,25 @@ export function isVerifiedNativeCapability(result, seconds, { allowUpstreamConca
   if (result.model !== model) return false;
   // 上游合成档位：整条片子由上游合成后交付，本地不拼接。
   if (isUpstreamConcatCapability(result, target)) return allowUpstreamConcat;
-  // 20/30 秒走改写路径：20s 载体 10s，30s 载体 15s（2 额度档），rewriteCarrier=true 即为有效
-  if (target === 20 || target === 30) {
-    const expectCarrier = target === 30 ? 15 : 10;
-    return result.uiSeconds === expectCarrier && result.native === false && result.rewriteCarrier === true;
+  // A genuine native target is stronger evidence than any shorter carrier, but
+  // the shape alone is not enough: only the duration probe's explicit
+  // `native_single` source proves that the page exposed a one-shot target
+  // option.  This keeps a carrier/concat result from being promoted to native
+  // capability merely because a caller filled in matching UI fields.
+  if (result.uiSeconds === target && result.native === true && result.rewriteCarrier === false) {
+    return result.source === DURATION_SOURCE.NATIVE_SINGLE;
+  }
+  // 30 秒：默认仍是历史口径（载体必须是 15s）；显式放行后接受任何真实存在的更短载体。
+  if (target === 30) {
+    if (!allowCarrierRewrite) {
+      return result.uiSeconds === 15 && result.native === false && result.rewriteCarrier === true;
+    }
+    // 载体必须是**真实档位**：数值类型、正整数、且严格短于目标。
+    // 不认字符串 '10' —— 真实证据只由 selectNativeVideoDuration() 产出（恒为 number），
+    // 一个字符串只能来自被篡改或手写的探测结果，没必要为它放宽。
+    return result.native === false && result.rewriteCarrier === true
+      && typeof result.uiSeconds === 'number' && Number.isInteger(result.uiSeconds)
+      && result.uiSeconds > 0 && result.uiSeconds < target;
   }
   return result.uiSeconds === target && result.native === true && result.rewriteCarrier === false;
 }

@@ -83,14 +83,17 @@ let gatewayHealth = null;
 
 /** 生成要不要按用户区分令牌 */
 const PER_USER_PROVIDER = PROVIDER === 'admin-dola';
-const SUPPORTED_SECONDS = Object.freeze(PER_USER_PROVIDER ? [10, 15, 20, 30] : [FIXED_SECONDS]);
+// 档位精简（2026-09-27）：10 秒与 20 秒已下线，只剩 15（专家模式）与 30（主档位）。
+const SUPPORTED_SECONDS = Object.freeze(PER_USER_PROVIDER ? [15, 30] : [FIXED_SECONDS]);
 const EXPERT_SECONDS = Object.freeze(PER_USER_PROVIDER ? [15] : []);
-// admin-dola 下 15/30 秒都要后台有「已确认原生能力 + 代理隔离」的账号才放行
-// （expertSecondsReady / fixedSecondsReady）。两者都没就绪时，默认 30 秒会让
-// 「创建视频任务」在创建前就被 409 挡掉 —— 工作台一打开就是不能提交的状态。
-// 10 秒是唯一不需要额外能力闸门的档位，所以作为该 provider 的默认值。
+/** 已下线档位：只用于给出更明确的报错（DURATION_RETIRED），不做任何静默降级。 */
+const RETIRED_SECONDS = Object.freeze([10, 20]);
+// 默认值仍是「能力闸门最少拦的那个」：15/30 秒都要后台有「已确认原生能力 + 代理隔离」
+// 的账号（expertSecondsReady / fixedSecondsReady）才放行。10 秒原本是唯一不需要额外
+// 闸门的档位，它下线后默认档位改成 30 秒 —— 30 秒是精简后的主档位（2 额度），
+// 宁可让按钮在号池没就绪时置灰，也不要退回一个已下线的档位。
 // 单租户 provider 只支持 FIXED_SECONDS，保持原行为不变。
-const DEFAULT_SECONDS = PER_USER_PROVIDER ? 10 : FIXED_SECONDS;
+const DEFAULT_SECONDS = PER_USER_PROVIDER ? 30 : FIXED_SECONDS;
 
 /** key = 用户令牌；值 = 已绑定该令牌的 VideoClient（须早于 syncAdminDolaCapabilityFlags） */
 const userClients = new Map();
@@ -468,6 +471,16 @@ const server = http.createServer(async (req, res) => {
       // 15 秒+标准模式应报 EXPERT_MODE_REQUIRED 而不是 UNSUPPORTED_DURATION。
       if (seconds === 15 && mode !== 'expert') {
         json(res, 400, { ok: false, code: 'EXPERT_MODE_REQUIRED', message: '15 秒视频只能在专家模式提交，任务未提交，也未扣积分' });
+        return;
+      }
+      // 已下线档位单独一个码：与"从来没这档"区分开，前端/日志才好分辨
+      // 「用户点了旧入口」和「传了个野值」。
+      if (RETIRED_SECONDS.includes(seconds)) {
+        json(res, 400, {
+          ok: false,
+          code: 'DURATION_RETIRED',
+          message: `${seconds} 秒档位已下线，当前工作台仅支持 15 秒（专家模式）或 30 秒；任务未提交，也未扣积分`,
+        });
         return;
       }
       if (!Number.isInteger(seconds) || !SUPPORTED_SECONDS.includes(seconds)) {

@@ -11,6 +11,9 @@
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import os from 'node:os';
+import { accessSync, constants as fsConstants } from 'node:fs';
+import { execFile } from 'node:child_process';
 import { HttpClient } from '../core/http.js';
 import { normalizeTask, extractTaskId, Status } from '../core/task.js';
 import { AuthError, BusinessError, VideoProviderError } from '../core/errors.js';
@@ -30,6 +33,96 @@ const SOF_MARKERS = new Set([
   0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7,
   0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf,
 ]);
+
+// ---------------------------------------------------------------- GIF → PNG 首帧
+// ★ 2026-09-28 同步（与 admin/server/dola/reference-images.js 同一口径）：
+//   原来一张 GIF 会让整批 9 张参考图全部被拒（校验逐张串行、遇错即抛）。
+//   现在 GIF 用系统 ffmpeg 抽首帧转 PNG 再走正常校验，不再连坐其它 8 张。
+//   ⚠️ 本文件有意保持独立（见文件头），所以这里**复制**一份实现，而不是 import admin 那份。
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+function sniffImageFormat(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 12) return 'unknown';
+  if (buf.subarray(0, 8).equals(PNG_MAGIC)) return 'png';
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpeg';
+  const six = buf.subarray(0, 6).toString('latin1');
+  if (six === 'GIF87a' || six === 'GIF89a') return 'gif';
+  if (buf.subarray(0, 4).toString('latin1') === 'RIFF'
+    && buf.subarray(8, 12).toString('latin1') === 'WEBP') return 'webp';
+  if (buf.subarray(4, 8).toString('latin1') === 'ftyp') {
+    const brand = buf.subarray(8, 12).toString('latin1').toLowerCase();
+    if (brand.startsWith('avif') || brand.startsWith('avis')) return 'avif';
+    if (brand.startsWith('heic') || brand.startsWith('heix')
+      || brand.startsWith('hevc') || brand.startsWith('mif1')) return 'heic';
+  }
+  if (buf[0] === 0x42 && buf[1] === 0x4d) return 'bmp';
+  return 'unknown';
+}
+
+const FORMAT_HINT = Object.freeze({
+  webp: '暂不支持 WEBP 格式，请先转成 PNG 或 JPG 再上传',
+  avif: '暂不支持 AVIF 格式，请先转成 PNG 或 JPG 再上传',
+  heic: '暂不支持 HEIC 格式（iPhone 相册默认格式），请在相册里导出成 JPG 再上传',
+  bmp: '暂不支持 BMP 格式，请先转成 PNG 再上传',
+  gif: 'GIF 未被预处理（内部错误），请重新上传',
+  unknown: '这不是有效的图片文件，请上传 JPG 或 PNG',
+});
+
+let ffmpegResolved = false;
+let ffmpegBin = null;
+
+function resolveFfmpeg() {
+  if (ffmpegResolved) return ffmpegBin;
+  ffmpegResolved = true;
+  const candidates = [
+    process.env.FFMPEG_PATH,
+    '/usr/bin/ffmpeg',
+    '/usr/local/bin/ffmpeg',
+    '/opt/homebrew/bin/ffmpeg',
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    try { accessSync(candidate, fsConstants.X_OK); ffmpegBin = candidate; break; } catch { /* 下一个 */ }
+  }
+  return ffmpegBin;
+}
+
+function execFileP(file, args, options) {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, options, (err, stdout, stderr) => {
+      if (err) reject(Object.assign(err, { stderr: String(stderr || '') }));
+      else resolve({ stdout, stderr });
+    });
+  });
+}
+
+function swapExtension(name, ext) {
+  const base = path.basename(String(name || '').replace(/[/\\]/g, ''));
+  if (!base) return `reference${ext}`;
+  return base.replace(/\.[A-Za-z0-9]+$/, '') + ext;
+}
+
+async function gifFirstFrameToPng(buf, name = 'reference.gif') {
+  const bin = resolveFfmpeg();
+  if (!bin) {
+    throw new VideoProviderError(`参考图「${name}」是 GIF 动图，但服务器上没有可用的 ffmpeg，无法自动转成静态图。请先把它转成 PNG 或 JPG 再上传`);
+  }
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'refgif-'));
+  const src = path.join(dir, 'in.gif');
+  const dst = path.join(dir, 'out.png');
+  try {
+    await fs.writeFile(src, buf);
+    await execFileP(bin, ['-hide_banner', '-loglevel', 'error', '-y', '-i', src, '-frames:v', '1', dst], { timeout: 15_000 });
+    const png = await fs.readFile(dst);
+    if (!png.length) throw new Error('ffmpeg 输出为空');
+    return inspectImage(png, swapExtension(name, '.png'));
+  } catch (e) {
+    const raw = String((e && e.stderr) || (e && e.message) || e);
+    const detail = raw.replace(/\[[^\]]{0,40}@\s*0x[0-9a-f]+\]\s*/gi, '').replace(/\s+/g, ' ').trim().slice(0, 90);
+    throw new VideoProviderError(`参考图「${name}」是 GIF 动图，但首帧提取失败${detail ? `（${detail}）` : ''}。这可能是损坏的动图，建议转成 PNG 或 JPG 后重新上传`);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
 
 function jsonOrNull(text) {
   if (!text) return null;
@@ -79,11 +172,12 @@ function imageDimensions(buf, mime) {
 }
 
 function inspectImage(buf, name) {
-  const isPng = buf.length >= 24
-    && buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
-  const isJpeg = buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
-  const mime = isPng ? 'image/png' : isJpeg ? 'image/jpeg' : null;
-  if (!mime) throw new VideoProviderError(`参考图不是有效的 JPG/JPEG/PNG：${name || '未命名文件'}`);
+  const format = sniffImageFormat(buf);
+  const mime = format === 'png' ? 'image/png' : format === 'jpeg' ? 'image/jpeg' : null;
+  if (!mime) {
+    const hint = FORMAT_HINT[format] || FORMAT_HINT.unknown;
+    throw new VideoProviderError(`参考图「${name || '未命名文件'}」无法使用：${hint}`);
+  }
 
   const dimensions = imageDimensions(buf, mime);
   if (!dimensions || dimensions.width < 1 || dimensions.height < 1) {
@@ -122,6 +216,9 @@ async function readImage(input, index) {
     name = input.name || `image-${index}.png`;
   } else {
     throw new VideoProviderError(`第 ${index + 1} 张参考图格式不受支持`);
+  }
+  if (sniffImageFormat(buf) === 'gif') {
+    return gifFirstFrameToPng(buf, name);
   }
   return inspectImage(buf, name);
 }

@@ -1,4 +1,6 @@
 import { classifyFailure, FAILURE_REASONS } from './generation-analytics.js';
+import { isVerifiedNativeCapability } from './generation-policy.js';
+import { DURATION_SOURCE } from './generation-duration.js';
 
 export const GENERATION_GUARD_SCHEMA = `CREATE TABLE IF NOT EXISTS dola_generation_guards (
   account_id INTEGER NOT NULL, scope TEXT NOT NULL, reason_code TEXT NOT NULL,
@@ -22,14 +24,76 @@ export function failureScope(row) {
   //   于是 failureScope 返回 null、recordGenerationGuard 直接返回 false、**一个防护都不建** ——
   //   这个号就永远留在待选池里，每轮再白烧最多 3 分钟。这是线上真实故障，不是理论问题。
   if (code === 'login') return 'login';
+  // ⚠️ 这里**故意保留 10/20**：本集合只用于「历史 capability 防护」的作用域命名与解锁判定，
+  // 不是新提交的准入白名单。历史库里存在 seconds=10/20 的防护记录，把它们排除在集合外
+  // 会让 clearGenerationGuard 对它们返回 false —— 那就是本项目吃过的"永久锁"。
+  // 新提交准入由 SUPPORTED_VIDEO_SECONDS 把关（2026-09-27 档位精简）。
   return code === 'capability' && [10, 15, 20, 30].includes(Number(row.seconds)) ? `duration:${Number(row.seconds)}` : null;
 }
 
+/**
+ * 只有这两种作用域有对应的**账号级能力字段**（见 `capabilityColumn`）：
+ * 探测结果会写回 `native_<n>s_state/_at`，因此"更晚的探针"才有东西可比。
+ *
+ * ⚠️ 10 秒 / 20 秒**故意不在此表内**：库和账号表里根本没有 `native_10s_*` /
+ *    `native_20s_*` 字段（`capabilityColumn` 对它们返回 null），无从取得证据，
+ *    所以它们的防护不会被探针自动证伪 —— 这也是改动前的行为。
+ */
+const GUARD_SUPERSEDE_COLUMN = Object.freeze({
+  'duration:15': 'native_15s',
+  'duration:30': 'native_30s',
+});
+
+/**
+ * 更晚的只读探针是否已经证伪这条防护？
+ *
+ * ── 复用的是本文件**已经写明**的原则，不是新规矩 ────────────────────────
+ * `recordGenerationGuard` 里有一句：
+ *     // A newer verified probe wins over an old failed callback / historical import.
+ * 但那条保护原先**只在写入时**生效。读取时（`hasGenerationGuard`）没有对应实现，
+ * 于是下面这个**真实发生过的**序列会把账号永久压死：
+ *
+ *     #424  09:12:21  30 秒任务失败（模型控件未加载完）→ 建 `duration:30` 防护
+ *     #424  10:32:29  只读探针确认「10 秒载体可用」→ native_30s_state='available'
+ *     之后每次选号：防护仍在 → 30 秒永远 0 个可选账号
+ *
+ * 即使 `native_30s_note` 里明明白白写着"已确认…可用"，`hasGenerationGuard`
+ * 也看不见 —— 这就是本项目反复吃过的「永久锁」（见 `submission-journal.js`
+ * 的 uncertain、以及 test/generation-login-guard.mjs ③ 的注释）。
+ *
+ * ── 判据（刻意收窄）────────────────────────────────────────────────
+ * 只有同时满足才认定"已被证伪"：
+ *   · 该作用域有账号级能力字段（上表）；
+ *   · 字段状态是 `available`（不是 unknown —— unknown 是"没确认"，不是证据）；
+ *   · 时间戳**严格晚于**该次失败（同刻或更早都不算，避免同批写入自己把自己解开）。
+ *
+ * @param {{guard_scope:string, guard_blocked_at:string, [k:string]:any}} row
+ *   一行 `guard_*` 前缀的防护字段 + 账号的 `native_15s_state/_at`、`native_30s_state/_at`。
+ */
+export function guardSupersededByProbe(row) {
+  const prefix = GUARD_SUPERSEDE_COLUMN[String(row?.guard_scope || '')];
+  if (!prefix) return false;
+  const state = row[`${prefix}_state`];
+  const at = String(row[`${prefix}_at`] ?? '');
+  const blockedAt = String(row?.guard_blocked_at ?? '');
+  return state === 'available' && at !== '' && blockedAt !== '' && at > blockedAt;
+}
+
+/**
+ * 这个账号在 `seconds` 这个时长上是否仍被防护拦着？
+ *
+ * 与 `listGenerationGuards`（后台展示）用**同一个** `guardSupersededByProbe`：
+ * 两处各判一遍的话，页面会显示"已拦截"而调度认为"可派号"，是最难查的一类不一致。
+ */
 export function hasGenerationGuard(db, accountId, seconds, refs = false) {
-  return Boolean(db.prepare(`SELECT 1 FROM dola_generation_guards
-    WHERE account_id=? AND cleared_at IS NULL
-      AND (scope=? OR scope='login' OR (?=1 AND scope='reference-images')) LIMIT 1`)
-    .get(accountId, `duration:${Number(seconds)}`, refs ? 1 : 0));
+  const rows = db.prepare(`SELECT g.scope AS guard_scope, g.blocked_at AS guard_blocked_at,
+      a.native_15s_state, a.native_15s_at, a.native_30s_state, a.native_30s_at
+    FROM dola_generation_guards g JOIN dola_accounts a ON a.id = g.account_id
+    WHERE g.account_id=? AND g.cleared_at IS NULL
+      AND (g.scope=? OR g.scope='login' OR (?=1 AND g.scope='reference-images'))`)
+    .all(accountId, `duration:${Number(seconds)}`, refs ? 1 : 0);
+  // 可能同时命中多条（例如 duration:30 + login）；任一条仍然有效就算被拦。
+  return rows.some(row => !guardSupersededByProbe(row));
 }
 
 function capabilityColumn(scope) {
@@ -102,15 +166,48 @@ export function seedHistoricalGenerationGuards(db) {
 }
 
 // A successful read-only probe is the only UI unlock path; it never buys quota or submits a prompt.
-export function clearGenerationGuard(db, guard, accountSnapshot, result, at = new Date().toISOString()) {
+/**
+ * 只读复核通过 → 解除防护。
+ *
+ * ── `allowCarrierRewrite` 为什么必须传进来（2026-09-26 线上事实）──────────
+ * 30 秒的**页面 UI 里没有 30 秒档位**：服务端 `video-duration` 的 `option_list`
+ * 实测只下发 `5`/`10`（三个模型重看三次一致）。所以 30 秒永远拿不到
+ * `uiSeconds===30 && native===true` 这种"精确目标证据"——它天生只能靠
+ * 「短档位载体 + 请求改写」跑通。
+ *
+ * 而这里原先**硬编码**了那个精确条件，于是：
+ *     `duration:30` 的解锁分支永远返回 false ⇒ 一条**永久锁**。
+ * 账号 #424 正是这样被 09:12 的一次瞬时失败（模型控件未加载完）锁住的，
+ * 尽管 10:32 的只读探针已经把 `native_30s_state` 写成了 `available`、
+ * 备注写着"已确认页面 10 秒载体可用"。
+ *
+ * 生成路径在 2026-09-26 已经接受载体口径（`isVerifiedNativeCapability` +
+ * `allowCarrierRewrite`，见 generator.js 与 routes/dola.js 的 probeNativeCapability），
+ * **解锁路径漏改** —— 正是 routes/dola.js 注释里警告过的
+ * 「探针把号记成 available、生成时却选不到档位」的反向版本：
+ * 「生成已经认了，解锁却不认」。
+ *
+ * ⚠️ 保守起见只对 **30 秒**放开，且只在开关打开时：
+ *    默认（`allowCarrierRewrite=false`）逐字保留历史口径，
+ *    test/generation-analytics.mjs 的「10s rewrite carrier cannot clear a prior 30s
+ *    capability failure」断言过这一点。
+ *    10/15 秒本来就是原生档位、走精确口径，行为不变；
+ *    20 秒与上游合成档位存在**同一类**漏改，但线上都还未触发（prod 无对应防护），
+ *    留作后续单独处理，不在本次扩大改动面。
+ */
+export function clearGenerationGuard(db, guard, accountSnapshot, result, at = new Date().toISOString(), {
+  allowUpstreamConcat = false, allowCarrierRewrite = false,
+} = {}) {
   if (!result?.ok || result.state !== 'available') return false;
   const duration = /^duration:(10|15|20|30)$/.exec(guard.scope);
   if (duration) {
     const seconds = Number(duration[1]);
-    // A selectable 10s carrier is not new evidence that a rejected 20/30s
-    // capability works. Nor can a generic available flag prove the target model.
-    if (result.seconds !== seconds || result.uiSeconds !== seconds || result.native !== true
+    if (seconds === 30 && allowCarrierRewrite === true) {
+      // 与生成路径同源，读同一对开关、同一个判定函数。
+      if (!isVerifiedNativeCapability(result, seconds, { allowUpstreamConcat, allowCarrierRewrite })) return false;
+    } else if (result.seconds !== seconds || result.uiSeconds !== seconds || result.native !== true
       || result.rewriteCarrier !== false
+      || (seconds === 30 && result.source !== DURATION_SOURCE.NATIVE_SINGLE)
       || result.model !== (seconds === 15 ? 'seedance_v2.0' : 'seedance_v2.5')) return false;
   } else if (guard.scope === 'login') {
     // ★ 「登录未确认」的解除凭据：只读探针**真的拿到了创作输入框**并认出了一个时长控件。
@@ -122,6 +219,7 @@ export function clearGenerationGuard(db, guard, accountSnapshot, result, at = ne
     // ⚠️ 这一条分支是**必须存在**的：没有它 clearGenerationGuard 会对未知作用域直接返回 false，
     //    于是 login 防护永远解不开 —— 那就是本项目已经吃过一次的"永久锁"（见 submission-journal.js
     //    里 uncertain「一旦写入就没有任何代码路径能离开它」）。test/generation-login-guard.mjs 专门断言可解除。
+    // 同上：解锁判定要保持能覆盖历史 10/20 记录，不能跟着档位精简一起收紧。
     const secs = Number(result.seconds), ui = Number(result.uiSeconds);
     if (![10, 15, 20, 30].includes(secs) || ![10, 15, 20, 30].includes(ui)) return false;
     if (result.native !== true && result.rewriteCarrier !== true) return false;
@@ -142,8 +240,15 @@ export function clearGenerationGuard(db, guard, accountSnapshot, result, at = ne
 }
 
 export function listGenerationGuards(db) {
-  return db.prepare(`SELECT g.* FROM dola_generation_guards g JOIN dola_accounts a ON a.id=g.account_id
-    WHERE g.cleared_at IS NULL ORDER BY g.blocked_at DESC`).all().map(row => ({
+  return db.prepare(`SELECT g.*,
+      g.scope AS guard_scope, g.blocked_at AS guard_blocked_at,
+      a.native_15s_state, a.native_15s_at, a.native_30s_state, a.native_30s_at
+    FROM dola_generation_guards g JOIN dola_accounts a ON a.id=g.account_id
+    WHERE g.cleared_at IS NULL ORDER BY g.blocked_at DESC`).all()
+    // 已被更晚的只读探针证伪的防护不出现在列表里 —— 与 hasGenerationGuard 同一判据，
+    // 否则页面会显示"已拦截"而调度认为"可派号"。
+    .filter(row => !guardSupersededByProbe(row))
+    .map(row => ({
     ...row,
     // 直接按库里存下来的 reason_code 取文案，而不是从别处再猜一句话 ——
     // 猜的那版会把 login 防护显示成"能力探测未完成"，运维看了不知道该修登录还是修控件。

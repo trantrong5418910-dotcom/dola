@@ -69,7 +69,7 @@ export async function startFixture({ gate = false, imagesGate = false, port = 0,
         if (url.pathname === '/api/gateway/health') {
           json(res, 200, {
             pointsPerTask: 1,
-            supportedSeconds: [10, 15, 20, 30],
+            supportedSeconds: [15, 30],
             expertSeconds: [15],
             expertSecondsReady: gate,
             fixedSeconds: 30,
@@ -91,7 +91,7 @@ export async function startFixture({ gate = false, imagesGate = false, port = 0,
           state.creates++;
           state.lastCreate = input;
           if (state.createDelayMs) await new Promise((resolve) => setTimeout(resolve, state.createDelayMs));
-          if (![10, 15, 20, 30].includes(input.seconds) || input.forceSeconds !== input.seconds
+          if (![15, 30].includes(input.seconds) || input.forceSeconds !== input.seconds
               || !['standard', 'expert'].includes(input.mode || 'standard')
               || (input.seconds === 15 && input.mode !== 'expert')) { json(res, 400, { message: 'fixture requires a supported native duration and mode' }); return; }
           const id = String(state.creates);

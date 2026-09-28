@@ -1,6 +1,9 @@
 const PHASES = new Set([
   'launch', 'context', 'navigate', 'bootstrap', 'entry', 'model', 'duration', 'verified',
 ]);
+// ⚠️ 这里**故意保留 10/20**：本集合只用于净化「历史诊断记录」的展示字段，不是提交白名单。
+// 档位精简（2026-09-27）下线 10/20 后，历史任务的诊断仍然带 10/20，把它们冲成 null
+// 会让历史失败排查失去秒数线索。新提交的准入由 SUPPORTED_VIDEO_SECONDS 把关。
 const SECONDS = new Set([10, 15, 20, 30]);
 const MAX_COUNT = 9999;
 const MAX_TIME_MS = 600000;

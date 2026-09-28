@@ -3,7 +3,8 @@
  * Everything needed by the serialized function lives inside it. No I/O at install.
  * targetModel is an optional exact-match filter, NEVER a model replacement.
  * rewrite=false keeps the adapter observation-only; it never changes the body.
- * Only numeric seconds 10/15/20/30 are accepted; repeated installs update the settings.
+ * Only numeric seconds 15/30 are accepted (10s and 20s retired 2026-09-27);
+ * repeated installs update the settings.
  * Limits: 1 MiB input, depth 8, 4096 values, 2 MiB cumulative decoded JSON,
  * 100 capture entries. Unsupported/over-limit bodies pass through unchanged.
  */
@@ -11,10 +12,18 @@
 /**
  * Node-side Fangyue rewrite: set ability_param.duration on chat completion bodies.
  * Mirrors the page adapter's duration rewrite without touching unrelated fields.
+ *
+ * 兼容路径（经业务授权）：页面先用 10 秒载体完成签名，再由网络层把最终请求体
+ * 改写成 30 秒。这里不把带 `a_bogus` 的请求强制保留原 body；改写结果会继续
+ * 经过后续的生成请求检查器，由它校验最终模型/时长、参考图证据和单次发送约束。
+ * 上游仍可能按会话风控拒绝请求，`710022002` 也可能表示限流；两者由回执阶段区分，
+ * 本层不提前把授权的兼容路径判死。
  */
 export function rewriteVideoDurationBody(body, { seconds, targetModel = 'seedance_v2.5' } = {}) {
-  if (![10, 15, 20, 30].includes(Number(seconds))) {
-    throw new TypeError('seconds must be 10, 15, 20 or 30');
+  // 字面量而非 import：本函数与 installVideoRequestAdapter 同文件，会被序列化后
+  // 注入浏览器执行，引用外部模块变量会直接 ReferenceError。
+  if (![15, 30].includes(Number(seconds))) {
+    throw new TypeError('seconds must be 15 or 30');
   }
   if (typeof body !== 'string' || !body || body.length > 1024 * 1024) return { body, changed: false, records: [] };
   const records = [];
@@ -42,7 +51,10 @@ export function rewriteVideoDurationBody(body, { seconds, targetModel = 'seedanc
         }
         if (param && typeof param === 'object' && models.has(param.model)
             && (targetModel == null || param.model === targetModel)
-            && (Number(seconds) < 20 || param.model === 'seedance_v2.5')
+            // 档位精简：15 秒只跑 v2.0、30 秒只跑 v2.5，所以按目标档位认模型。
+            // 原来是 `seconds < 20 || model === 'seedance_v2.5'`（为 10/20 设计的口径），
+            // 留下来的话 30 秒会把 v2.0 的请求也改写成 30 秒 —— 而 v2.0 根本不出 30 秒。
+            && param.model === (Number(seconds) === 15 ? 'seedance_v2.0' : 'seedance_v2.5')
             && Number.isFinite(Number(param.duration))) {
           const before = Number(param.duration);
           if (before !== Number(seconds)) {
@@ -79,8 +91,10 @@ export function rewriteVideoDurationBody(body, { seconds, targetModel = 'seedanc
 }
 
 export function installVideoRequestAdapter({ seconds, targetModel = null, rewrite = true }) {
-  if (![10, 15, 20, 30].includes(seconds)) {
-    throw new TypeError('seconds must be 10, 15, 20 or 30');
+  // 严格类型：只认数字 15/30，字符串 '15' 不接受（与改写函数用 Number() 的宽松口径不同，
+  // 这是历史行为，别为了"更好用"悄悄放宽 —— 档位值必须是调用方算准的数，不是碰巧能转的数）。
+  if (![15, 30].includes(seconds)) {
+    throw new TypeError('seconds must be 15 or 30');
   }
   if (targetModel !== null && typeof targetModel !== 'string') {
     throw new TypeError('targetModel must be a string or null');
@@ -136,7 +150,8 @@ export function installVideoRequestAdapter({ seconds, targetModel = null, rewrit
     try {
       const resolved = new URL(url, page.location.href);
       return resolved.protocol === 'https:' && resolved.origin === origin &&
-        resolved.pathname === '/chat/completion' && !resolved.username && !resolved.password;
+        resolved.pathname === '/chat/completion' && !resolved.username && !resolved.password
+        && !resolved.searchParams.has('a_bogus');
     } catch { return false; }
   }
 
@@ -324,4 +339,136 @@ export function installVideoRequestAdapter({ seconds, targetModel = null, rewrit
     };
   }
   Object.defineProperty(page, installKey, { value: state });
+}
+
+/**
+ * ★★ 网络层改写通道（2026-09-26 实测新增）★★
+ *
+ * 为什么要有这一层：页内 `installVideoRequestAdapter`（addInitScript + patch
+ * window.fetch / XMLHttpRequest）在 Dola 上实测**一次都命中不了** —— 多次调试
+ * `state.requests` 恒为 0。Dola 的提交请求 body 不走 `init.body` 字符串，
+ * 也不是普通 XHR send 字符串，所以页内 patch 抓不到。
+ *
+ * 换成 Playwright 网络层 `route` 后立刻命中：`POST /chat/completion` 被拦到，
+ * `ability_param.duration` 成功改写为 30（线上实测 requests=1 rewritten=1）。
+ *
+ * 这里复用 Node 侧的 `rewriteVideoDurationBody`（纯函数、已覆盖 ability_param
+ * 为 JSON 字符串的情况），不重复实现改写逻辑，两边口径保持一致。
+ *
+ * 幂等：同一 context 重复安装只更新参数，不叠加第二个 route。
+ */
+const WIRE_STATES = new WeakMap();
+const WIRE_ROUTE = '**/chat/completion**';
+const MAX_WIRE_RECORDS = 100;
+const MAX_WIRE_ERRORS = 20;
+
+function appendWireEntries(target, entries, limit) {
+  for (const entry of entries) {
+    target.push(entry);
+    if (target.length > limit) target.splice(0, target.length - limit);
+  }
+}
+
+/** 取当前 context 上的网络层状态；没装过返回 null。 */
+export function getVideoRequestWire(ctx) {
+  return WIRE_STATES.get(ctx)?.state || null;
+}
+
+/**
+ * 在网络层安装改写器。参数是 context 级别（与 addInitScript 同级）。
+ * @returns {Promise<object>} 状态对象，可读写 seconds / targetModel / rewrite，
+ *                            只读 requests / rewritten / records。
+ */
+export async function installVideoRequestWire(ctx, {
+  seconds,
+  targetModel = 'seedance_v2.5',
+  rewrite = true,
+} = {}) {
+  const existing = WIRE_STATES.get(ctx);
+  if (existing) {
+    if (existing.disposal) {
+      await existing.disposal;
+      return installVideoRequestWire(ctx, { seconds, targetModel, rewrite });
+    }
+    existing.state.seconds = Number(seconds);
+    existing.state.targetModel = targetModel ?? null;
+    existing.state.rewrite = Boolean(rewrite);
+    await existing.installation;
+    return existing.state;
+  }
+  const state = {
+    seconds: Number(seconds),
+    targetModel: targetModel ?? null,
+    rewrite: Boolean(rewrite),
+    requests: 0,
+    rewritten: 0,
+    records: [],
+    errors: [],
+  };
+  const handler = async (route) => {
+    let failureCategory = 'request-inspection-failed';
+    try {
+      const req = route.request();
+      let options;
+      if (req.method().toUpperCase() === 'POST') {
+        state.requests += 1;
+        const body = req.postData();
+        if (body && state.rewrite) {
+          failureCategory = 'duration-rewrite-failed';
+          const result = rewriteVideoDurationBody(body, {
+            seconds: state.seconds,
+            targetModel: state.targetModel,
+          });
+          if (result?.records?.length) appendWireEntries(state.records, result.records, MAX_WIRE_RECORDS);
+          // 载体改写经授权，即使 URL 带 a_bogus 也要把最终 body 交给后续检查链。
+          if (result?.changed && result.records?.some(record => record.before !== record.after)) {
+            state.rewritten += 1;
+            options = { postData: result.body };
+          }
+        }
+      }
+      // 交给已安装的发送检查与日志处理器，不能直接跳过其处理链。
+      failureCategory = 'route-fallback-failed';
+      return await route.fallback(options);
+    } catch {
+      // 不保留可能含请求数据的异常文本；失败后只终止，绝不再次发送。
+      appendWireEntries(state.errors, [failureCategory], MAX_WIRE_ERRORS);
+      try {
+        return await route.abort('failed');
+      } catch {
+        appendWireEntries(state.errors, ['route-abort-failed'], MAX_WIRE_ERRORS);
+        return undefined;
+      }
+    }
+  };
+  const entry = { state, handler, installation: null, disposal: null };
+  WIRE_STATES.set(ctx, entry);
+  // 先保存安装中的 entry，避免并发安装给同一 context 叠加 handler。
+  entry.installation = Promise.resolve().then(() => ctx.route(WIRE_ROUTE, handler));
+  try {
+    await entry.installation;
+  } catch (error) {
+    if (WIRE_STATES.get(ctx) === entry) WIRE_STATES.delete(ctx);
+    throw error;
+  }
+
+  return state;
+}
+
+/** 仅卸载本模块在指定 context 上安装的 handler，供会话归还前调用。 */
+export async function disposeVideoRequestWire(ctx) {
+  const entry = WIRE_STATES.get(ctx);
+  if (!entry) return false;
+  if (entry.disposal) return entry.disposal;
+  entry.disposal = (async () => {
+    try {
+      await entry.installation;
+      await ctx.unroute(WIRE_ROUTE, entry.handler);
+      if (WIRE_STATES.get(ctx) === entry) WIRE_STATES.delete(ctx);
+      return true;
+    } finally {
+      entry.disposal = null;
+    }
+  })();
+  return entry.disposal;
 }

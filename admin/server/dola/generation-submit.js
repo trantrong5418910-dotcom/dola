@@ -32,27 +32,22 @@ export async function fillAndSubmitVideoPrompt(page, prompt, { timeout = 15000, 
     throw failure('GENERATION_SEND_NOT_READY', '发送按钮状态变化，未提交');
   }
   if (!isActive()) throw failure('GENERATION_CANCELLED', 'generation_cancelled');
+  const before = page.url();
   // Exactly one send action. Never follow this with Enter or another click.
   await send.click({ timeout }).catch(() => {
     throw failure('GENERATION_SUBMISSION_UNCERTAIN', '发送动作结果未确认，请先核对上游任务，不要重复提交');
   });
 
-  /**
-   * ★ 点了却没派发时的**现场取证**。
-   *
-   * 为什么必须有：实测出现过"提示词写进去了、发送按钮看着也是可用的、点击也没报错，
-   * 但浏览器**一个生成请求都没发出**（放行 0 次 / 阻断 0 次）"的情况。
-   * 只有一段文字回执根本判断不了 —— 是按钮点错了？被遮挡了？还是应用没接住这次点击？
-   * 所以这里**只观察、不重试**（绝不补一次 Enter 或再次点击，那会造成重复提交）：
-   * 给几秒时间看 URL 有没有跳到会话页；没跳就截图 + 记录按钮的 DOM 状态。
-   */
-  const before = page.url();
+  // A missing numeric conversation URL does not establish that no request was sent.
+  // Observe once after the click; never retry the send action here.
   let dispatched = false;
   for (let i = 0; i < 12; i++) {
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(500).catch(() => {
+      throw failure('GENERATION_SUBMISSION_UNCERTAIN', '发送动作已执行，页面观察中断；请核对上游结果，不要重复提交');
+    });
     if (/\/chat\/\d{10,}/.test(page.url())) { dispatched = true; break; }
   }
-  if (dispatched) return { dispatched: true };
+  if (dispatched) return { sendActionCompleted: true, conversationLocated: true, dispatched: true };
 
   const dom = await page.evaluate((sel) => {
     const nodes = [...document.querySelectorAll(sel)];
@@ -68,7 +63,7 @@ export async function fillAndSubmitVideoPrompt(page, prompt, { timeout = 15000, 
         pointerEvents: cs.pointerEvents,
         visibility: cs.visibility,
         opacity: cs.opacity,
-        // 点下去的时候到底命中了谁？被别的元素盖住的话这里会显示覆盖者
+        // This is sampled AFTER the click; it cannot identify the original click target.
         topAtCenter: (() => {
           const cx = r.x + r.width / 2, cy = r.y + r.height / 2;
           const t = document.elementFromPoint(cx, cy);
@@ -88,5 +83,8 @@ export async function fillAndSubmitVideoPrompt(page, prompt, { timeout = 15000, 
     await page.screenshot({ path: shot });
   } catch { shot = null; }
 
-  return { dispatched: false, urlBefore: before, urlAfter: page.url(), sendButton: dom, shot };
+  return { sendActionCompleted: true, conversationLocated: false,
+    // Compatibility field: this describes URL observation only, never transport acceptance.
+    dispatched: false, observationPhase: 'after_click',
+    urlBefore: before, urlAfter: page.url(), sendButton: dom, shot };
 }

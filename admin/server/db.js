@@ -14,21 +14,40 @@ import { generateTokenValue, generateCardCode, insertMany, makeBatchNo } from '.
 import { GENERATION_GUARD_SCHEMA } from './dola/generation-guards.js';
 import { SUBMISSION_JOURNAL_SCHEMA } from './dola/submission-journal.js';
 import { LOGIN_REGISTRY_SCHEMA } from './dola/account-login-registry.js';
+import { applySqlitePragmas } from './sqlite-pragmas.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const DATA_DIR = path.join(HERE, 'data');
 export const DB_PATH = process.env.ADMIN_DB || path.join(DATA_DIR, 'admin.db');
+
+/**
+ * 开连接后立刻打连接级 PRAGMA（busy_timeout / WAL / synchronous）。
+ *
+ * 2026-09-28：生产实测 busy_timeout=0（每连接，默认 0），并发写直接抛
+ * `database is locked`。WAL 已经开着（持久属性），但它不解决写-写竞争 ——
+ * 补 busy_timeout 才是那个真正生效的一刀。详见 ./sqlite-pragmas.js 顶部注释。
+ *
+ * 这里必须**先打 PRAGMA 再 wrap**，因为 wrap 只暴露 exec/prepare，
+ * 而 PRAGMA 要在任何业务语句之前生效。
+ */
+function openWithPragmas(db) {
+  const r = applySqlitePragmas(db);
+  if (r.failed.length) {
+    console.warn(`[db] 部分 PRAGMA 未生效（不影响启动）：${r.failed.join(' | ')}`);
+  }
+  return db;
+}
 
 async function openDatabase() {
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
   try {
     const mod = await import('better-sqlite3');
     const Database = mod.default ?? mod;
-    return wrap(new Database(DB_PATH));
+    return wrap(openWithPragmas(new Database(DB_PATH)));
   } catch (e) {
     const { DatabaseSync } = await import('node:sqlite');
     console.warn(`[db] better-sqlite3 不可用（${e.message}），改用内置 node:sqlite（实验特性）`);
-    return wrap(new DatabaseSync(DB_PATH));
+    return wrap(openWithPragmas(new DatabaseSync(DB_PATH)));
   }
 }
 
@@ -279,6 +298,7 @@ CREATE TABLE IF NOT EXISTS dola_videos (
   conversation_id   TEXT,
   prompt            TEXT NOT NULL DEFAULT '',
   ratio             TEXT NOT NULL DEFAULT '16:9',
+  mode              TEXT NOT NULL DEFAULT 'standard', -- standard / expert；记录真实提交时的页面模式
   seconds           INTEGER NOT NULL DEFAULT 10,
   force_seconds     INTEGER,                       -- 注入 patch 强改的时长（null = 不改）
   status            TEXT NOT NULL DEFAULT 'queued',-- queued/submitting/generating/ready/failed/cancelled
@@ -324,6 +344,128 @@ CREATE TABLE IF NOT EXISTS dola_materials (
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_dm_updated ON dola_materials(updated_at DESC);
+
+-- 脚本工作台：一份脚本及其可编辑的分镜。图片文件不进库，视频任务复用 dola_videos。
+CREATE TABLE IF NOT EXISTS dola_scripts (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  title      TEXT NOT NULL DEFAULT '',
+  topic      TEXT NOT NULL DEFAULT '',
+  tone       TEXT NOT NULL DEFAULT '',
+  model      TEXT NOT NULL DEFAULT '',
+  status     TEXT NOT NULL DEFAULT 'draft',
+  error      TEXT NOT NULL DEFAULT '',
+  created_by INTEGER,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ds_updated ON dola_scripts(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS dola_script_shots (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  script_id     INTEGER NOT NULL REFERENCES dola_scripts(id) ON DELETE CASCADE,
+  seq           INTEGER NOT NULL,
+  scene         TEXT NOT NULL DEFAULT '',
+  narration     TEXT NOT NULL DEFAULT '',
+  seconds       INTEGER NOT NULL DEFAULT 30,
+  ratio         TEXT NOT NULL DEFAULT '16:9',
+  image_prompt  TEXT NOT NULL DEFAULT '',
+  image_path    TEXT NOT NULL DEFAULT '',
+  image_candidates TEXT NOT NULL DEFAULT '[]',
+  -- 这一条分镜要喂给视频模型的**参考图**，JSON 数组。
+  -- ★ 只存「指向」，不存图片字节：字节在 dola_reference_images / 上游 CDN 上。
+  -- 提交视频任务时才解析成真实字节（见 routes/scripts.js 的 resolveShotReferenceImages）。
+  -- 元素形状：{ kind:'shot' }（用本分镜当前分镜图）
+  --          { kind:'library', id, name }（参考图库里的某张）
+  --          { kind:'url', url }（任意 http(s) 直链，通常是别处的分镜图/出图历史）
+  -- 为什么不落字节：参考图会跟着分镜图/图库条目变（用户换了分镜图，参考图理应跟着换），
+  -- 而且同一张图被 10 个分镜引用时不该存 10 份。
+  reference_images TEXT NOT NULL DEFAULT '[]',
+  video_task_id INTEGER,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL,
+  UNIQUE(script_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_dss_script ON dola_script_shots(script_id, seq);
+
+-- 分镜图**生成历史**：★ 一行 = 一次生成 = 一组图，**绝不拆成一图一行**。
+--
+-- 为什么必须按「批」存：dola 网页 agent 一次文生图**固定吐 4 张**（实测
+-- 2732×1534 无水印原图，model=Agent-Creation）。这 4 张是同一批的候选，
+-- 拆开单存就丢了「它们出自同一次生成」这个信息，也没法按批回看/回切，
+-- 前端会退化成一条平铺的图片流水 —— 那正是要避免的「格式错」。
+--
+-- images 存 JSON 数组（一次生成的整组），image_count 冗余存张数，
+-- 便于校验是否被写坏（正常恒为 4）。used_url 记录这一批里当时被选中的那张。
+--
+-- 注意：本库**没有开 PRAGMA foreign_keys**（SQLite 默认 OFF），
+-- 所以下面的 REFERENCES 只是文档，级联删除必须由代码显式做
+-- （见 routes/scripts.js 删除分镜/脚本处）。
+-- 另外：这里是 SQL 模板字符串内部，注释里**不要用反引号**，会把模板截断。
+CREATE TABLE IF NOT EXISTS dola_script_shot_images (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  shot_id         INTEGER NOT NULL REFERENCES dola_script_shots(id) ON DELETE CASCADE,
+  script_id       INTEGER NOT NULL,
+  seq             INTEGER NOT NULL,
+  prompt          TEXT NOT NULL DEFAULT '',
+  model           TEXT NOT NULL DEFAULT '',
+  conversation_id TEXT,
+  account_id      INTEGER,
+  account_label   TEXT NOT NULL DEFAULT '',
+  images          TEXT NOT NULL DEFAULT '[]',
+  image_count     INTEGER NOT NULL DEFAULT 0,
+  used_url        TEXT NOT NULL DEFAULT '',
+  -- 这一批的图被**自动收进参考图库**后得到的条目 id（JSON 数组）。
+  -- 存下来是为了：① 前端能直接说「已收进图库 N 张」并跳过去看；
+  -- ② 出图历史里能判断这一批是不是已经收录过，避免重复抓同一批。
+  -- 收录是 best-effort（见 routes/scripts.js 的 ingestBatchToLibrary），
+  -- 所以这里可能是空数组 —— 空不等于"没出图"，只等于"没收成"。
+  library_ids     TEXT NOT NULL DEFAULT '[]',
+  ms              INTEGER NOT NULL DEFAULT 0,
+  created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dssi_shot ON dola_script_shot_images(shot_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_dssi_script ON dola_script_shot_images(script_id, id DESC);
+
+-- 参考图库：一个**统一的参考图来源**，同时喂给「视频任务主工作台」和「脚本分镜页」。
+--
+-- 为什么要有它（而不是继续只在前端 localStorage 里存 base64）：
+--   · 前端素材（test.js 的 state.materials）只活在这台浏览器里，换机器就没了，
+--     也没法在分镜页引用；
+--   · 分镜图出在**上游 CDN 的临时直链**上，可能过期，直接当参考图引用会隔天失效；
+--     收进图库 = 立刻落盘成我们自己的文件，生命周期由我们控制。
+--
+-- 存储分层：**元数据在 SQLite，字节在 data/reference-library/<id>.<ext>**。
+-- 绝不把 base64 塞进 SQLite（单张可到 8MB，库会被撑爆，备份也变慢）。
+--
+-- sha256 唯一索引 = 去重键：同一张图重复上传/重复从分镜图收进来，只留一条记录，
+-- 返回已有那条。用**部分索引**（WHERE sha256 <> ''）而不是普通唯一索引：
+-- 空字符串在 SQLite 唯一索引里也只允许一条，留空的行会互相打架。
+--
+-- 注意：本库**没有开 PRAGMA foreign_keys**，script_shot_id 只是文档性外键，
+-- 不产生级联；分镜被删时图库条目**故意保留**（图还在，只是没了出处）。
+-- 另外：这里是 SQL 模板字符串内部，注释里**不要用反引号**，会把模板截断。
+CREATE TABLE IF NOT EXISTS dola_reference_images (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  name           TEXT NOT NULL DEFAULT '',
+  -- upload = 后台上传；url = 粘贴直链；shot = 从分镜图收进来；material = 从素材库转存
+  source         TEXT NOT NULL DEFAULT 'upload',
+  origin_url     TEXT NOT NULL DEFAULT '',
+  local_path     TEXT NOT NULL DEFAULT '',
+  mime           TEXT NOT NULL DEFAULT '',
+  bytes          INTEGER NOT NULL DEFAULT 0,
+  width          INTEGER NOT NULL DEFAULT 0,
+  height         INTEGER NOT NULL DEFAULT 0,
+  sha256         TEXT NOT NULL DEFAULT '',
+  tags           TEXT NOT NULL DEFAULT '',
+  script_shot_id INTEGER,
+  use_count      INTEGER NOT NULL DEFAULT 0,
+  created_by     INTEGER,
+  created_at     TEXT NOT NULL,
+  updated_at     TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dri_sha ON dola_reference_images(sha256) WHERE sha256 <> '';
+CREATE INDEX IF NOT EXISTS idx_dri_updated ON dola_reference_images(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dri_source ON dola_reference_images(source, id DESC);
 
 -- 上游限流事件：用于后台运营审计与冷却面板。
 -- 只记录码、账号/任务引用和人类可读说明，不保存 cookie 或完整代理凭据。
@@ -394,6 +536,7 @@ function migrate() {
     ['dola_accounts', 'fail_count', 'INTEGER NOT NULL DEFAULT 0'],
     ['dola_accounts', 'last_submit_at', 'TEXT'],
     ['dola_videos', 'local_path', 'TEXT'],
+    ['dola_videos', 'mode', "TEXT NOT NULL DEFAULT 'standard'"],
     ['dola_videos', 'local_bytes', 'INTEGER'],
     ['dola_videos', 'is_unwatermarked', 'INTEGER NOT NULL DEFAULT 0'],
     ['dola_videos', 'has_reference_images', 'INTEGER NOT NULL DEFAULT 0'],
@@ -411,6 +554,16 @@ function migrate() {
     // （新建库走 PROXY_POOL_SCHEMA，已有库走这里的 ALTER）。
     ['dola_proxies', 'exit_ip_at', 'TEXT'],
     ['dola_proxies', 'rotation_count', 'INTEGER NOT NULL DEFAULT 0'],
+    // 分镜图的候选集（见 server/dola/chat-bridge.js）：一次文生图上游会吐 4 张，
+    // `image_path` 只存用户最终选中的那张，候选全量留在这里让前端换图。
+    // 存 JSON 数组而不是另开一张表：候选与分镜是 1:N 但**生命周期完全一致**
+    // （分镜删了候选就该没），没有独立查询需求。
+    ['dola_script_shots', 'image_candidates', "TEXT NOT NULL DEFAULT '[]'"],
+    // 分镜要喂给视频模型的参考图（见 SCHEMA 里 dola_script_shots 的注释）。
+    // 只存「指向」，提交时才解析成字节 —— 所以用户换了分镜图，参考图会跟着换。
+    ['dola_script_shots', 'reference_images', "TEXT NOT NULL DEFAULT '[]'"],
+    // 一批分镜图收进参考图库后得到的条目 id（见 SCHEMA 里 dola_script_shot_images 的注释）。
+    ['dola_script_shot_images', 'library_ids', "TEXT NOT NULL DEFAULT '[]'"],
   ];
   for (const [table, column, def] of ALTERS) {
     try {
@@ -422,6 +575,55 @@ function migrate() {
     } catch (e) {
       console.error(`[db] 迁移失败 ${table}.${column}:`, e.message);
     }
+  }
+
+  backfillScriptImageHistory();
+}
+
+/**
+ * 一次性回填分镜出图历史。
+ *
+ * 在引入 dola_script_shot_images 之前出的图，其 image_candidates **本身就是一次
+ * 生成的整组**（4 张），只是当时没记录。不回填的话会出现很怪的场面：分镜明明
+ * 有 4 张候选图，历史里却是空的 —— 用户只会以为历史功能坏了。
+ *
+ * 元数据（model / 耗时 / 会话号 / 账号）当时没记，只能留空 —— **不编造**。
+ * 幂等：只处理「有候选但一条历史都没有」的分镜，跑多少次结果一样。
+ */
+function backfillScriptImageHistory() {
+  try {
+    const hasTable = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='dola_script_shot_images'",
+    ).get();
+    if (!hasTable) return;
+    const cols = db.prepare('PRAGMA table_info(dola_script_shots)').all().map((c) => c.name);
+    if (!cols.includes('image_candidates')) return;
+    const orphans = db.prepare(`SELECT s.* FROM dola_script_shots s
+      WHERE TRIM(COALESCE(s.image_candidates,'')) <> ''
+        AND TRIM(COALESCE(s.image_candidates,'')) <> '[]'
+        AND NOT EXISTS (SELECT 1 FROM dola_script_shot_images i WHERE i.shot_id = s.id)`).all();
+    if (!orphans.length) return;
+    const insert = db.prepare(`INSERT INTO dola_script_shot_images
+      (shot_id,script_id,seq,prompt,model,conversation_id,account_id,account_label,images,image_count,used_url,ms,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    let done = 0;
+    for (const shot of orphans) {
+      let images = [];
+      try { images = JSON.parse(shot.image_candidates) || []; } catch { images = []; }
+      if (!Array.isArray(images) || !images.length) continue;
+      insert.run(
+        shot.id, shot.script_id, shot.seq,
+        String(shot.image_prompt || shot.scene || '').slice(0, 12000),
+        '', null, null, '',
+        JSON.stringify(images), images.length,
+        String(shot.image_path || '').slice(0, 2048), 0,
+        shot.updated_at || new Date().toISOString(),
+      );
+      done += 1;
+    }
+    if (done) console.log(`[db] 回填 ${done} 条分镜出图历史（历史表引入之前出的图，元数据留空）`);
+  } catch (e) {
+    console.error('[db] 出图历史回填失败:', e.message);
   }
 }
 
@@ -478,8 +680,22 @@ function seed() {
     ['dola_replenish_min_quota', '30', '号池补号提示：已确认剩余额度低于此数时提示补号（0=关闭额度判据）', 'dola'],
     ['dola_quota_reset_tz', 'Asia/Tokyo', 'dola 每日额度重置时区（IANA，如 Asia/Tokyo；上游按此时区 0 点重置）', 'dola'],
     ['dola_quota_reset_hour', '0', 'dola 每日额度重置时刻（0～23，重置时区当地时间）', 'dola'],
-    ['dola_submit_mode', 'browser', '视频提交通道：browser=浏览器模拟提交（默认）/ scheme-a=Abort取签名+页内重放提交（实验）', 'dola'],
+    ['dola_submit_mode', 'browser', '视频提交通道：browser=浏览器模拟提交（默认）/ scheme-a=Abort取签名+页内重放提交（实验）/ pure-http=纯协议、Node 自算 a_bogus 后直发（不开浏览器）', 'dola'],
+    // 「你好」探测通道（`server/dola/hello-probe.js`）。
+    // ⚠️ 默认就是 pure-http —— 与视频通道（dola_submit_mode 默认 browser）**刻意不同**：
+    //    探测是高频轻量动作，开浏览器要等创作输入框（慢代理 20~30 秒）还占账号浏览器锁。
+    //    纯协议用的是与 chat-bridge 完全相同的已验证链路，所以默认即切换、不需要灰度。
+    //    回退路径：改成 browser（旧实现仍保留在 hello-probe.js 里）。
+    ['dola_hello_probe_mode', 'pure-http', '「你好」探测通道：pure-http=纯协议直发（默认，不开浏览器）/ browser=开浏览器走 UI（慢，仅回退用）', 'dola'],
     ['dola_upstream_concat', 'false', '允许把页面上游合成档位（30s = 15s ×2）算作 30 秒可用证据：拆段与首尾相接均在上游完成，本服务不做本地拼接', 'dola'],
+    // ★ 30 秒改写通道（2026-09-26）。历史口径要求「页面必须先有原生 15 秒档位」才认 30 秒，
+    //    但实测服务端 `video-duration` 控件只下发 5s/10s —— 15s 在配置层面不存在，
+    //    于是探针永远确认不了、`native_30s_state` 恒为 unknown、三处硬门禁全部拒绝。
+    //    ⚠️ 默认必须是 'false'：**上线本身不改线上行为**；要开放 30 秒必须显式打开。
+    ['dola_allow_30s_rewrite', 'false', '允许 30 秒走「短档位载体 + 请求改写」通道（默认关；打开后不再要求页面有原生 15 秒档位）', 'dola'],
+    // 载体映射（JSON，如 {"20":10,"30":10}）。留空 = 按上面开关取内置默认：
+    // 关=30→15（历史口径），开=30→10（页面真实存在的档）。
+    ['dola_duration_carrier_map', '', '时长载体映射（JSON，如 {"20":10,"30":10}；留空=按开关用内置默认）', 'dola'],
     ['dola_convert_auto_zero', 'false', '转换后把账号额度清零（仅记账，不代表真的扣了 dola）', 'dola'],
     ['dola_auto_maintenance_enabled', 'true', '自动巡检账号和可查额度', 'dola'],
     ['dola_auto_cleanup_invalid', 'true', '自动隔离明确失效账号（保留 cookie，不硬删除）', 'dola'],
@@ -499,6 +715,17 @@ function seed() {
     ['gateway_points_per_task', '1', '每个视频任务扣多少积分', 'gateway'],
     ['gateway_prompt_cooldown_seconds', '120', '同一令牌相同提示词冷却时间（秒）', 'gateway'],
     ['gateway_key', '7d4aaa02d7ce44a0e99ebebd7e8f34abe7e28c5ae49b1424', '网关共享密钥（用户端要用它调后台）', 'gateway'],
+    // 脚本工作台的 OpenAI-compatible LLM 配置。api_key 由 settings 路由统一脱敏。
+    // `llm_provider` 决定走哪条通道：
+    //   openai → 外部 OpenAI 兼容接口（需要 base_url + api_key + model）
+    //   dola   → **不配置任何 LLM**，借本服务号池里的 dola 网页 agent 出分镜与分镜图
+    //            （见 server/dola/chat-bridge.js）。启用它时上面三项都不需要填。
+    ['llm_provider', 'openai', '脚本工作台：生成通道（openai=外部 LLM / dola=借用号池网页 agent）', 'script'],
+    ['llm_enabled', 'false', '脚本工作台：启用生成', 'script'],
+    ['llm_base_url', '', '脚本工作台：LLM 接口地址（OpenAI-compatible）', 'script'],
+    ['llm_api_key', '', '脚本工作台：LLM API Key', 'script'],
+    ['llm_model', '', '脚本工作台：模型名', 'script'],
+    ['llm_timeout_ms', '120000', '脚本工作台：LLM 超时（毫秒）', 'script'],
     // 提示词包装（发给上游前拼接，见 server/dola/prompt-wrap.js）。
     // ⚠️ 同样必须先注册（`setSetting()` 只 UPDATE 已有 key）；否则后台改了"没反应"。
     // 默认**关**：包装会改变上游看到的内容，属于运营决策，不该在升级后自动生效。
@@ -516,6 +743,13 @@ function seed() {
     // ⚠️ 默认必须是 all：升级之后不能改变任何既有行为。
     ['gateway_enabled_scope', 'all', '网关开关生效范围：all=全部入口 / v1=只对外接口 / admin=只后台工作台', 'gateway'],
     ['gateway_prompt_wrap_enabled_scope', 'all', '提示词包装生效范围：all / v1 / admin', 'gateway'],
+    // 参考图上传前自动遮盖真人脸（见 server/dola/portrait-guard.js）。
+    // ⚠️ 默认 **true**：代价不对称 ——
+    //    漏处理（真人脸没盖）→ 上游肖像保护软拒绝 → 任务白等满 40 分钟 + 锁号（实例 #188）；
+    //    误处理（把卡通也盖了）→ 只是参考图上多一块「此角色由AI生成」面板，任务照样出片。
+    // 实测（27 样本回归）：真人脸 100% 被盖且盖后检测不出；13 张 AI 分镜图 + 平涂卡通 + 素描 一律不动。
+    // 想临时关掉不用等设置生效：环境变量 DOLA_PORTRAIT_GUARD=false（它优先于本项）。
+    ['gateway_portrait_guard_enabled', 'true', '参考图上传前自动遮盖真人脸（true/false；素描与卡通不处理，盖完会复检确保检测不出）', 'gateway'],
     // 可观测性（Prometheus 抓取）。
     // ⚠️ 必须先在这里注册：`setSetting()` **只 UPDATE 已有的 key**，不创建任意 key
     //    （见 db.js 的 setSetting 注释）—— 不注册的话这个设置永远写不进去、也就永远抓不到指标，

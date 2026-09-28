@@ -78,13 +78,13 @@ test('★ 补号阈值可关掉（replenish_min_accounts=0 → 不再因为号�
 });
 
 // ─────────────────────── ② seconds：哪些档位真的能选 ───────────────────────
-test('★ seconds.ready：10/20 只需有可用账号，15/30 还需要原生能力已确认', () => {
+test('★ seconds.ready：15/30 都需要原生能力已确认（10/20 已下线）', () => {
   const both = readinessSummary(healthy).seconds;
   assert.deepEqual([...both.supported], [...SUPPORTED_VIDEO_SECONDS]);
-  assert.deepEqual(both.ready, [10, 15, 20, 30]);
+  assert.deepEqual(both.ready, [15, 30]);
 
   const onlyPage = readinessSummary({ ...healthy, pools: {} }).seconds;
-  assert.deepEqual(onlyPage.ready, [10, 20], '没有原生能力确认时只剩页面默认档位');
+  assert.deepEqual(onlyPage.ready, [], '档位精简后没有"无需能力确认"的档位：15/30 都要原生能力确认');
   assert.deepEqual([...onlyPage.supported], [...SUPPORTED_VIDEO_SECONDS], 'supported 是能力清单，不随就绪变化');
 });
 

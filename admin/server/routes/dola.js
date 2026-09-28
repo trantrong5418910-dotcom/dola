@@ -16,20 +16,26 @@ import { createJob, getJob, listJobs, cancelJob, registerJobHandler } from '../j
 import {
   parseCookies, missingRequired, checkSession, probeCredits,
   fetchCreditsViaBrowser, playwrightAvailable, findCreditFields,
-  fetchProfile, fetchSubscription, probeNativeThirtySecondViaBrowser,
-  probeNativeFifteenSecondViaBrowser,
+  // ⚠️ 刻意**保留** probeReferenceImageViaBrowser / probeNativeVideoViaBrowser：
+  //   它们不只是「能力探测」在用，`/accounts/:id/generation-guard-probe` 解除失败保护
+  //   也要靠它们做只读复核 —— 删掉它们，已记录的保护就永远解不开（见 generation-guards.js
+  //   里「永久锁」的教训）。同理 dola_accounts 上的 native_*_state / reference_image_state
+  //   也要保留：hasGenerationGuard() 在派号时直接 SELECT 这几列判「是否被更晚的探针证伪」。
+  fetchProfile, fetchSubscription,
   probeNativeVideoViaBrowser,
   probeReferenceImageViaBrowser,
   looksLikeJsonBlob, DOLA_LOGIN_OPTIONS, DOLA_CODE,
 } from '../dola/provider.js';
 import { proxyOf, proxyUrlOf } from '../dola/proxy.js';
 import { accountHealth, creditBalanceFromHits, quotaObservation, summarizeQuota } from '../dola/account-observations.js';
-import { isVerifiedNativeCapability, requireGenerationProxy } from '../dola/generation-policy.js';
-import { sendHelloProbeViaBrowser } from '../dola/hello-probe.js';
-import { cancelVideoTask, generationStatus, getVideoTask, resolvePendingSubmission, generationRouteView } from '../dola/generator.js';
+import { requireGenerationProxy, SUPPORTED_VIDEO_SECONDS } from '../dola/generation-policy.js';
+import { sendHelloProbe } from '../dola/hello-probe.js';
+import {
+  cancelVideoTask, generationStatus, getVideoTask, resolvePendingSubmission, generationRouteView,
+  deleteVideoTask, isTaskDeletable,
+} from '../dola/generator.js';
 import { listPendingSubmissions, listBlockedAccounts, countPendingSubmissions } from '../dola/submission-journal.js';
 import { settleFailedVideoRefund } from '../dola/generation-billing.js';
-import { referenceImageEvidenceNote } from '../dola/reference-images.js';
 import { generationAnalytics, classifyFailure } from '../dola/generation-analytics.js';
 import { listGenerationGuards, clearGenerationGuard } from '../dola/generation-guards.js';
 import { chainTextSnapshot } from '../dola/chain-text-rules.js';
@@ -291,7 +297,14 @@ registerJobHandler('dola_check', async (accountId, ctx = {}) => {
   };
 });
 
-/** Explicit chat probe: one ordinary “你好” message, never part of scheduled maintenance. */
+/**
+ * Explicit chat probe: one ordinary “你好” message, never part of scheduled maintenance.
+ *
+ * ★ 2026-09-28：默认改走**纯协议**（`hello-probe.js` 的 `sendHelloProbe`）——
+ *   不再开 Chromium、不占浏览器并发、不用等创作输入框（慢代理下要 20~30 秒）。
+ *   需要回退时把设置项 `dola_hello_probe_mode` 改成 `browser`。
+ *   判定口径两条通道一致：只有「上游明确说会话失效」才允许把账号置 invalid。
+ */
 registerJobHandler('dola_hello_probe', async (accountId) => {
   const acc = db.prepare('SELECT * FROM dola_accounts WHERE id=?').get(accountId);
   if (!acc) return { ok: false, message: '账号不存在' };
@@ -309,10 +322,12 @@ registerJobHandler('dola_hello_probe', async (accountId) => {
     const proxyUrl = proxyUrlOf(acc);
     try {
       requireGenerationProxy(proxyUrl);
-      result = await sendHelloProbeViaBrowser(cookies, {
+      result = await sendHelloProbe(cookies, {
         accountId,
         proxyUrl,
         proxy: proxyOf(acc),
+        // 默认纯协议；置为 'browser' 即回退到旧的开浏览器实现（见 hello-probe.js 文件头）。
+        mode: getSetting('dola_hello_probe_mode', 'pure-http'),
       });
     } catch (error) {
       result = { state: 'unknown', message: `${error.message || '代理不可用'}，未发送` };
@@ -543,8 +558,8 @@ function withAccountRotation(view) {
 router.get('/route', requirePerm('dola:list'), (req, res) => {
   try {
     const seconds = req.query.seconds == null ? null : Number(req.query.seconds);
-    if (seconds != null && ![10, 15, 20, 30].includes(seconds)) {
-      return res.status(400).json({ ok: false, message: 'seconds 仅支持 10、15、20 或 30' });
+    if (seconds != null && !SUPPORTED_VIDEO_SECONDS.includes(seconds)) {
+      return res.status(400).json({ ok: false, code: 'DURATION_RETIRED', message: 'seconds 仅支持 15 或 30（10 秒与 20 秒档位已下线）' });
     }
     res.json(withAccountRotation(generationRouteView({
       seconds,
@@ -574,12 +589,21 @@ router.post('/accounts/:id/generation-guard-probe', requirePerm('dola:check'), a
     const result = scope === 'reference-images'
       ? await probeReferenceImageViaBrowser(accountCookies(acc), options)
       // ★ 登录防护没有 durations 段，scope.split(':')[1] 会是 NaN —— 必须单独分支。
-      //   解除凭据 = 真的拿到创作面板。用最短的原生档位（10 秒）去证：
-      //   它是最普遍支持的档位，也正好对应线上主要负载（全部任务都是 10 秒）。
+      //   解除凭据 = 真的拿到创作面板。仍用页面最普遍支持的最短档位（10 秒）去证，
+      //   但 10 秒档位已下线，所以必须显式开 allowLegacy —— 这里只借它证明
+      //   「页面可用」，不是要提交 10 秒任务。没有这个开关，历史登录防护会永久解不开。
       : scope === 'login'
-        ? await probeNativeVideoViaBrowser(accountCookies(acc), { ...options, seconds: 10 })
+        ? await probeNativeVideoViaBrowser(accountCookies(acc), { ...options, seconds: 10, allowLegacy: true })
         : await probeNativeVideoViaBrowser(accountCookies(acc), { ...options, seconds: Number(scope.split(':')[1]) });
-    const cleared = clearGenerationGuard(db, guard, acc, result);
+    const cleared = clearGenerationGuard(db, guard, acc, result, undefined, {
+      // 与生成路径**同源**（详见 generation-guards.js 的 clearGenerationGuard 注释）：
+      // 30 秒的页面 UI 里没有 30 秒档位，只能靠「短档位载体 + 请求改写」，
+      // 所以解锁判据必须读同一对开关。写死"精确目标证据"会让 30 秒变成永久锁。
+      // 两个开关都在本文件上方有单一定义（upstreamConcatEnabled / allow30sRewrite），
+      // 与 generator.js 用的是同一处（能力探测功能已于 2026-09-28 下线）。
+      allowUpstreamConcat: upstreamConcatEnabled(),
+      allowCarrierRewrite: allow30sRewrite(),
+    });
     audit(req, 'dola.generation_guard_probe', 'dola_account', id, `scope=${scope}; cleared=${cleared}`);
     return res.json({ ok: true, cleared, state: !cleared && result.state === 'available' ? 'unknown' : result.state,
       message: cleared
@@ -870,6 +894,75 @@ router.post('/generation-tasks/:id/cancel', requirePerm('dola:check'), (req, res
   res.json({ ok: true, item: updated, refundedPoints: billing.points || 0, billing });
 });
 
+/**
+ * DELETE /api/dola/generation-tasks/:id —— 删除单条生成任务（成片库，2026-09-27）
+ *
+ * 只允许删终态（failed / cancelled / ready）。运行中/排队中一律 409，
+ * 因为生成器还持有这条任务的引用，删掉会让它写回一个不存在的行。
+ */
+router.delete('/generation-tasks/:id', requirePerm('dola:task:delete'), async (req, res) => {
+  const row = getVideoTask(req.params.id);
+  if (!row) return res.status(404).json({ ok: false, message: '生成任务不存在' });
+  if (!isTaskDeletable(row.status)) {
+    return res.status(409).json({
+      ok: false, message: `当前状态 ${row.status} 不允许删除（运行中/排队中的任务不能删）`,
+    });
+  }
+  const result = await deleteVideoTask(row.id);
+  if (!result?.ok) return res.status(409).json({ ok: false, message: result?.reason || '删除失败' });
+  audit(req, 'dola.generation_delete', 'dola_video', String(row.id),
+    `status=${row.status}; journal=${result.journalCleared}; file=${result.fileRemoved ? 1 : 0}`);
+  res.json({ ok: true, id: row.id, journalCleared: result.journalCleared, fileRemoved: result.fileRemoved });
+});
+
+/**
+ * POST /api/dola/generation-tasks/batch-delete —— 批量删除，body { ids: [...] }
+ *
+ * ★ 全有或全无：先在内存里把每一条的状态都查一遍，只要有任何一条是
+ *   运行中/排队中，就**整个请求拒绝、一条都不删**。
+ *   绝不"能删的先删、删不掉的跳过" —— 那样用户会以为失败的那批也清了。
+ */
+router.post('/generation-tasks/batch-delete', requirePerm('dola:task:delete'), async (req, res) => {
+  const ids = Array.isArray(req.body?.ids)
+    ? [...new Set(req.body.ids.map(Number).filter(Boolean))] : [];
+  if (!ids.length) return res.status(400).json({ ok: false, message: '没有选中任何任务' });
+
+  const rows = [];
+  const blocked = [];
+  const missing = [];
+  for (const id of ids) {
+    const row = getVideoTask(id);
+    if (!row) { missing.push(id); continue; }
+    rows.push(row);
+    if (!isTaskDeletable(row.status)) blocked.push({ id, status: row.status });
+  }
+  if (blocked.length) {
+    return res.status(409).json({
+      ok: false,
+      message: `有 ${blocked.length} 条任务处于运行中/排队中，不能删除；本次未删除任何任务`,
+      blocked,
+    });
+  }
+
+  const deletedIds = [];
+  let journalCleared = 0;
+  let fileRemoved = 0;
+  for (const row of rows) {
+    const r = await deleteVideoTask(row.id);
+    if (r?.ok) {
+      deletedIds.push(row.id);
+      journalCleared += r.journalCleared || 0;
+      fileRemoved += r.fileRemoved ? 1 : 0;
+    }
+  }
+  audit(req, 'dola.generation_bulk_delete', 'dola_video', deletedIds.join(','),
+    `批量删除 ${deletedIds.length}/${ids.length} 条；journal ${journalCleared}；文件 ${fileRemoved}`);
+  res.json({
+    ok: true, deleted: deletedIds.length, requested: ids.length,
+    skipped: missing.length, missing, journalCleared, fileRemoved, ids: deletedIds,
+  });
+});
+
 /** POST /api/dola/maintenance/run —— 立即执行一次完整维护（不受自动开关影响） */
 router.post('/maintenance/run', requirePerm('dola:check'), (req, res) => {
   const result = enqueueDolaMaintenance('manual', { force: true, userId: req.user.id });
@@ -1140,218 +1233,15 @@ router.post('/accounts/:id/probe', requirePerm('dola:check'), async (req, res) =
  */
 const upstreamConcatEnabled = () => boolSetting('dola_upstream_concat', false);
 
-/** Read-only page capability checks; never part of automatic session maintenance. */
-const NATIVE_PROBE_CONFIG = Object.freeze({
-  15: {
-    seconds: 15,
-    jobType: 'dola_native_15s',
-    probe: probeNativeFifteenSecondViaBrowser,
-    auditName: 'dola.native_15s_probe',
-    successNote: '已确认页面提供 Seedance 2.0 原生 15 秒选项',
-  },
-  30: {
-    seconds: 30,
-    jobType: 'dola_native_30s',
-    probe: probeNativeThirtySecondViaBrowser,
-    auditName: 'dola.native_30s_probe',
-    allowUpstreamConcat: true,
-    // 备注按**实际来源**写，不要把两种 30 秒混成一句话：
-    // 载体改写是我们把 15s 请求改成 30s；上游合成是页面自己就标着 30 秒。
-    successNote: result => result?.source === 'upstream_concat'
-      ? '已确认页面提供上游合成档位（30s = 15s ×2，拆段与首尾相接均在上游完成，本服务不做本地拼接）'
-      : '已确认页面 15 秒载体可用（Seedance 2.5，2 额度档，请求改写 duration=30）',
-  },
-});
-
-const REFERENCE_IMAGE_PROBE_CONFIG = Object.freeze({
-  jobType: 'dola_reference_images',
-  probe: probeReferenceImageViaBrowser,
-  auditName: 'dola.reference_image_probe',
-  successNote: '已确认页面提供明确的图片上传控件；尚未执行真实上传',
-});
-
-function nativeProbeConfig(seconds) {
-  return NATIVE_PROBE_CONFIG[Number(seconds)] || null;
-}
-
 /**
- * 执行一次原生能力只读探测并做竞态安全写回。
+ * 30 秒「短档位载体 + 请求改写」通道（默认关 = 现行为）。
  *
- * 这个核心同时供单账号 HTTP 路由和批量后台任务使用，避免两条路径的
- * Cookie / 代理 / 能力字段规则漂移。批量探测默认串行，减少浏览器和上游
- * 风控压力；任何异常都只记 unknown，不把账号误清理成 invalid。
+ * 探针必须和生成路径读同一套口径：`dola_allow_30s_rewrite` 决定判据是否接受
+ * 「页面真实存在的更短载体」，`dola_duration_carrier_map` 决定具体用哪个档位。
+ * 两者与 generator.js 里的同名开关一一对应 —— 只改一边就会出现
+ * 「探针把号记成 available、生成时却选不到档位」这种最难查的不一致。
  */
-async function probeNativeCapability(accountId, seconds) {
-  const config = nativeProbeConfig(seconds);
-  if (!config) return { status: 400, ok: false, seconds, state: 'unknown', message: `不支持原生 ${seconds} 秒探测` };
-
-  const id = Number(accountId);
-  const acc = db.prepare('SELECT * FROM dola_accounts WHERE id=?').get(id);
-  if (!acc) return { status: 404, ok: false, seconds, state: 'unknown', message: '账号不存在' };
-  if (acc.status === 'disabled') return { status: 409, ok: false, seconds, state: 'unknown', message: '账号已停用，未探测', label: acc.label };
-
-  const active = db.prepare("SELECT id FROM dola_videos WHERE account_id=? AND status IN ('queued','submitting','generating','resolving') LIMIT 1").get(id);
-  if (active) {
-    return { status: 409, ok: false, seconds, state: 'unknown', message: '账号正在生成，跳过本次能力探测', label: acc.label };
-  }
-
-  const cookies = accountCookies(acc);
-  const missing = missingRequired(cookies);
-  // 只有 30 秒档位 + 设置开启时，才允许把「上游合成」当成可用证据。
-  const concatAllowed = Boolean(config.allowUpstreamConcat) && upstreamConcatEnabled();
-  let result;
-  if (missing.length) {
-    result = { ok: false, state: 'unknown', error: '缺少关键 cookie，未进行能力判定' };
-  } else {
-    try {
-      result = await config.probe(cookies, {
-        timeout: Math.min(90_000, numSetting('dola_http_timeout', 20) * 1000 + 60_000),
-        proxy: proxyOf(acc),
-        proxyUrl: proxyUrlOf(acc),
-        // 传下去让探测复用该账号的持久化 profile —— 命中缓存后热启动只要 ~0.36MB，
-        // 否则每次冷启动 12MB，走 5Mbps 静态 IP 时必然超时、结果被记成 unknown。
-        accountId: id,
-        allowUpstreamConcat: concatAllowed,
-      });
-    } catch (e) {
-      // 诊断日志：这里原先是裸 catch，会把真实异常一口吞掉，
-      // 页面只剩一句笼统的「页面、登录状态或网络未能完成只读能力探测」，永远查不到根因。
-      console.error(`[probe] ${seconds}s capability probe threw for account ${id}: name=${e?.name || 'unknown'} code=${e?.code || 'none'} message=${String(e?.message || e).slice(0, 300)}`);
-      result = { ok: false, state: 'unknown', error: '页面、登录状态或网络未能完成只读能力探测' };
-    }
-  }
-
-  const nativeVerified = isVerifiedNativeCapability(result, config.seconds, { allowUpstreamConcat: concatAllowed });
-  const state = nativeVerified ? 'available'
-    : result?.state === 'unavailable' ? 'unavailable' : 'unknown';
-  /**
-   * ★ 登录态（对照参考站 §4 的 logged_in 字段 / unsigned 独立状态）。三态、绝不猜：
-   *   'available'   探针真的认出了创作面板 → 已登录（探针顺便覆盖了登录态，不用再单跑一次）
-   *   'unavailable' 页面**已经加载**、但创作输入框始终没出现（"未确认已登录的创作页面"）→ 未登录
-   *   null          证据不足（页面根本没打开 / 控件没加载完 / 其它）→ 保持原值不动
-   *
-   * ⚠️ 判据用 classifyFailure 而不是 result.reason：**一个真相来源**，探测链路和任务链路同口径。
-   *    不能用 reason==='VIDEO_PAGE_NOT_READY' —— 实测（#408）探针整体超时时外层会把
-   *    reason 覆写成 VIDEO_PREPARATION_TIMEOUT，把更具体的"输入框没出现"盖掉，于是漏判。
-   *    文案「未确认已登录的创作页面」只出自 native-capability.js:156 一处抛出点，
-   *    且不含「创作条…未完成加载」（那种输入框已出现 = 已登录），所以按文案判是精确的。
-   *
-   * ⚠️ 必须排除「页面没打开」：2026-09-25 实测，代理会话失效时也报同一句话，
-   *    拿它写 unavailable 会把**可用账号**（实测 #420）封掉。这就是 provider.js 保留导航异常的意义。
-   */
-  const loginState = nativeVerified ? 'available'
-    : (result?.pageLoaded !== false && classifyFailure(result?.error || '').code === 'login') ? 'unavailable'
-      : null;
-  // 备注里带上结构化 reason：只看中文长句分不清「时长控件没加载完」和「登录没确认」，
-  // 而这两件事该修的地方完全不同（对照参考站 §11 把「登录握手」单列一类日志）。
-  const successNote = typeof config.successNote === 'function' ? config.successNote(result) : config.successNote;
-  const note = String(nativeVerified ? successNote
-    : `${result?.error || '本次未完成能力判定'}${result?.reason ? `［${result.reason}］` : ''}`).slice(0, 300);
-  const capabilityColumn = `native_${config.seconds}s`;
-  const loginSet = loginState ? `, login_state=?, login_at=?, login_note=?` : '';
-  const updated = db.prepare(`UPDATE dola_accounts
-    SET ${capabilityColumn}_state=?, ${capabilityColumn}_at=?, ${capabilityColumn}_note=?, updated_at=?${loginSet}
-    WHERE id=? AND cookie_hash=? AND proxy=? AND status <> 'disabled'`)
-    .run(state, now(), note, now(),
-      ...(loginState ? [loginState, now(), loginState === 'available'
-        ? '只读探测已确认创作面板可用（登录态正常）'
-        : '页面已加载但创作输入框未出现，已暂停选号并等待只读复核'] : []),
-      id, acc.cookie_hash, acc.proxy).changes > 0;
-  return { status: 200, ok: nativeVerified, seconds: config.seconds, state, loginState, message: note, updated, label: acc.label };
-}
-
-/**
- * 执行一次参考图能力只读探测并做竞态安全写回。
- *
- * 只认真实页面里明确声明 image 类型的 file input；仅有加号按钮、拖拽
- * 区域或未知菜单时保持 unknown，避免把猜测当成已支持。
- */
-async function probeReferenceImageCapability(accountId) {
-  const id = Number(accountId);
-  const acc = db.prepare('SELECT * FROM dola_accounts WHERE id=?').get(id);
-  if (!acc) return { status: 404, ok: false, state: 'unknown', message: '账号不存在' };
-  if (acc.status === 'disabled') {
-    return { status: 409, ok: false, state: 'unknown', message: '账号已停用，未探测', label: acc.label };
-  }
-
-  const active = db.prepare("SELECT id FROM dola_videos WHERE account_id=? AND status IN ('queued','submitting','generating','resolving') LIMIT 1").get(id);
-  if (active) {
-    return { status: 409, ok: false, state: 'unknown', message: '账号正在生成，跳过本次能力探测', label: acc.label };
-  }
-
-  const cookies = accountCookies(acc);
-  const missing = missingRequired(cookies);
-  let result;
-  if (missing.length) {
-    result = { ok: false, state: 'unknown', error: '缺少关键 cookie，未进行能力判定' };
-  } else {
-    try {
-      result = await REFERENCE_IMAGE_PROBE_CONFIG.probe(cookies, {
-        timeout: Math.min(90_000, numSetting('dola_http_timeout', 20) * 1000 + 60_000),
-        proxy: proxyOf(acc),
-        proxyUrl: proxyUrlOf(acc),
-      });
-    } catch (e) {
-      // 诊断日志：同上，参考图探测的裸 catch 也会吞掉真实异常。
-      console.error(`[probe] reference-image capability probe threw for account ${id}: name=${e?.name || 'unknown'} code=${e?.code || 'none'} message=${String(e?.message || e).slice(0, 300)}`);
-      result = { ok: false, state: 'unknown', error: '页面、登录状态或网络未能完成只读能力探测' };
-    }
-  }
-
-  const state = ['available', 'unavailable', 'unknown'].includes(result?.state) ? result.state : 'unknown';
-  const evidence = result?.ok ? referenceImageEvidenceNote(result.imageInputs) : '';
-  const note = String(result?.ok ? `${REFERENCE_IMAGE_PROBE_CONFIG.successNote}${evidence}` : (result?.error || '本次未完成能力判定')).slice(0, 300);
-  const updated = db.prepare(`UPDATE dola_accounts
-    SET reference_image_state=?, reference_image_at=?, reference_image_note=?, updated_at=?
-    WHERE id=? AND cookie_hash=? AND proxy=? AND status <> 'disabled'`)
-    .run(state, now(), note, now(), id, acc.cookie_hash, acc.proxy).changes > 0;
-  return { status: 200, ok: Boolean(result?.ok), state, message: note, updated, label: acc.label };
-}
-
-for (const config of Object.values(NATIVE_PROBE_CONFIG)) {
-  registerJobHandler(config.jobType, async (accountId) => {
-    const result = await probeNativeCapability(accountId, config.seconds);
-    return { ok: result.status === 200 && result.ok, message: result.message };
-  });
-}
-
-registerJobHandler(REFERENCE_IMAGE_PROBE_CONFIG.jobType, async (accountId) => {
-  const result = await probeReferenceImageCapability(accountId);
-  return { ok: result.status === 200 && result.ok, message: result.message };
-});
-
-async function runNativeCapabilityProbe(req, res, { seconds }) {
-  const config = nativeProbeConfig(seconds);
-  const result = await probeNativeCapability(req.params.id, seconds);
-  if (result.status !== 200) return res.status(result.status).json({ ok: false, seconds, state: result.state, message: result.message });
-  audit(req, config.auditName, 'dola_account', Number(req.params.id), `state=${result.state}; updated=${result.updated}`);
-  res.json({ ok: result.ok, seconds: result.seconds, state: result.state, message: result.message, updated: result.updated });
-}
-
-/**
- * POST /api/dola/accounts/:id/native-30s-probe
- */
-router.post('/accounts/:id/native-30s-probe', requirePerm('dola:check'), async (req, res) => runNativeCapabilityProbe(req, res, {
-  seconds: 30,
-}));
-
-/**
- * POST /api/dola/accounts/:id/native-15s-probe
- */
-router.post('/accounts/:id/native-15s-probe', requirePerm('dola:check'), async (req, res) => runNativeCapabilityProbe(req, res, {
-  seconds: 15,
-}));
-
-/** POST /api/dola/accounts/:id/reference-images-probe */
-router.post('/accounts/:id/reference-images-probe', requirePerm('dola:check'), async (req, res) => {
-  const result = await probeReferenceImageCapability(req.params.id);
-  if (result.status !== 200) {
-    return res.status(result.status).json({ ok: false, state: result.state, message: result.message });
-  }
-  audit(req, REFERENCE_IMAGE_PROBE_CONFIG.auditName, 'dola_account', Number(req.params.id), `state=${result.state}; updated=${result.updated}`);
-  return res.json({ ok: result.ok, state: result.state, message: result.message, updated: result.updated });
-});
-
+const allow30sRewrite = () => boolSetting('dola_allow_30s_rewrite', false);
 /**
  * POST /api/dola/accounts/:id/proxy  { proxy }
  *
@@ -1906,7 +1796,8 @@ router.post('/accounts/:id/test-generate', requirePerm('dola:create'), async (re
   }
   if (!tokenValue) return res.status(400).json({ ok: false, message: '请提供用户令牌（测试生成走网关链路扣积分）' });
 
-  const seconds = [10, 15, 20, 30].includes(Number(req.body?.seconds)) ? Number(req.body.seconds) : 10;
+  // 档位精简：非法/缺失一律落 30（主档位）。10/20 已下线，不再有 10 秒兜底。
+  const seconds = SUPPORTED_VIDEO_SECONDS.includes(Number(req.body?.seconds)) ? Number(req.body.seconds) : 30;
   const prompt = String(req.body?.prompt || '').trim().slice(0, 500) || `测试生成（账号 ${acc.label || id}，${seconds} 秒）`;
   try {
     const r = await submitGenerationTask({
@@ -1942,7 +1833,8 @@ router.post('/stress-test', requirePerm('dola:create'), async (req, res) => {
   }
   if (!tokenValue) return res.status(400).json({ ok: false, message: '请提供用户令牌（压力测试走网关链路扣积分）' });
 
-  const seconds = [10, 15, 20, 30].includes(Number(req.body?.seconds)) ? Number(req.body.seconds) : 10;
+  // 档位精简：非法/缺失一律落 30（主档位）。10/20 已下线，不再有 10 秒兜底。
+  const seconds = SUPPORTED_VIDEO_SECONDS.includes(Number(req.body?.seconds)) ? Number(req.body.seconds) : 30;
   const promptBase = String(req.body?.prompt || '').trim().slice(0, 200) || '压力测试';
   const results = [];
   for (let i = 0; i < count; i++) {
@@ -1968,10 +1860,8 @@ router.post('/jobs', (req, res, next) => {
   next();
 }, (req, res) => {
   const type = String(req.body?.type || '');
-  const nativeSeconds = type === 'dola_native_15s' ? 15 : (type === 'dola_native_30s' ? 30 : null);
-  const referenceImages = type === 'dola_reference_images';
   const helloProbe = type === 'dola_hello_probe';
-  if (!['dola_check', 'dola_credits', 'dola_native_15s', 'dola_native_30s', 'dola_reference_images', 'dola_hello_probe'].includes(type)) {
+  if (!['dola_check', 'dola_credits', 'dola_hello_probe'].includes(type)) {
     return res.status(400).json({ ok: false, message: `不支持的任务类型：${type}` });
   }
   if (helloProbe) {
@@ -1980,32 +1870,22 @@ router.post('/jobs', (req, res, next) => {
   }
   let ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number).filter(Boolean) : [];
   if (req.body?.all) {
-    const statusFilter = nativeSeconds
-      ? `status = 'valid' AND proxy IS NOT NULL AND proxy <> '' AND native_${nativeSeconds}s_state <> 'available'`
-      : referenceImages
-        ? "status = 'valid' AND proxy IS NOT NULL AND proxy <> '' AND reference_image_state <> 'available'"
-      : (type === 'dola_credits' ? "status IN ('valid','unknown')" : "status <> 'disabled'");
+    const statusFilter = type === 'dola_credits' ? "status IN ('valid','unknown')" : "status <> 'disabled'";
     ids = db.prepare(`SELECT id FROM dola_accounts WHERE ${statusFilter} ORDER BY id`).all().map((r) => r.id);
   }
   if (!ids.length) return res.status(400).json({ ok: false, message: '没有要处理的对象' });
 
   // 浏览器通道很吃内存，并发单独限
-  const defaultConc = nativeSeconds || referenceImages
-    ? 1
-    : helloProbe
-      ? 1
-    : (type === 'dola_credits' && getSetting('dola_use_browser', 'false') === 'true'
-      ? numSetting('dola_browser_concurrency', 3)
-      : numSetting('dola_check_concurrency', 5));
+  const defaultConc = (type === 'dola_credits' && getSetting('dola_use_browser', 'false') === 'true'
+    ? numSetting('dola_browser_concurrency', 3)
+    : numSetting('dola_check_concurrency', 5));
 
   const job = createJob({
     type,
     ids,
-    concurrency: helloProbe
-      ? 1
-      : nativeSeconds || referenceImages
-      ? Math.min(2, Math.max(1, Number(req.body?.concurrency) || defaultConc))
-      : (Number(req.body?.concurrency) || defaultConc),
+    // ⚠️ hello_probe 虽已是纯协议通道，并发仍刻意锁 1：同一个出口并发打 /chat/completion
+    //    更容易吃 710022002，放开前必须做「并发 × 710022002 命中率」实测。
+    concurrency: helloProbe ? 1 : (Number(req.body?.concurrency) || defaultConc),
     userId: req.user.id,
   });
   audit(req, 'dola.job_create', 'job', job.id, `${type} × ${ids.length}`);

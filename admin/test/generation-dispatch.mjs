@@ -25,6 +25,9 @@ function fixture({ chargeError = false, startResult = true, withImages = true, c
     // 每日额度：本测试的 db 是个三行桩，喂不了真实的 point_transactions 查询，
     // 所以这里注入**恒放行**的假实现（只保留 `ok`，让闸门不拦）。
     // 真实的定价与额度口径由 test/gateway-quota.mjs 覆盖。
+    // ★ 档位精简（2026-09-27）：gateway.js 新增了这两个 import，必须在这里补同名绑定。
+    SUPPORTED_VIDEO_SECONDS: [15, 30],
+    RETIRED_VIDEO_SECONDS: [10, 20],
     quotaView: () => ({ limit: 0, used: 0, remaining: null, ok: true, reason: 'unlimited', day: '1970-01-01', limitSource: 'none' }),
     usageSnapshot: () => ({ limit: 0, used: 0, remaining: null, ok: true, reason: 'unlimited', day: '1970-01-01', limitSource: 'none' }),
     resolveTaskPoints: () => ({ points: 1, source: 'setting', key: 'gateway_points_per_task', costsReason: 'n/a' }),
@@ -101,7 +104,7 @@ function assertPreflightRejected(h, error, diagnostic) {
   assert.equal(resource, 'generation_attempt');
   assert.equal(id, '');
   assert.deepEqual(plain(details), {
-    code: error.code, seconds: 10, mode: 'standard', diagnostic,
+    code: error.code, seconds: 30, mode: 'standard', diagnostic,
     taskCreated: false, charged: false,
   });
   assert.deepEqual(plain(h.response.data), {
@@ -113,7 +116,7 @@ for (const [code, status] of [['GENERATION_PREFLIGHT_FAILED', undefined], ['GENE
   test(`${code} is audited once, sanitized and rejected before any task or billing side effects`, async () => {
     const secret = 'synthetic-extra-value=not-a-real-secret';
     const diagnostic = {
-      version: 1, phase: 'model', seconds: 10, elapsedMs: 1800, phaseElapsedMs: 250,
+      version: 1, phase: 'model', seconds: 30, elapsedMs: 1800, phaseElapsedMs: 250,
       reason: 'MODEL_OPTION_NOT_CONFIRMED',
       network: { failedRequests: 3, httpErrors: 2, url: secret, headers: { authorization: secret }, body: secret },
       page: { errors: 1, lastErrorKind: 'type_error', message: secret, stack: secret },
@@ -123,7 +126,7 @@ for (const [code, status] of [['GENERATION_PREFLIGHT_FAILED', undefined], ['GENE
     const h = fixture({ createError: error });
     await h.run();
     const expected = {
-      version: 1, phase: 'model', seconds: 10, elapsedMs: 1800, phaseElapsedMs: 250,
+      version: 1, phase: 'model', seconds: 30, elapsedMs: 1800, phaseElapsedMs: 250,
       reason: 'MODEL_OPTION_NOT_CONFIRMED',
       network: { failedRequests: 3, httpErrors: 2 }, page: { errors: 1, lastErrorKind: 'type_error' },
     };

@@ -176,7 +176,6 @@
             <el-table-column label="状态" width="100"><template #default="{ row }"><el-tag size="small" :type="statusType(row.status)">{{ statusLabel(row.status) }}</el-tag></template></el-table-column>
             <el-table-column label="代理" width="120"><template #default="{ row }"><el-tag size="small" :type="row.proxy ? 'success' : 'danger'">{{ row.proxy ? proxyRegion(row.proxy) : '未配置' }}</el-tag></template></el-table-column>
             <el-table-column label="出口隔离" width="125"><template #default="{ row }"><el-tag size="small" :type="row.exitIpShared ? 'danger' : (row.exitIpKnown ? 'success' : 'warning')">{{ row.exitIpShared ? '共享出口' : (row.exitIpKnown ? '已核验' : '待核验') }}</el-tag></template></el-table-column>
-            <el-table-column label="能力" width="150"><template #default="{ row }">30 秒 {{ row.native_30s_state === 'available' ? '✓' : '—' }} · 参考图 {{ row.reference_image_state === 'available' ? '✓' : '—' }}</template></el-table-column>
             <el-table-column label="冷却" width="170"><template #default="{ row }">{{ row.cooldown_until && new Date(row.cooldown_until) > new Date() ? fmt(row.cooldown_until) : '—' }}</template></el-table-column>
             <el-table-column label="操作" width="150" fixed="right"><template #default="{ row }"><el-button v-if="can('dola:update') && (!row.exitIpKnown || row.exitIpShared || !row.proxy)" size="small" text type="primary" @click="openProxyRepairFor(row)">处理</el-button><span v-else class="muted">正常</span></template></el-table-column>
             <template #empty><el-empty description="暂无账号" :image-size="70" /></template>
@@ -232,7 +231,6 @@
                 <span>{{ replenishBanner.text }}</span>
                 <span class="replenish-actions">
                   <el-button v-if="can('dola:import')" size="small" type="primary" :icon="Upload" @click="importDlg = true">去补号</el-button>
-                  <el-button v-if="can('dola:check')" size="small" :icon="Money" @click="runJob('dola_credits')">批量查额度</el-button>
                 </span>
               </div>
             </template>
@@ -259,12 +257,7 @@
               <el-button v-if="can('dola:delete')" :disabled="!selected.length" type="danger" plain @click="bulkRemove">
                 删除{{ selected.length ? `（${selected.length}）` : '' }}
               </el-button>
-              <el-button v-if="can('dola:check')" :icon="CircleCheck" @click="runJob('dola_check')">批量校验</el-button>
               <el-button v-if="can('dola:create')" type="warning" plain @click="runJob('dola_hello_probe')">发送“你好”探测</el-button>
-              <el-button v-if="can('dola:check')" :icon="Money" @click="runJob('dola_credits')">批量查额度</el-button>
-              <el-button v-if="can('dola:check')" plain @click="runJob('dola_native_15s')">批量探测 15 秒</el-button>
-              <el-button v-if="can('dola:check')" plain @click="runJob('dola_native_30s')">批量探测 30 秒</el-button>
-              <el-button v-if="can('dola:check')" plain @click="runJob('dola_reference_images')">批量探测参考图</el-button>
               <el-button v-if="can('dola:update')" :disabled="!selected.length" plain @click="batchRecover">批量恢复{{ selected.length ? `（${selected.length}）` : '' }}</el-button>
               <el-button v-if="can('dola:update')" :disabled="!selected.length" plain @click="batchResetQuota">重置额度{{ selected.length ? `（${selected.length}）` : '' }}</el-button>
               <el-button v-if="can('dola:update')" :disabled="!selected.length" plain @click="groupDlg = true">批量分组</el-button>
@@ -313,7 +306,11 @@
             <el-table-column label="账号" min-width="190">
               <template #default="{ row }">
                 <div class="cell-stack">
-                  <span class="main"><template v-if="row.accountCode">[{{ row.accountCode }}] </template>{{ row.loginEmail || primaryName(row) }}</span>
+                  <!-- 名字走 primaryName() 统一出口：备注 → 邮箱 → 不重名的 label → 账号#<id>。
+                       旧写法 `row.loginEmail || primaryName(row)` 是多余的（primaryName 里已经含邮箱），
+                       而且它把重名的自动编号 `账号001` 原样上屏 —— 16 行一模一样，已按工作单改掉。
+                       原 label / account_hint 收进 tooltip，信息不丢。 -->
+                  <span class="main" :title="nameTitle(row)"><template v-if="row.accountCode">[{{ row.accountCode }}] </template>{{ primaryName(row) }}</span>
                   <span class="sub mono">
                     <template v-if="secondaryName(row)">{{ secondaryName(row) }}</template>
                     <template v-else-if="!row.account_hint">未识别（校验后可回填）</template>
@@ -355,15 +352,6 @@
                     :title="row.login_note || '尚未确认登录态（未做只读探测）'">
                     登录态：{{ row.login_state === 'available' ? '正常'
                       : (row.login_state === 'unavailable' ? '已停选' : '未探测') }}
-                  </span>
-                  <span class="sub native-capability" :title="row.native_15s_note || '尚未做原生 15 秒页面探测'">
-                    15秒：{{ row.native_15s_state === 'available' ? '已确认' : (row.native_15s_state === 'unavailable' ? '未提供' : '待探测') }}
-                  </span>
-                  <span class="sub native-capability" :title="row.native_30s_note || '尚未做原生 30 秒页面探测'">
-                    30秒：{{ row.native_30s_state === 'available' ? '已确认' : (row.native_30s_state === 'unavailable' ? '未提供' : '待探测') }}
-                  </span>
-                  <span class="sub native-capability" :title="row.reference_image_note || '尚未做参考图页面探测'">
-                    参考图：{{ row.reference_image_state === 'available' ? '已确认' : (row.reference_image_state === 'unavailable' ? '未发现' : '待探测') }}
                   </span>
                 </div>
               </template>
@@ -424,9 +412,6 @@
                         <el-dropdown-item v-if="can('dola:update') && row.cooldown_until && new Date(row.cooldown_until) > new Date()" command="recover">解除冷却</el-dropdown-item>
                         <el-dropdown-item v-if="can('dola:update')" command="resetQuota">重置额度</el-dropdown-item>
                         <el-dropdown-item v-if="can('dola:check')" command="probe">接口探测</el-dropdown-item>
-                        <el-dropdown-item v-if="can('dola:check')" command="native15">检查原生 15 秒</el-dropdown-item>
-                        <el-dropdown-item v-if="can('dola:check')" command="native30">检查原生 30 秒</el-dropdown-item>
-                        <el-dropdown-item v-if="can('dola:check')" command="referenceImages">检查参考图上传</el-dropdown-item>
                         <el-dropdown-item v-if="can('dola:create')" command="helloProbe">发送“你好”探测</el-dropdown-item>
                         <el-dropdown-item command="toggle" divided v-if="can('dola:update')">
                           {{ row.status === 'disabled' ? '启用' : '停用' }}
@@ -457,7 +442,7 @@
       <el-tab-pane label="批量任务" name="jobs">
         <el-card shadow="never">
           <div class="toolbar">
-            <span class="muted">批量校验/查额度都跑成后台任务，几百个账号不会把页面卡死。</span>
+            <span class="muted">「发送你好探测」这类批处理都跑成后台任务，几百个账号不会把页面卡死。</span>
             <div class="spacer" />
             <el-button :icon="Refresh" @click="loadJobs">刷新</el-button>
           </div>
@@ -516,6 +501,7 @@
               <span class="muted">任务列表只读监控；批量创建走网关链路扣积分</span>
             </div>
             <div class="spacer" />
+            <span v-if="pendingCount" class="pending-hint">正在创建 {{ pendingCount }} 条任务…</span>
             <span v-if="provider.generation" class="muted">
               运行中 {{ provider.generation.running ?? 0 }} · 排队 {{ provider.generation.queued ?? 0 }} ·
               并发 {{ provider.generation.running ?? 0 }}/{{ provider.generation.concurrency ?? 1 }} ·
@@ -523,10 +509,31 @@
             </span>
             <el-button v-if="can('dola:create')" plain @click="openApiWorkbench">V1 API 工作台</el-button>
             <el-button v-if="can('dola:create')" type="primary" @click="openBatchGen">批量创建</el-button>
+            <el-button
+              v-if="canDeleteTask"
+              type="danger"
+              plain
+              :disabled="!deletableSelected.length"
+              @click="bulkDeleteGeneration"
+            >批量删除{{ deletableSelected.length ? `（${deletableSelected.length}）` : '' }}</el-button>
             <el-button :icon="Refresh" :loading="generationLoading" @click="loadGeneration">刷新</el-button>
           </div>
-          <el-table :data="generationTasks" v-loading="generationLoading" border stripe>
-            <el-table-column prop="id" label="ID" width="70" />
+          <el-table
+            ref="generationTableRef"
+            :data="generationRows"
+            v-loading="generationLoading"
+            border
+            stripe
+            :row-key="(row) => row._key ?? row.id"
+            @selection-change="(rows) => (generationSelected = rows)"
+          >
+            <el-table-column v-if="canDeleteTask" type="selection" width="46" reserve-selection :selectable="isTaskDeletable" />
+            <el-table-column label="ID" width="70">
+              <template #default="{ row }">
+                <span v-if="isPlaceholder(row)" class="muted">—</span>
+                <span v-else>{{ row.id }}</span>
+              </template>
+            </el-table-column>
             <el-table-column label="提示词" min-width="260" show-overflow-tooltip>
               <template #default="{ row }">{{ row.prompt || '—' }}{{ row.promptTruncated ? '…' : '' }}</template>
             </el-table-column>
@@ -546,13 +553,39 @@
             <el-table-column label="时间" width="165">
               <template #default="{ row }">{{ fmt(row.created_at) }}</template>
             </el-table-column>
-            <el-table-column label="错误说明" min-width="200" show-overflow-tooltip>
-              <template #default="{ row }">{{ row.error || '—' }}</template>
-            </el-table-column>
-            <el-table-column label="操作" width="90" fixed="right">
+            <!--
+              错误说明列改成「原文 + 建议」两行（2026-09-27）。
+              以前只把后端 error 原样丢出来，用户看到「上游限流（code 710022002）」不知道下一步干什么，
+              只能反复重提 —— 那正是失败率被放大的地方。
+            -->
+            <el-table-column label="错误说明" min-width="260">
               <template #default="{ row }">
-                <el-button v-if="can('dola:check') && ['queued','submitting','generating','resolving'].includes(row.status)" size="small" text type="danger" @click="cancelGeneration(row)">取消</el-button>
-                <span v-else class="muted">—</span>
+                <div class="err-raw">{{ row.error || '—' }}</div>
+                <div v-if="failureAdvice(row)" class="failure-advice">建议：{{ failureAdvice(row) }}</div>
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" width="200" fixed="right">
+              <template #default="{ row }">
+                <!-- 占位行（服务端还没回包）不给任何按钮：它还没有真实 taskId，点了必然 404 -->
+                <span v-if="isPlaceholder(row)" class="muted">提交中…</span>
+                <el-button
+                  v-if="!isPlaceholder(row) && row.status === 'failed' && can('dola:create')"
+                  size="small" text type="primary"
+                  title="把这条任务的参数填回「批量创建」，确认后再提交（不会自动重提）"
+                  @click="rebuildGeneration(row)"
+                >重建</el-button>
+                <el-button
+                  v-if="!isPlaceholder(row) && can('dola:check') && !isTaskDeletable(row)"
+                  size="small" text type="danger" @click="cancelGeneration(row)"
+                >取消</el-button>
+                <el-button
+                  v-if="!isPlaceholder(row) && canDeleteTask"
+                  size="small" text type="danger"
+                  :disabled="!isTaskDeletable(row)"
+                  :title="isTaskDeletable(row) ? '删除这条任务记录' : '运行中/排队中的任务不能删除'"
+                  @click="deleteGeneration(row)"
+                >删除</el-button>
+                <span v-if="!isPlaceholder(row) && !canDeleteTask && isTaskDeletable(row)" class="muted">—</span>
               </template>
             </el-table-column>
             <template #empty><el-empty description="还没有生成任务" :image-size="80" /></template>
@@ -603,10 +636,10 @@
     <!-- ============ 批量创建生成任务 ============ -->
     <el-dialog v-model="batchGenDlg" title="批量创建生成任务" width="680px" :close-on-click-modal="false">
       <el-alert type="info" :closable="false" show-icon class="tip">
-        <template #title>逐条顺序提交，单条失败不中断；每条都走用户端网关链路（排重 / 预检 / 扣积分 / 失败退款）</template>
+        <template #title>逐条创建任务，单条未受理不中断</template>
         <div class="notice-body">
-          积分从所选用户令牌扣除。<code>15 秒</code>只能走专家模式（选 15 秒会自动切专家模式）。
-          参考站没有的：批量创建不支持参考图。
+          每条先通过用户端网关建任务并进入后台队列，积分从所选用户令牌扣除；任务是否成片请到任务列表查看。
+          <code>15 秒</code>只能走专家模式（选 15 秒会自动切专家模式）。批量创建不支持参考图。
         </div>
       </el-alert>
       <el-form label-width="90px">
@@ -636,11 +669,22 @@
         </el-form-item>
         <el-form-item label="时长">
           <el-select v-model="batchGenForm.seconds" style="width: 160px" @change="onBatchSecondsChange">
-            <el-option :value="10" label="10 秒" />
-            <el-option :value="15" label="15 秒" />
-            <el-option :value="20" label="20 秒" />
+            <el-option :value="15" label="15 秒（专家模式）" />
             <el-option :value="30" label="30 秒" />
           </el-select>
+        </el-form-item>
+        <!-- 号池可用性：提交前就把「有没有号能上」讲清楚，别等任务失败才说 -->
+        <el-form-item v-if="poolRouteText" label="号池">
+          <el-alert
+            :type="poolRouteBlocked ? 'error' : (poolRoute.error ? 'warning' : 'success')"
+            :closable="false" show-icon class="tip"
+          >
+            <template #title>{{ poolRouteText }}</template>
+            <div v-if="poolRouteBlocked" class="notice-body">
+              提交按钮已暂时禁用。可先到「号池」标签页导入新的 Cookie，
+              或在账号行的「更多」菜单里单独给某个号跑一次探测。
+            </div>
+          </el-alert>
         </el-form-item>
         <el-form-item label="比例">
           <el-select v-model="batchGenForm.ratio" style="width: 160px">
@@ -656,26 +700,30 @@
       </el-form>
       <template #footer>
         <el-button @click="batchGenDlg = false">取消</el-button>
-        <el-button type="primary" :loading="batchGenSaving" @click="submitBatchGen">开始提交</el-button>
+        <el-button
+          type="primary" :loading="batchGenSaving" :disabled="poolRouteBlocked"
+          :title="poolRouteBlocked ? '号池当前没有可用于该档位的账号' : ''"
+          @click="submitBatchGen"
+        >开始提交</el-button>
       </template>
     </el-dialog>
 
     <!-- ============ 批量创建结果 ============ -->
     <el-dialog v-model="batchGenResultDlg" title="批量创建结果" width="680px">
       <el-alert :type="batchGenResult?.failCount ? 'warning' : 'success'" :closable="false" show-icon class="tip"
-        :title="`成功 ${batchGenResult?.okCount ?? 0} 条，失败 ${batchGenResult?.failCount ?? 0} 条`" />
+        :title="`已建任务 ${batchGenResult?.okCount ?? 0} 条，未受理 ${batchGenResult?.failCount ?? 0} 条`" />
       <el-table :data="batchGenResult?.results || []" border stripe size="small" max-height="420">
         <el-table-column label="提示词" min-width="260" show-overflow-tooltip>
           <template #default="{ row }">{{ row.prompt || '（空）' }}</template>
         </el-table-column>
         <el-table-column label="结果" width="90">
           <template #default="{ row }">
-            <el-tag size="small" :type="row.ok ? 'success' : 'danger'">{{ row.ok ? '成功' : '失败' }}</el-tag>
+            <el-tag size="small" :type="row.ok ? 'success' : 'warning'">{{ row.ok ? '已建任务' : '未受理' }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="任务 / 说明" min-width="200" show-overflow-tooltip>
           <template #default="{ row }">
-            <span v-if="row.ok">任务 #{{ row.taskId }}</span>
+            <span v-if="row.ok">任务 #{{ row.taskId }} 已进入队列</span>
             <span v-else class="muted">{{ row.error }}</span>
           </template>
         </el-table-column>
@@ -723,9 +771,20 @@
     </el-dialog>
 
     <!-- ============ 单账号测试生成（会消耗真实额度，走网关链路扣积分） ============ -->
-    <el-dialog v-model="testGenDlg" title="测试生成" width="560px" :close-on-click-modal="false">
-      <el-alert type="warning" :closable="false" show-icon class="tip"
-        title="将在该账号上提交一条真实生成任务，消耗该账号额度和所选令牌积分，且不触发限流自动换号（测的就是这个号本身）。" />
+    <el-dialog v-model="testGenDlg" title="测试生成（锁定单账号）" width="560px" :close-on-click-modal="false">
+      <el-alert type="warning" :closable="false" show-icon class="tip">
+        <template #title>提交的是真实任务，消耗该账号额度 + 所选令牌积分；**这条链路锁定该账号，失败不会自动换号**。</template>
+        <div class="notice-body">
+          用途是验证「这一个号」能不能出片。要做吞吐请用「压力测试」（走正常选号与换号）。
+        </div>
+      </el-alert>
+      <el-alert v-if="testGenIssues.length" :type="testGenBlocked ? 'error' : 'warning'"
+        :closable="false" show-icon class="tip mt">
+        <template #title>{{ testGenBlocked ? '这个号现在提交必然失败，已禁用提交' : '这个号有未确认项，建议先处理' }}</template>
+        <ul class="notice-list">
+          <li v-for="(m, i) in testGenIssues" :key="i">{{ m }}</li>
+        </ul>
+      </el-alert>
       <el-form label-width="90px" class="mt">
         <el-form-item label="账号"><b>{{ testGenForm.label }}</b></el-form-item>
         <el-form-item label="用户令牌" required>
@@ -736,9 +795,7 @@
         </el-form-item>
         <el-form-item label="时长">
           <el-radio-group v-model="testGenForm.seconds">
-            <el-radio :label="10">10 秒</el-radio>
-            <el-radio :label="15">15 秒</el-radio>
-            <el-radio :label="20">20 秒</el-radio>
+            <el-radio :label="15">15 秒（专家模式）</el-radio>
             <el-radio :label="30">30 秒</el-radio>
           </el-radio-group>
         </el-form-item>
@@ -748,7 +805,11 @@
       </el-form>
       <template #footer>
         <el-button @click="testGenDlg = false">取消</el-button>
-        <el-button type="primary" :loading="testGenBusy" @click="doTestGenerate">提交测试</el-button>
+        <el-button
+          type="primary" :loading="testGenBusy" :disabled="testGenBlocked"
+          :title="testGenBlocked ? '该账号当前状态不适合提交，先处理上面的问题' : ''"
+          @click="doTestGenerate"
+        >提交测试</el-button>
       </template>
     </el-dialog>
 
@@ -769,9 +830,7 @@
         </el-form-item>
         <el-form-item label="时长">
           <el-radio-group v-model="stressForm.seconds">
-            <el-radio :label="10">10 秒</el-radio>
-            <el-radio :label="15">15 秒</el-radio>
-            <el-radio :label="20">20 秒</el-radio>
+            <el-radio :label="15">15 秒（专家模式）</el-radio>
             <el-radio :label="30">30 秒</el-radio>
           </el-radio-group>
         </el-form-item>
@@ -993,21 +1052,6 @@
       </template>
     </el-dialog>
 
-    <!-- ============ 原生视频能力探测 ============ -->
-    <el-dialog v-model="nativeProbeDlg" :title="nativeProbeResult?.referenceImages ? '参考图上传能力探测' : `原生 ${nativeProbeResult?.seconds || 30} 秒能力探测`" width="520px">
-      <el-alert type="info" :closable="false" show-icon
-        :title="nativeProbeResult?.referenceImages ? '只读探测：打开页面检查真实图片文件控件，不选择文件、不填写提示词、不发送任务、不消耗生成额度。' : '只读探测：打开页面检查现有模型和时长选项，不填写提示词、不发送任务、不消耗生成额度。'" />
-      <el-descriptions v-if="nativeProbeResult" :column="1" border size="small" class="mt">
-        <el-descriptions-item label="账号">{{ nativeProbeResult.label || '当前账号' }}</el-descriptions-item>
-        <el-descriptions-item label="结果">
-          <el-tag :type="nativeProbeResult.state === 'available' ? 'success' : (nativeProbeResult.state === 'unavailable' ? 'warning' : 'info')">
-            {{ nativeProbeResult.referenceImages ? (nativeProbeResult.state === 'available' ? '已发现明确图片上传控件' : (nativeProbeResult.state === 'unavailable' ? '页面未发现明确图片上传控件' : '本次未完成判定')) : (nativeProbeResult.state === 'available' ? `已确认原生 ${nativeProbeResult.seconds || 30} 秒` : (nativeProbeResult.state === 'unavailable' ? `页面未提供原生 ${nativeProbeResult.seconds || 30} 秒` : '本次未完成判定')) }}
-          </el-tag>
-        </el-descriptions-item>
-        <el-descriptions-item label="说明">{{ nativeProbeResult.message || '—' }}</el-descriptions-item>
-      </el-descriptions>
-    </el-dialog>
-
     <!-- ============ cookie 明文 ============ -->
     <el-dialog v-model="revealDlg" title="账号 cookie" width="680px">
       <el-alert type="info" :closable="false" show-icon title="这次查看已写入操作日志。" class="mb" />
@@ -1021,10 +1065,10 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue';
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { useRoute } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import { ArrowDown, CircleCheck, CopyDocument, Key, Money, Refresh, Search, Switch, Upload } from '@element-plus/icons-vue';
+import { ArrowDown, CopyDocument, Key, Refresh, Search, Switch, Upload } from '@element-plus/icons-vue';
 import { api, qs } from '../api.js';
 import { can } from '../store.js';
 import DolaGoogleLogin from '../components/DolaGoogleLogin.vue';
@@ -1080,7 +1124,56 @@ const jobDlg = ref(false);
 const activeJob = ref(null);
 const generationTasks = ref([]);
 const generationLoading = ref(false);
+
+// ---- 成片库删除功能（2026-09-27）----
+// 与后端 generator.js 的 UNDELETABLE_TASK_STATES 保持一致：
+// 运行中/排队中的任务不可删、不可选（后端也会拒绝，前端只是提前置灰）
+const TASK_UNDELETABLE_STATES = ['queued', 'submitting', 'generating', 'resolving'];
+const isTaskDeletable = (row) => !TASK_UNDELETABLE_STATES.includes(row?.status);
+const generationSelected = ref([]);
+const generationTableRef = ref(null);
+const canDeleteTask = computed(() => can('dola:task:delete'));
+// 选中项里「真能删」的那些（运行中/排队中不可选，所以通常 = 全部选中项）
+const deletableSelected = computed(() => generationSelected.value.filter(isTaskDeletable));
 const generationStatusFilter = ref('');
+
+/**
+ * ★ 乐观更新（2026-09-27，飞哥要求「提交之后马上显示在任务列表，不要让用户傻傻的等」）
+ *
+ * 改之前：点「开始提交」→ await 整批 POST → 关弹窗 → 回读列表。
+ * 而服务端是**逐条**走网关链路（提示词排重 → 参考图校验 → 账号体检 → 扣积分），
+ * 每条都可能发真实网络请求 ⇒ 20 条能等几十秒，用户看到的是卡住的按钮 + 没变化的列表。
+ *
+ * 现在：点提交立刻插占位行（状态「提交中」）+ 立刻关弹窗 + 切到任务列表，
+ * 请求在后台跑。回包后**原地改写**占位行（拿真实 taskId / status，不换对象、
+ * 不换 _key，表格行不会重建）⇒ 不闪；之后 loadGeneration 拉到真实行时，
+ * 占位按 id 去重自动退场 ⇒ 也不重复。
+ *
+ * ⚠️ 占位行必须是**独立数组**，不能塞进 generationTasks ——
+ * 否则下一次静默轮询（busy 时 3 秒一次）全量替换 generationTasks 就会把占位抹掉。
+ */
+const pendingGenTasks = ref([]);
+let pendingSeq = 0;
+// 占位「还没落库」= 既没有真实 id、也还没被服务端受理
+const isPlaceholder = (row) => Boolean(row?._pending && !row?._accepted);
+// 还在等待服务端回包的那几条（用于工具栏提示）
+const pendingCount = computed(() => pendingGenTasks.value.filter((r) => !r._accepted).length);
+
+// 表格数据源 = 占位（未被真实行接管的部分）+ 真实行
+const generationRows = computed(() => {
+  const realIds = new Set(generationTasks.value.map((r) => r.id));
+  const filter = generationStatusFilter.value;
+  const pending = pendingGenTasks.value
+    .filter((r) => !(r.id != null && realIds.has(r.id)))
+    .filter((r) => !filter || filter === r.status);
+  return [...pending, ...generationTasks.value];
+});
+
+// 切状态筛选时，已落库的占位交给真实列表（否则切筛后可能和真实行同时出现）
+watch(generationStatusFilter, () => {
+  pendingGenTasks.value = pendingGenTasks.value.filter((r) => !r._accepted);
+});
+
 let pollTimer = null;
 let jobPollVersion = 0;
 let providerTimer = null;
@@ -1095,10 +1188,80 @@ const batchGenForm = reactive({
   tokenRaw: '',
   prompts: '',
   mode: 'standard',
-  seconds: 10,
+  seconds: 30,
   ratio: '16:9',
   points: null,
 });
+
+// ---- 号池可用性预检（2026-09-27 新增）----------------------------------
+// 为什么加：以前是「提交完才发现没有可用号」，任务排队→失败→退款绕一大圈，
+// 用户只看到一条失败记录和一句技术错误。现在把这一步提前到提交之前，
+// 用后端已有的只读路由视图（GET /api/dola/route）回答「这个档位现在有几个号能上」。
+// ⚠️ 只是**引导**，不是硬门禁：查询失败时如实说明并放行，绝不假装成功。
+const poolRoute = ref({ loading: false, seconds: null, eligibleCount: null, excluded: [], error: '' });
+let poolRouteSeq = 0;
+async function refreshPoolRoute(seconds) {
+  const seq = ++poolRouteSeq;
+  poolRoute.value = { ...poolRoute.value, loading: true, seconds, error: '' };
+  try {
+    const r = await api.get(`/api/dola/route?seconds=${encodeURIComponent(seconds)}`);
+    if (seq !== poolRouteSeq) return;
+    poolRoute.value = {
+      loading: false,
+      seconds,
+      eligibleCount: Number(r?.eligibleCount ?? r?.ranked?.length ?? 0),
+      excluded: r?.excluded || [],
+      error: '',
+    };
+  } catch (e) {
+    if (seq !== poolRouteSeq) return;
+    poolRoute.value = { loading: false, seconds, eligibleCount: null, excluded: [], error: e?.message || '号池查询失败' };
+  }
+}
+/** 明确没有可用号时才拦（null = 没查到，不拦） */
+const poolRouteBlocked = computed(() => poolRoute.value.eligibleCount === 0);
+const poolRouteText = computed(() => {
+  const p = poolRoute.value;
+  if (p.error) return `号池可用性查询失败：${p.error}。不阻断提交，失败原因以任务记录为准。`;
+  if (p.eligibleCount == null) return '';
+  if (p.eligibleCount === 0) {
+    const reasons = [...new Set((p.excluded || []).map((x) => x?.reason).filter(Boolean))].slice(0, 3);
+    return `当前没有可用于 ${p.seconds} 秒的账号。`
+      + (reasons.length ? `主要原因：${reasons.join('；')}。` : '')
+      + '现在提交必然失败，请先去「号池」补号或跑能力/额度探测。';
+  }
+  return `当前可用于 ${p.seconds} 秒的账号：${p.eligibleCount} 个。`;
+});
+
+/** 把后端错误原文翻译成「下一步该做什么」。兼容 09-27 前后的两套文案，认不出就不显示。 */
+function failureAdvice(row) {
+  const e = String(row?.error || '');
+  if (!e) return '';
+  if (/锁定账号|不自动换号/.test(e)) return '这条锁定了账号，失败不会换号。去掉锁定后重提，或换一个号再试。';
+  if (/验签|参数被上游拒绝|710022002/.test(e)) return '上游拒绝了请求签名/参数，账号本身没问题（这类拒绝已不再冷却账号）。可直接重建一条重试。';
+  if (/冷却|访问频繁|限流/.test(e)) return '该账号已进入冷却。等冷却结束，或去「号池」换一个可用账号。';
+  if (/没有可用账号|账号池暂无可用/.test(e)) return '号池里挑不出可用账号。去「号池」补号，或对现有账号跑一次能力/额度探测。';
+  if (/额度|quota/i.test(e)) return '该账号额度不足（或今日已用完）。换号，或等额度重置。';
+  if (/参考图/.test(e)) return '参考图缺失或数量与任务记录不符。回到来源重新上传参考图再提交。';
+  if (/会话|登录|login/i.test(e)) return '账号会话已失效。去「号池」重新登录该账号。';
+  if (/时长|duration/i.test(e)) return '成片时长与请求不符，系统已拦下并退款。可重建一条重试。';
+  if (/队列/.test(e)) return '队列已满。稍后重提，或在设置里调大队列上限。';
+  return '';
+}
+
+/** 失败任务一键重建：把原参数填回批量创建弹窗，由人确认后再提交（不自动重提，避免盲目烧额度）。 */
+async function rebuildGeneration(row) {
+  batchGenForm.prompts = row?.prompt || '';
+  const sec = Number(row?.seconds);
+  batchGenForm.seconds = sec === 15 || sec === 30 ? sec : 30;
+  batchGenForm.mode = batchGenForm.seconds === 15 ? 'expert' : 'standard';
+  batchGenForm.ratio = row?.ratio || '16:9';
+  batchGenResult.value = null;
+  batchGenDlg.value = true;
+  await loadTokenOptions();
+  refreshPoolRoute(batchGenForm.seconds);
+}
+
 let providerRequest = null;
 let generationRequest = null;
 let disposed = false;
@@ -1119,8 +1282,6 @@ const current = ref(null);
 
 const probeDlg = ref(false);
 const probeResult = ref(null);
-const nativeProbeDlg = ref(false);
-const nativeProbeResult = ref(null);
 
 const revealDlg = ref(false);
 const revealValue = ref('');
@@ -1129,10 +1290,45 @@ const noticeOpen = ref(false);   // 顶部说明默认收起
 // ---- 新增：测试生成 / 压力测试 / 批量分组 ----
 const testGenDlg = ref(false);
 const testGenBusy = ref(false);
-const testGenForm = reactive({ id: null, label: '', tokenId: null, seconds: 10, prompt: '' });
+const testGenForm = reactive({
+  id: null, label: '', tokenId: null, seconds: 30, prompt: '',
+  // 2026-09-27：把该号的可提交状态一起存进来，用于弹窗内的提交前拦截
+  status: '', cooldownUntil: null,
+  quotaRemaining: null, loginState: '',
+});
+
+/**
+ * 测试生成的提交前检查。
+ * 为什么必须有：「测试生成」走后端**锁定账号**链路（strictAccount=true），失败不换号。
+ * 所以「这个号本身能不能上」必须在下发之前讲清楚 —— 否则就是拿真实额度去撞一个已知不可用的号。
+ * 这也是 09-27 那次连打三单全崩的直接教训。
+ */
+const testGenIssues = computed(() => {
+  const f = testGenForm;
+  const out = [];
+  const cooling = f.cooldownUntil && new Date(f.cooldownUntil).getTime() > Date.now();
+  if (cooling) {
+    out.push(`该账号冷却中（至 ${fmt(f.cooldownUntil)}）。冷却期内提交必然失败，而这条链路不会换号。`);
+  }
+  if (f.status && f.status !== 'valid') out.push(`账号状态是「${f.status}」而不是 valid，选号时会被直接排除。`);
+  if (f.loginState === 'unavailable') out.push('该账号登录态未确认（创作输入框未出现），提交会先被拦下。');
+  if (f.quotaRemaining != null && Number(f.quotaRemaining) <= 0) out.push('该账号今日额度已确认为 0，提交会因额度不足失败。');
+  return out;
+});
+/** 硬伤才禁用提交；「能力未确认」这类只警告，让用户自己决定 */
+const testGenBlocked = computed(() => {
+  const f = testGenForm;
+  const cooling = f.cooldownUntil && new Date(f.cooldownUntil).getTime() > Date.now();
+  return Boolean(
+    cooling
+    || (f.status && f.status !== 'valid')
+    || f.loginState === 'unavailable'
+    || (f.quotaRemaining != null && Number(f.quotaRemaining) <= 0),
+  );
+});
 const stressDlg = ref(false);
 const stressBusy = ref(false);
-const stressForm = reactive({ tokenId: null, count: 5, seconds: 10, prompt: '' });
+const stressForm = reactive({ tokenId: null, count: 5, seconds: 30, prompt: '' });
 const stressCost = computed(() => Number(stressForm.count || 0) * 2); // 按 15 秒档 2 点/条估算
 const groupDlg = ref(false);
 const groupBusy = ref(false);
@@ -1155,9 +1351,6 @@ const maintenanceJob = computed(() => {
 const maintenanceBusy = computed(() => maintenanceLoading.value || Boolean(maintenanceJob.value) || Boolean(isJobRunning(activeJob.value)));
 function jobTypeLabel(job) {
   if (job.type === 'dola_hello_probe') return '发送“你好”探测';
-  if (job.type === 'dola_native_15s') return '原生 15 秒探测';
-  if (job.type === 'dola_native_30s') return '原生 30 秒探测';
-  if (job.type === 'dola_reference_images') return '参考图上传探测';
   const maintenance = job.automatic || job.payload?.autoMaintenance
     || job.id === provider.value.maintenance?.activeJob?.id
     || job.id === provider.value.maintenance?.lastJob?.id;
@@ -1187,11 +1380,55 @@ function relTime(iso) {
 }
 
 /**
- * 账号主标题。
- * 优先用人工备注名（label，导入时可填、之后可改），没有才退回自动识别的标识。
+ * 本页「撞名」的备注名集合（只算当前列表，够用且不额外打接口）。
+ *
+ * 为什么需要：19 号那次是**逐个**粘贴导入的，而服务端自动编号用的是
+ * 「本次请求内已插入数 + 1」，每个请求都从 1 起算 ⇒ 每行都落成同一个
+ * `账号001`。实测生产 17 行里有 16 行叫 `账号001`，光看主行分不清谁是谁。
+ * 结论：**名字只有能区分彼此时才算名字** —— 重名的那个直接作废，退回 ID。
+ */
+const duplicateLabels = computed(() => {
+  const seen = new Map();
+  for (const row of items.value) {
+    const key = String(row.label || '').trim();
+    if (key) seen.set(key, (seen.get(key) || 0) + 1);
+  }
+  return new Set([...seen].filter(([, n]) => n > 1).map(([k]) => k));
+});
+
+/**
+ * 账号主标题（全站账号名的唯一出口，5 处调用点共用）。
+ *
+ * 优先级 —— 2026-09-27 工作单「账号名重复，避免 17 行同名」：
+ *   ① `note` 人工备注      —— 最优先。这是用户为「区分账号」专门写的字段
+ *   ② `loginEmail` 登录邮箱 —— 天然唯一，且是真实身份
+ *   ③ `label` 备注名        —— **仅当它不与本页其它行重名**时才用
+ *   ④ `账号#<id>`           —— 兜底，永远唯一
+ *
+ * 顺带把旧行为的两个坑填了：
+ *   · 旧版把 `label` 排在邮箱之后、且不查重，所以 16 个 `账号001` 原样上屏；
+ *   · 旧版兜底是 `#<id>`（只有井号没有「账号」二字），和列表里「账号」列的语义不搭。
  */
 function primaryName(row) {
-  return String(row.loginEmail || row.label || '').trim() || String(row.account_hint || '').trim().split(/\s+/)[0] || `#${row.id}`;
+  const note = String(row.note || '').trim();
+  if (note) return note;
+  const email = String(row.loginEmail || '').trim();
+  if (email) return email;
+  const label = String(row.label || '').trim();
+  if (label && !duplicateLabels.value.has(label)) return label;
+  return `账号#${row.id}`;
+}
+
+/**
+ * 主行 tooltip：把被「显示名」挤掉的原始字段留个出口，信息一条不丢。
+ * 用户在列表里看到的是 `账号#429`，鼠标一放能看到它原本的 label（账号001）。
+ */
+function nameTitle(row) {
+  const parts = [`ID ${row.id}`];
+  if (row.label) parts.push(`备注名：${row.label}`);
+  if (row.note) parts.push(`备注：${row.note}`);
+  if (row.account_hint) parts.push(`账号标识：${String(row.account_hint).trim()}`);
+  return parts.join('  ·  ');
 }
 
 /**
@@ -1352,7 +1589,7 @@ const statCards = computed(() => {
     },
     {
       label: '未校验', value: unknown, color: '#909399',
-      sub: unknown ? '批量校验一次看看' : '都已校验',
+      sub: unknown ? '到账号行点「校验」' : '都已校验',
     },
     {
       label: '换算进度', value: s.countable ?? 0, color: '#9b6eff',
@@ -1379,7 +1616,7 @@ const replenishBanner = computed(() => {
     return {
       level: 'info',
       title: '额度尚未确认',
-      text: '有可用账号，但没有任何账号确认过今日额度——先批量查额度，再判断是否需要补号。',
+      text: '有可用账号，但没有任何账号确认过今日额度——额度由自动维护刷新，也可在账号行的「更多」里单独查额度。',
     };
   }
   return null;
@@ -1470,7 +1707,13 @@ async function loadGeneration({ silent = false } = {}) {
   generationRequest = (async () => {
     const res = await api.get(`/api/dola/generation-tasks?limit=100${query}`, { silent });
     if (disposed) return;
-    generationTasks.value = res.items || [];
+    const items = res.items || [];
+    generationTasks.value = items;
+    // 已落库的占位：真实行到齐就撤掉。两次赋值在同一个同步块里，Vue 只渲染一次 ⇒ 不闪。
+    if (pendingGenTasks.value.some((r) => r._accepted)) {
+      const arrived = new Set(items.map((r) => r.id));
+      pendingGenTasks.value = pendingGenTasks.value.filter((r) => !r._accepted || !arrived.has(r.id));
+    }
     if (res.generation) provider.value = { ...provider.value, generation: res.generation };
   })();
   try { await generationRequest; }
@@ -1486,6 +1729,8 @@ const batchGenLines = computed(() =>
 function onBatchSecondsChange() {
   // 15 秒只能走专家模式：与 8787 前台保持一致，自动切过去
   if (batchGenForm.seconds === 15) batchGenForm.mode = 'expert';
+  // 换档位就换号池口径：30 秒和 15 秒的可用号不是同一批
+  refreshPoolRoute(batchGenForm.seconds);
 }
 
 /**
@@ -1506,12 +1751,13 @@ async function openBatchGen() {
   batchGenForm.tokenRaw = '';
   batchGenForm.tokenMode = 'select';
   batchGenForm.mode = 'standard';
-  batchGenForm.seconds = 10;
+  batchGenForm.seconds = 30;
   batchGenForm.ratio = '16:9';
   batchGenForm.points = null;
   batchGenResult.value = null;
   batchGenDlg.value = true;
   await loadTokenOptions();
+  refreshPoolRoute(batchGenForm.seconds);
 }
 
 function openApiWorkbench() {
@@ -1524,25 +1770,83 @@ async function submitBatchGen() {
   if (lines.length > 20) { ElMessage.error('一次最多提交 20 条'); return; }
   if (batchGenForm.tokenMode === 'select' && !batchGenForm.tokenId) { ElMessage.error('请选择要扣积分的用户令牌'); return; }
   if (batchGenForm.tokenMode === 'paste' && !batchGenForm.tokenRaw.trim()) { ElMessage.error('请粘贴用户令牌原文'); return; }
+  // 号池硬拦：明确没有可用号时不发出去（查询失败不拦，见 poolRouteBlocked 定义）
+  if (poolRouteBlocked.value) {
+    ElMessage.error(`号池当前没有可用于 ${batchGenForm.seconds} 秒的账号，提交必然失败。请先补号或跑能力/额度探测。`);
+    return;
+  }
+
+  // ★ 先把请求体和展示用的参数**冻结**下来：弹窗下面马上就被关掉了，
+  //   之后再读 batchGenForm 可能已经被别的操作改过。
+  const seconds = batchGenForm.seconds;
+  const ratio = batchGenForm.ratio;
+  const mode = seconds === 15 ? 'expert' : batchGenForm.mode;
+  const body = { items: lines.map((prompt) => ({ prompt, mode, seconds, ratio })) };
+  if (batchGenForm.tokenMode === 'select') body.tokenId = batchGenForm.tokenId;
+  else body.token = batchGenForm.tokenRaw.trim();
+  if (batchGenForm.points != null) body.points = batchGenForm.points;
+
+  // ★ 乐观更新第一步：立刻占位 + 立刻关弹窗 + 切到任务列表。不等服务端回包。
+  const nowIso = new Date().toISOString();
+  const placeholders = lines.map((prompt) => ({
+    _key: `p-${++pendingSeq}`,
+    _pending: true,
+    _accepted: false,
+    id: null,
+    prompt,
+    account_label: '待分配',
+    ratio,
+    seconds,
+    status: 'submitting',
+    stage: '正在提交…',
+    error: null,
+    archived: false,
+    created_at: nowIso,
+  }));
+  pendingGenTasks.value = [...placeholders, ...pendingGenTasks.value];
+  batchGenResult.value = null;
+  batchGenDlg.value = false;
+  if (tab.value !== 'generation') tab.value = 'generation';
+
   batchGenSaving.value = true;
   try {
-    const body = {
-      items: lines.map((prompt) => ({
-        prompt,
-        mode: batchGenForm.seconds === 15 ? 'expert' : batchGenForm.mode,
-        seconds: batchGenForm.seconds,
-        ratio: batchGenForm.ratio,
-      })),
-    };
-    if (batchGenForm.tokenMode === 'select') body.tokenId = batchGenForm.tokenId;
-    else body.token = batchGenForm.tokenRaw.trim();
-    if (batchGenForm.points != null) body.points = batchGenForm.points;
     const res = await api.post('/api/dola/generation-tasks/batch', body);
+    const results = Array.isArray(res.results) ? res.results : [];
+    const rejectedKeys = new Set();
+    // 服务端按 items 顺序逐条返回，所以下标一一对应
+    placeholders.forEach((row, i) => {
+      const item = results[i];
+      if (item && item.ok) {
+        // ★ 原地改写（不换对象、不换 _key）⇒ 表格行不重建、不闪
+        row.id = item.taskId;
+        row.status = item.status || 'queued';
+        row.stage = '已建任务，等待调度';
+        row._accepted = true;
+        row.created_at = new Date().toISOString();
+      } else {
+        rejectedKeys.add(row._key);
+      }
+    });
+    // 未被受理的直接撤掉占位 —— 它们本来就没落库，留在列表里会像"幽灵任务"。
+    // 失败原因在下面的结果弹窗里逐条讲清楚。
+    if (rejectedKeys.size) {
+      pendingGenTasks.value = pendingGenTasks.value.filter((r) => !rejectedKeys.has(r._key));
+    }
     batchGenResult.value = res;
-    batchGenDlg.value = false;
-    batchGenResultDlg.value = true;
-    await loadGeneration();
+    const okCount = res.okCount ?? (lines.length - rejectedKeys.size);
+    const failCount = res.failCount ?? rejectedKeys.size;
+    if (failCount) {
+      ElMessage.warning(`${okCount} 条已建任务，${failCount} 条未受理（原因见弹窗）`);
+      batchGenResultDlg.value = true;
+    } else {
+      ElMessage.success(`${okCount} 条已建任务，已进入下方列表`);
+    }
+    // 收敛到真实数据。占位行按 id 去重，真实行到了它自己就退场，全程不闪。
+    loadGeneration({ silent: true }).catch(() => { /* 轮询会兜住 */ });
   } catch (e) {
+    // 整批失败（网络/超时/权限）：撤掉占位，不留一堆假的「提交中」
+    const keys = new Set(placeholders.map((r) => r._key));
+    pendingGenTasks.value = pendingGenTasks.value.filter((r) => !keys.has(r._key));
     ElMessage.error(e.message || '批量提交失败');
   } finally {
     batchGenSaving.value = false;
@@ -1683,19 +1987,23 @@ async function assignProxyRepair() {
   }
 }
 
-/** 提交批量任务并打开进度窗口 */
+/**
+ * 提交批量任务并打开进度窗口。
+ *
+ * 2026-09-28：15 秒 / 30 秒 / 参考图 三类能力探测已整体下线，
+ * 现在**只剩「发送"你好"探测」一个调用方**。
+ * ⚠️ 后端 /api/dola/jobs 的白名单也已移除那三个 type（提交会被 400 拒），
+ *    别再把按钮加回来 —— 加了只会得到一个「不支持的任务类型」。
+ */
 async function runJob(type) {
   const useSelected = selected.value.length > 0;
   const label = jobTypeLabel({ type });
-  const capabilityProbe = type === 'dola_native_15s' || type === 'dola_native_30s' || type === 'dola_reference_images';
   const helloProbe = type === 'dola_hello_probe';
   const target = useSelected ? `选中的 ${selected.value.length} 个账号`
-    : (helloProbe ? '全部未停用账号' : (capabilityProbe ? '全部有效且已绑定代理的账号' : '全部账号'));
+    : (helloProbe ? '全部未停用账号' : '全部账号');
   const detail = helloProbe
     ? '会为每个账号新建一条普通 Dola 对话并发送固定文本“你好”，会留下聊天记录且可能消耗上游文本对话额度；视频生成请求会被拦截，不会创建视频任务或扣后台积分。只在本次手动任务中发送，不进入定时巡检。'
-    : (capabilityProbe
-      ? '这是串行只读页面探测：不填写提示词、不发送任务、不消耗生成额度；已确认的账号会自动跳过。参考图探测只认明确的图片文件控件。'
-      : '');
+    : '';
   try {
     await ElMessageBox.confirm(
       `${target}执行「${label}」？${detail ? `\n\n${detail}` : ''}`,
@@ -1731,9 +2039,6 @@ async function rowMenu(row, cmd) {
     // 这两个原来在操作列上是独立按钮，现在收进「更多」
     return cmd === 'probe' ? probe(row) : rowAction(row, 'credits');
   }
-  if (cmd === 'native15') return probeNative(row, 15);
-  if (cmd === 'native30') return probeNative(row, 30);
-  if (cmd === 'referenceImages') return probeReferenceImages(row);
   if (cmd === 'set_credits') return openSetCredits(row);
   if (cmd === 'testGenerate') return openTestGenerate(row);
   if (cmd === 'recover') {
@@ -1817,18 +2122,31 @@ async function doBatchGroup() {
 async function openTestGenerate(row) {
   testGenForm.id = row.id;
   testGenForm.label = primaryName(row);
-  testGenForm.seconds = 10;
+  testGenForm.seconds = 30;
   testGenForm.prompt = '';
+  // 把该号当前状态快照进来，供弹窗做提交前拦截（09-27 加的，防「拿真实额度撞已知不可用的号」）
+  testGenForm.status = row.status || '';
+  testGenForm.cooldownUntil = row.cooldown_until || null;
+  testGenForm.quotaRemaining = row.quota_remaining ?? null;
+  testGenForm.loginState = row.login_state || '';
   testGenDlg.value = true;
   await loadTokenOptions();
   testGenForm.tokenId = tokenOptions.value?.[0]?.id ?? null;
 }
 async function doTestGenerate() {
   if (!testGenForm.tokenId) return ElMessage.warning('先选择用户令牌（测试生成走网关链路扣积分）');
+  // 硬拦截：后端这条链路是锁定账号的，必然失败的提交不该发出去
+  if (testGenBlocked.value) {
+    return ElMessage.error('该账号当前状态不适合提交（见弹窗顶部说明），请先处理后再试。');
+  }
+  const soft = testGenIssues.value.length
+    ? `\n\n⚠️ 未确认项：\n· ${testGenIssues.value.join('\n· ')}`
+    : '';
   try {
     await ElMessageBox.confirm(
-      `在账号「${testGenForm.label}」上提交一条 ${testGenForm.seconds} 秒测试生成？将消耗该账号的真实额度和令牌积分，且不触发限流自动换号。`,
-      '测试生成', { type: 'warning' });
+      `在账号「${testGenForm.label}」上提交一条 ${testGenForm.seconds} 秒测试生成？`
+      + `将消耗该账号的真实额度和令牌积分，且**这次不会自动换号**（锁定该账号）。${soft}`,
+      '测试生成（锁定单账号）', { type: 'warning', dangerouslyUseHTMLString: false });
   } catch { return; }
   testGenBusy.value = true;
   try {
@@ -1844,7 +2162,7 @@ async function doTestGenerate() {
 /** 压力测试（对标 dola-pool「压力测试」）：打开弹窗配数量 */
 async function openStress() {
   stressForm.count = 5;
-  stressForm.seconds = 10;
+  stressForm.seconds = 30;
   stressForm.prompt = '';
   stressDlg.value = true;
   await loadTokenOptions();
@@ -1912,6 +2230,69 @@ async function cancelGeneration(row) {
   await Promise.allSettled([loadGeneration(), loadOperations(), refreshProvider()]);
 }
 
+/**
+ * 删除单条生成任务（成片库，2026-09-27）。
+ * 已完成的额外提示「不可恢复」——它的归档成片文件会一起被清掉。
+ */
+async function deleteGeneration(row) {
+  if (!isTaskDeletable(row)) {
+    ElMessage.warning('运行中/排队中的任务不能删除');
+    return;
+  }
+  const isReady = row.status === 'ready';
+  try {
+    await ElMessageBox.confirm(
+      isReady
+        ? `任务 #${row.id} 已完成，删除后**记录与已归档的成片文件都会消失，且不可恢复**。确认删除吗？`
+        : `确认删除任务 #${row.id} 吗？删除后无法恢复。`,
+      '删除生成任务',
+      { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消', dangerouslyUseHTMLString: isReady },
+    );
+  } catch { return; }
+  try {
+    // 注意：api 暴露的方法名是 del（不是 delete）
+    await api.del(`/api/dola/generation-tasks/${row.id}`);
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.message || e?.message || '删除失败');
+    return;
+  }
+  ElMessage.success(`任务 #${row.id} 已删除`);
+  await Promise.allSettled([loadGeneration(), loadOperations(), refreshProvider()]);
+}
+
+/** 批量删除：按当前筛选后的选中项；后端保证「有任一条不可删则整批拒绝」 */
+async function bulkDeleteGeneration() {
+  const rows = deletableSelected.value;
+  if (!rows.length) return;
+  const ids = rows.map((r) => r.id);
+  const hasReady = rows.some((r) => r.status === 'ready');
+  try {
+    await ElMessageBox.confirm(
+      hasReady
+        ? `将删除 ${ids.length} 条任务（含已完成）。已完成任务的**记录与归档成片文件会一起消失，不可恢复**。确认删除吗？`
+        : `将删除 ${ids.length} 条任务记录，删除后无法恢复。确认吗？`,
+      '批量删除生成任务',
+      { type: 'warning', confirmButtonText: `确认删除 ${ids.length} 条`, cancelButtonText: '取消', dangerouslyUseHTMLString: hasReady },
+    );
+  } catch { return; }
+  let res;
+  try {
+    res = await api.post('/api/dola/generation-tasks/batch-delete', { ids });
+  } catch (e) {
+    const data = e?.response?.data;
+    if (data?.blocked?.length) {
+      ElMessage.error(`有 ${data.blocked.length} 条处于运行中/排队中，本次未删除任何任务`);
+    } else {
+      ElMessage.error(data?.message || e?.message || '批量删除失败');
+    }
+    await loadGeneration();
+    return;
+  }
+  ElMessage.success(`已删除 ${res.deleted ?? ids.length} 条`);
+  generationTableRef.value?.clearSelection?.();
+  await Promise.allSettled([loadGeneration(), loadOperations(), refreshProvider()]);
+}
+
 function openSetCredits(row) {
   current.value = row;
   creditsInput.value = row.credits ?? 0;
@@ -1932,30 +2313,6 @@ async function probe(row) {
   const res = await api.post(`/api/dola/accounts/${row.id}/probe`);
   probeResult.value = res;
   probeDlg.value = true;
-}
-
-async function probeNative(row, seconds) {
-  nativeProbeResult.value = { label: row.label, seconds, state: 'unknown', message: '正在只读检查页面…' };
-  nativeProbeDlg.value = true;
-  try {
-    const res = await api.post(`/api/dola/accounts/${row.id}/native-${seconds}s-probe`);
-    nativeProbeResult.value = { ...res, label: row.label, seconds };
-    await load({ silent: true });
-  } catch (error) {
-    nativeProbeResult.value = { label: row.label, seconds, state: 'unknown', message: error.message || '探测失败' };
-  }
-}
-
-async function probeReferenceImages(row) {
-  nativeProbeResult.value = { label: row.label, seconds: null, referenceImages: true, state: 'unknown', message: '正在只读检查页面上传控件…' };
-  nativeProbeDlg.value = true;
-  try {
-    const res = await api.post(`/api/dola/accounts/${row.id}/reference-images-probe`);
-    nativeProbeResult.value = { ...res, label: row.label, seconds: null, referenceImages: true };
-    await load({ silent: true });
-  } catch (error) {
-    nativeProbeResult.value = { label: row.label, seconds: null, referenceImages: true, state: 'unknown', message: error.message || '探测失败' };
-  }
 }
 
 async function reveal(row) {
@@ -2023,6 +2380,17 @@ onUnmounted(() => {
 .notice-toggle :deep(.el-icon) { vertical-align: -2px; margin-left: 1px; }
 .notice-body { font-size: 12px; line-height: 1.9; margin-top: 6px; }
 .notice-body code { background: rgba(127, 127, 127, .18); padding: 1px 5px; border-radius: 4px; }
+/* 号池提示 / 测试生成问题清单（2026-09-27） */
+.notice-list { margin: 6px 0 0; padding-left: 18px; font-size: 12px; line-height: 1.9; }
+.notice-list li { list-style: disc; }
+/* 失败任务的「原文 + 建议」两行：原文降一级、建议用主色，让下一步一眼能看到 */
+.err-raw { font-size: 12px; color: var(--el-text-color-regular); word-break: break-word; }
+.failure-advice {
+  margin-top: 4px; font-size: 12px; line-height: 1.7;
+  color: var(--el-color-primary); word-break: break-word;
+}
+/* 乐观更新：提交后在途任务的提示（2026-09-27） */
+.pending-hint { font-size: 12px; color: var(--el-color-primary); }
 .maintenance-bar {
   display: flex; align-items: center; gap: 14px; justify-content: space-between;
   margin: -2px 0 14px; padding: 10px 14px;

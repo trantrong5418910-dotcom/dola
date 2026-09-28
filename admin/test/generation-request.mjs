@@ -165,15 +165,20 @@ test('targetModel filters but never replaces the native model', async () => {
   }
 });
 
-test('10s compatibility preserves native models, prompts and all unrelated fields', async () => {
-  const h = harness({ seconds: 10 });
-  for (const model of ['seedance_v2.0', 'seedance_v2.5']) {
-    await h.send(encode({ param: makeParam({ model, duration: 15 }) }));
-    assert.deepEqual(getParam(h.fetchCalls.at(-1).body), makeParam({ model, duration: 10 }));
-  }
+test('30s rewrite preserves native models, prompts and all unrelated fields', async () => {
+  const h = harness({ seconds: 30 });
+  // 30 秒只跑 Seedance 2.5：v2.5 的请求被改写成 30，v2.0 的请求**不动**（v2.0 不出 30 秒）
+  await h.send(encode({ param: makeParam({ model: 'seedance_v2.5', duration: 15 }) }));
+  assert.deepEqual(getParam(h.fetchCalls.at(-1).body), makeParam({ model: 'seedance_v2.5', duration: 30 }));
+  const v20 = encode({ param: makeParam({ model: 'seedance_v2.0', duration: 15 }) });
+  await h.send(v20);
+  assert.equal(h.fetchCalls.at(-1).body, v20);
   const body = encode({ param: makeParam({ model: 'unknown', duration: 15 }) });
   await h.send(body);
   assert.equal(h.fetchCalls.at(-1).body, body);
+  // 档位精简：10/20 不再是合法档位，装适配器时直接拒绝
+  assert.throws(() => harness({ seconds: 10 }), /seconds must be 15 or 30/);
+  assert.throws(() => harness({ seconds: 20 }), /seconds must be 15 or 30/);
 });
 
 test('non-video and unknown ability/parameter/duration types pass through', async () => {
@@ -323,13 +328,13 @@ test('idempotent installs retain hooks/captures and use the latest valid setting
   await h.send(encode());
   const cap = h.context.__CAP;
   h.install({ seconds: 30 });
-  h.install({ seconds: 10, targetModel: 'seedance_v2.5' });
+  h.install({ seconds: 15, targetModel: 'seedance_v2.5' });
   assert.equal(h.context.fetch, hooks[0]);
   assert.equal(h.context.XMLHttpRequest.prototype.open, hooks[1]);
   assert.equal(h.context.XMLHttpRequest.prototype.send, hooks[2]);
   assert.equal(h.context.__CAP, cap);
   await h.send(encode({ param: makeParam({ duration: 15 }) }));
-  assert.equal(getParam(h.fetchCalls[1].body).duration, 10);
+  assert.equal(getParam(h.fetchCalls[1].body).duration, 15);
   assert.equal(h.caps().length, 2);
   assert.equal(h.fetchCalls.length, 2);
 });
@@ -338,7 +343,7 @@ test('invalid settings reject with fixed text and do not replace existing settin
   const h = harness();
   const hook = h.context.fetch;
   for (const seconds of [undefined, null, false, true, '10', '15', '20', '30', 0, 31, NaN, Infinity, {}, []]) {
-    assert.throws(() => h.install({ seconds }), /seconds must be 10, 15, 20 or 30/);
+    assert.throws(() => h.install({ seconds }), /seconds must be 15 or 30/);
   }
   for (const targetModel of [false, 25, {}, []]) {
     assert.throws(() => h.install({ seconds: 30, targetModel }), /targetModel must be a string or null/);

@@ -108,10 +108,10 @@ test('native 30s probe stays unknown when no exact target option is selectable',
   assert.equal(nativeCapabilityState({ code: 'NATIVE_CAPABILITY_UNAVAILABLE' }), 'unavailable');
 });
 
-test('native composer 20s recognizes the 10s carrier without submitting', async () => {
-  const h = fixture({ duration: '10s' });
-  assert.deepEqual(await prepareNativeVideoComposer(h.page, { seconds: 20, clickDelayMs: 0 }), {
-    model: 'seedance_v2.5', seconds: 20, uiSeconds: 10, native: false, rewriteCarrier: true,
+test('native composer 30s recognizes the 15s carrier without submitting', async () => {
+  const h = fixture({ duration: '15s' });
+  assert.deepEqual(await prepareNativeVideoComposer(h.page, { seconds: 30, clickDelayMs: 0 }), {
+    model: 'seedance_v2.5', seconds: 30, uiSeconds: 15, native: false, rewriteCarrier: true,
     source: 'carrier_rewrite', concat: false,
   });
   assert.deepEqual(h.calls, []);
@@ -146,10 +146,10 @@ test('opens video entry when duration control is not yet visible', async () => {
   assert.equal(h.calls.filter(call => call === 'video-button').length, 1, 'never double-toggle a loading video composer');
 });
 
-test('20s composer selection produces evidence accepted by the actual admission predicate', async () => {
-  const h = fixture({ duration: '5s', selectedDuration: '10s' });
-  const capability = await prepareNativeVideoComposer(h.page, { seconds: 20 });
-  assert.equal(isVerifiedNativeCapability({ ...capability, ok: true, state: 'available' }, 20), true);
+test('30s composer selection produces evidence accepted by the actual admission predicate', async () => {
+  const h = fixture({ duration: '5s', selectedDuration: '15s' });
+  const capability = await prepareNativeVideoComposer(h.page, { seconds: 30 });
+  assert.equal(isVerifiedNativeCapability({ ...capability, ok: true, state: 'available' }, 30), true);
   assert.deepEqual(h.calls, ['duration-open', 'duration-select']);
 });
 
@@ -179,17 +179,17 @@ test('30s composer does not reuse an already-selected 10s carrier when the 15s t
 
 test('visible enabled video chip is never clicked before bootstrap configuration', async () => {
   const h = fixture({ durationVisible: false, bootstrapReady: false });
-  await assert.rejects(prepareNativeVideoComposer(h.page, { seconds: 10, timeout: 10 }),
+  await assert.rejects(prepareNativeVideoComposer(h.page, { seconds: 15, timeout: 10 }),
     e => e.code === 'NATIVE_CAPABILITY_UNKNOWN' && e.reason === 'VIDEO_BOOTSTRAP_NOT_READY');
   assert.ok(!h.calls.includes('video-button'));
 });
 
 test('slow composer hydration uses the remaining caller budget, not a separate 30-second cutoff', async () => {
-  const h = fixture({ duration: '10s', durationVisible: false });
+  const h = fixture({ model: 'Seedance 2.0 Fast', duration: '15s', durationVisible: false });
   const waits = [];
   h.page.waitForFunction = async (_fn, _arg, options) => { waits.push(options.timeout); };
   const phases = [];
-  await prepareNativeVideoComposer(h.page, { seconds: 10, timeout: 100000, onPhase: phase => phases.push(phase) });
+  await prepareNativeVideoComposer(h.page, { seconds: 15, model: 'seedance_v2.0', timeout: 100000, onPhase: phase => phases.push(phase) });
   assert.ok(waits.some(timeout => timeout > 30000), 'entry hydration must receive its remaining bounded budget');
   assert.deepEqual(phases, ['bootstrap', 'entry', 'model', 'duration', 'verified']);
   assert.equal(h.calls.filter(call => call === 'video-button').length, 1);
@@ -199,7 +199,7 @@ test('missing composer does not silently navigate and reset the probe budget', a
   const h = fixture(); let navigations = 0;
   h.page.waitForSelector = async () => { throw new Error('not ready'); };
   h.page.goto = async () => { navigations++; };
-  await assert.rejects(prepareNativeVideoComposer(h.page, { seconds: 10, timeout: 20 }),
+  await assert.rejects(prepareNativeVideoComposer(h.page, { seconds: 15, timeout: 20 }),
     e => e.code === 'NATIVE_CAPABILITY_UNKNOWN' && e.reason === 'VIDEO_PAGE_NOT_READY');
   assert.equal(navigations, 0);
 });

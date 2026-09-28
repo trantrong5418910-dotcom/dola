@@ -56,6 +56,20 @@
     .jobs td.ops{white-space:nowrap}
     .jobs .row-btn{margin-right:3px}
     .jobs .row-btn.primary{color:#2f5bd0;font-weight:650}
+    /* 乐观占位行（还没落库的任务）：压暗一点，和真实行区分开 ——
+       用户要能一眼看出「这条还在建」，而不是以为它已经是条真任务。 */
+    .pending-row td{color:#7e8a9c}
+    .pending-row .job-id{color:#a3adbd}
+    :root[data-theme="dark"] .pending-row td{color:#8e9cb0}
+    :root[data-theme="dark"] .pending-row .job-id{color:#79879b}
+    /* 占位行呼吸动效：提交要等几十秒，静止的一行会被当成「卡死」。
+       只动 opacity，不触发重排，也不影响行内按钮的悬停。 */
+    .pending-row td{animation:pending-breathe 1.5s ease-in-out infinite}
+    @keyframes pending-breathe{0%,100%{opacity:.55}50%{opacity:1}}
+    /* 状态列前一个跳动的点：比纯文字更容易一眼看到「它还在跑」 */
+    .pending-row .tag::before{content:'';display:inline-block;width:6px;height:6px;margin-right:5px;border-radius:50%;background:#416fe0;vertical-align:middle;animation:pending-dot 1s ease-in-out infinite}
+    @keyframes pending-dot{0%,100%{opacity:.3;transform:scale(.75)}50%{opacity:1;transform:scale(1.2)}}
+    @media (prefers-reduced-motion:reduce){.pending-row td,.pending-row .tag::before{animation:none}}
     .player{width:100%;margin-top:14px;border-radius:10px;background:#0d1725}
     .upstream-note{margin:10px 0 0;font-size:11px;color:#8793a4;line-height:1.6}
     code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;background:#edf1f7;border-radius:4px;padding:1px 4px}
@@ -158,6 +172,16 @@
     :root[data-theme="dark"] .dlg::backdrop{background:#050a13c4}
     :root[data-theme="dark"] .dlg-head{border-color:#2a374a}
     :root[data-theme="dark"] .dlg-note{color:#9aa9bd}
+    :root[data-theme="dark"] .ss-hist{color:#9db8ff}
+    :root[data-theme="dark"] .ss-hist.muted{color:#6d7a8c}
+    :root[data-theme="dark"] .ih-batch{background:#131c29;border-color:#2a374a}
+    :root[data-theme="dark"] .ih-batch.current{background:#16233a;border-color:#416fe0}
+    :root[data-theme="dark"] .ih-head{color:#9aa9bd}
+    :root[data-theme="dark"] .ih-head b{color:#e6edf7}
+    :root[data-theme="dark"] .ih-tag{background:#22314a;color:#a8c0f0}
+    :root[data-theme="dark"] .ih-tag.warn{background:#3a2c14;color:#e0b070}
+    :root[data-theme="dark"] .ih-tag.on{background:#16301f;color:#7fd39a}
+    :root[data-theme="dark"] .ih-prompt{color:#8b98ab}
     :root[data-theme="dark"] .batch-results li{border-color:#2a374a}
     :root[data-theme="dark"] .batch-results .ok{color:#a4e0b6}
     :root[data-theme="dark"] .batch-results .bad{color:#ffb7ad}
@@ -171,6 +195,129 @@
     @media(max-width:520px){main{padding:0 12px 24px}.topbar{height:58px;gap:9px}.top-sub,.origin{display:none}.composer,.task-card{padding:16px}.row{gap:8px}.task-top{flex-wrap:wrap}.task-actions{width:100%;justify-content:flex-start;margin-left:0}.notice{font-size:12px}.notice b{white-space:normal}}
   </style>
   <style>
+    /* ── 顶层双页签：视频任务 / 脚本分镜 ───────────────── */
+    .top-tabs{display:flex;gap:8px;margin:0 0 16px;border-bottom:1px solid #e3e9f2}
+    .ptab{border:0;background:none;color:#748196;padding:10px 14px;font:inherit;font-size:14px;font-weight:650;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px}
+    .ptab:hover{color:#416fe0}
+    .ptab.active{color:#416fe0;border-bottom-color:#416fe0}
+    .page{animation:fadein .16s ease}
+    @keyframes fadein{from{opacity:0;transform:translateY(2px)}to{opacity:1;transform:none}}
+    /* ── 脚本分镜 ───────────────── */
+    .ss-grid{display:grid;grid-template-columns:minmax(200px,260px) minmax(0,1fr);gap:16px;align-items:start}
+    .ss-list{display:grid;gap:6px;max-height:520px;overflow:auto}
+    .ss-item{border:1px solid transparent;border-radius:8px;background:transparent;padding:9px 10px;text-align:left;cursor:pointer;display:grid;grid-template-columns:1fr auto;gap:4px 8px;color:#35445a}
+    .ss-item:hover{background:#f3f6fa}
+    .ss-item.active{background:#edf3ff;border-color:#c3d6fb}
+    .ss-item .ss-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:600}
+    .ss-item small{grid-column:1/-1;color:#8a96a7;font-size:11px}
+    /* 设计宽度下**不允许溢出**：容器约 882px，6 列合计 844px（两列 min-width
+       会吸收余量）。一旦溢出，sticky 的操作列就会盖住它左边那一列 —— 见下方注释。
+       min-width 只作为窄屏兜底（<860px 时才真的横向滚）。 */
+    .ss-shots{width:100%;border-collapse:collapse;min-width:860px}
+    /* 窄屏兜底：横向滚时「操作」列不能被滚出去 —— 否则用户看到的是一排按钮的
+       **半边**，会以为按钮坏了。所以把它钉在右边（sticky），其余列滚。
+       ⚠️ 代价必须知道：被钉住的单元格会**盖住左边一列**（它有背景 #fff）。
+       实测踩过：7 列自然宽 940px > 容器 882px，溢出 58px，比例列被操作列盖掉
+       58px，下拉框几乎点不到。所以设计宽度下必须让表格**不溢出**（见上方
+       min-width 说明），sticky 只在 <860px 时生效，此时被盖的只是
+       「时长 / 比例」一列，可接受。
+       背景必须显式给：sticky 元素不设背景时，下面的单元格会从它背后透出来。 */
+    .ss-shots th:last-child,.ss-shots td:last-child{position:sticky;right:0;background:#fff;box-shadow:-7px 0 9px -7px rgba(27,53,81,.22)}
+    .ss-shots thead th:last-child{background:#fbfcfe}
+    .ss-shots th,.ss-shots td{text-align:left;border-bottom:1px solid #edf0f5;padding:8px 10px;font-size:12px;vertical-align:top}
+    .ss-shots th{color:#718096;background:#fbfcfe;font-weight:600}
+    .ss-shots textarea,.ss-shots select{width:100%;border:1px solid #d8e0eb;border-radius:7px;padding:7px 8px;font:inherit;font-size:12px;line-height:1.45;resize:vertical;background:#fff;color:#172033}
+    .ss-shots select{padding:7px 6px;resize:none}
+    /* 时长 / 比例 合并成一列（都是单分镜的输出规格），纵向堆叠省宽度 */
+    .ss-out{display:grid;gap:5px}
+    /* 出图历史入口：做成链接样式，塞在分镜图格里（不占操作列的宽度，见 .ss-shots 注释） */
+    .ss-hist{display:inline-block;margin-top:6px;padding:0;border:0;background:none;color:#416fe0;font:inherit;font-size:11px;cursor:pointer;text-decoration:underline;text-underline-offset:2px}
+    .ss-hist.muted{color:#9aa6b6;text-decoration:none;cursor:default}
+    .ss-hist:hover{color:#2f5bd0}
+    /* ── 出图历史弹层：一批一块 ── */
+    .ih-batch{border:1px solid #e4eaf3;border-radius:10px;padding:10px 11px;margin-bottom:10px;background:#fbfcfe}
+    .ih-batch.current{border-color:#416fe0;background:#f2f6ff}
+    .ih-head{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:11px;color:#6b7a8d;margin-bottom:8px}
+    .ih-head b{color:#22303f;font-size:12px}
+    .ih-tag{border-radius:999px;padding:1px 7px;font-size:10px;background:#e6edfa;color:#33549b}
+    .ih-tag.warn{background:#fff0e0;color:#a2620f}
+    .ih-tag.on{background:#e2f3e6;color:#1f7a3d}
+    .ih-grid{display:flex;flex-wrap:wrap;gap:7px}
+    .ih-img{padding:0;border:2px solid transparent;border-radius:8px;background:none;cursor:pointer;line-height:0}
+    .ih-img img{display:block;width:132px;height:74px;object-fit:cover;border-radius:6px}
+    .ih-img:hover{border-color:#9dbbff}
+    .ih-img.on{border-color:#416fe0}
+    .ih-prompt{margin:8px 0 0;font-size:11px;color:#7b8798;line-height:1.5;word-break:break-all}
+    /* ── 参考图：入口链接 + 选择弹层 ── */
+    /* 参考图入口和出图历史一样塞在分镜图格里，不占操作列宽度（见 .ss-shots 注释） */
+    .ss-ref{display:inline-block;margin-top:5px;padding:0;border:0;background:none;color:#416fe0;font:inherit;font-size:11px;cursor:pointer;text-decoration:underline;text-underline-offset:2px}
+    .ss-ref.muted{color:#9aa6b6;text-decoration:none}
+    .ss-ref:hover{color:#2f5bd0}
+    .ref-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+    .ref-toolbar .spacer{flex:1}
+    .ref-toolbar .muted{color:#8793a4;font-size:11px}
+    .ref-tabs{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
+    .ref-tab{border:1px solid #d8e0eb;background:#fff;border-radius:999px;padding:4px 12px;font:inherit;font-size:11.5px;color:#4a5768;cursor:pointer}
+    .ref-tab.active{background:#edf3ff;border-color:#c3d6fb;color:#234a83;font-weight:600}
+    .ref-pane{min-height:160px}
+    .ref-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:9px}
+    /* ⚠️ box-sizing 必须显式给 border-box：本页的全局 reset 不覆盖 img，
+       默认 content-box 会把边框算在宽度之外，网格会错位（踩过）。 */
+    .ref-pick{display:grid;grid-template-columns:auto 1fr;align-items:center;gap:5px;box-sizing:border-box;padding:6px;border:1px solid #e4eaf3;border-radius:8px;background:#fff;cursor:pointer}
+    .ref-pick:hover{border-color:#9dbbff}
+    .ref-pick.on{border-color:#416fe0;background:#f2f6ff}
+    .ref-pick img{box-sizing:border-box;display:block;width:100%;height:58px;object-fit:cover;border-radius:5px}
+    .ref-pick .ref-name{grid-column:1/-1;font-size:11px;color:#5d6b7d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .ref-pick input{accent-color:#416fe0}
+    .ref-batch{border:1px solid #e4eaf3;border-radius:10px;padding:9px 10px;margin-bottom:10px;background:#fbfcfe}
+    .ref-batch-head{display:flex;align-items:center;gap:9px;margin-bottom:7px;font-size:11px;color:#6b7a8d}
+    .ref-batch-head b{color:#22303f;font-size:12px}
+    .ref-selected{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:12px;min-height:24px;font-size:11.5px;color:#6b7a8d}
+    .ref-selected .chip{border-radius:999px;padding:2px 8px;background:#e6edfa;color:#33549b;font-size:10.5px;display:inline-flex;align-items:center;gap:5px}
+    .ref-selected .chip button{border:0;background:none;color:#33549b;cursor:pointer;font-size:12px;line-height:1;padding:0}
+    :root[data-theme="dark"] .ss-ref{color:#9db8ff}
+    :root[data-theme="dark"] .ss-ref.muted{color:#6d7a8c}
+    :root[data-theme="dark"] .ref-tab{background:#182333;border-color:#2a374a;color:#b9c6d8}
+    :root[data-theme="dark"] .ref-tab.active{background:#22314a;border-color:#416fe0;color:#d1dfff}
+    :root[data-theme="dark"] .ref-pick{background:#131c29;border-color:#2a374a}
+    :root[data-theme="dark"] .ref-pick.on{background:#16233a;border-color:#416fe0}
+    :root[data-theme="dark"] .ref-pick .ref-name{color:#9aa9bd}
+    :root[data-theme="dark"] .ref-batch{background:#131c29;border-color:#2a374a}
+    :root[data-theme="dark"] .ref-batch-head{color:#9aa9bd}
+    :root[data-theme="dark"] .ref-batch-head b{color:#e6edf7}
+    :root[data-theme="dark"] .ref-selected{color:#9aa9bd}
+    :root[data-theme="dark"] .ref-selected .chip{background:#22314a;color:#a8c0f0}
+    :root[data-theme="dark"] .ref-selected .chip button{color:#a8c0f0}
+    :root[data-theme="dark"] .ref-toolbar .muted{color:#93a1b5}
+    .ss-toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin:10px 0}
+    .ss-meta{color:#78869a;font-size:12px}
+    .ss-foot{display:flex;align-items:center;gap:12px;margin-top:12px;flex-wrap:wrap}
+    .ss-dirty{color:#b7791f;font-size:12px}
+    .ss-err{color:#ad352c;font-size:12px}
+    .ss-form{display:grid;grid-template-columns:minmax(300px,1.6fr) minmax(220px,1fr);gap:18px;margin-top:16px}
+    .ss-side{display:flex;flex-direction:column}
+    .ss-note{display:flex;justify-content:space-between;gap:10px;color:#8793a4;font-size:11px;padding-top:6px}
+    .ss-pick{display:flex;align-items:center;gap:8px}
+    .ss-pick .select{width:230px}
+    .ss-tag{display:inline-block;border-radius:999px;padding:3px 7px;font-size:10px;background:#f0f3f8;color:#66758a;white-space:nowrap}
+    .ss-tag.ok{background:#e9f7ef;color:#287544}
+    .ss-tag.bad{background:#fff0ee;color:#ad3b32}
+    .ss-tag.warn{background:#fff8e7;color:#7c5b14}
+    /* 分镜图：主图 + 候选缩略图。主图点击放大，缩略图点击即「选这张」。 */
+    .ss-thumb{display:block;width:118px;height:66px;object-fit:cover;border-radius:7px;border:1px solid #dbe3ef;background:#f3f6fa;cursor:zoom-in}
+    .ss-thumb-empty{display:grid;place-items:center;width:118px;height:66px;border:1px dashed #cfd9e6;border-radius:7px;color:#9aa6b6;font-size:11px;background:#fbfcfe}
+    /* 28→26px + gap 3：4 张候选合计 4×26+3×3=113 ≤ 118，刚好一行不换行 */
+    .ss-cands{display:flex;gap:3px;flex-wrap:wrap;margin-top:5px;max-width:118px}
+    .ss-cands img{width:26px;height:26px;object-fit:cover;border-radius:5px;border:2px solid transparent;cursor:pointer;opacity:.72}
+    .ss-cands img:hover{opacity:1}
+    .ss-cands img.on{border-color:#416fe0;opacity:1}
+    /* 后台「取消 / 删除 / 清空」按钮用的 .danger：test.html 里有两个 .btn.danger
+       规则互相覆盖（一个深红底、一个浅粉底），最终深红胜出 → 浅粉底+暗红字丢色。
+       任务列表里这套不可点就让用户不知道点没点中；脚本页要按这个走。
+       仅覆盖 .task-actions 容器内的，不会影响批量/兑换等其他按钮。 */
+    .task-actions .btn.danger{background:#fff1f0;color:#ad352c;border:1px solid #ffd9d4}
+    .task-actions .btn.danger:hover{background:#ffe5e1}
+    @media(max-width:900px){.ss-form,.ss-grid{grid-template-columns:1fr}}
     .notice-details{display:block}
     .notice-details>summary{cursor:pointer;font-weight:700;color:#234a83;list-style:none}
     .notice-details>summary::-webkit-details-marker{display:none}
@@ -183,6 +330,117 @@
     :root[data-theme="dark"] .notice-details>summary{color:#a9c6ff}
     :root[data-theme="dark"] .notice-details>summary::after{color:#aabbd4}
     :root[data-theme="dark"] .notice-file-mode a{color:#b4ccff}
+  </style>
+  <style>
+    /* 工作台精简视觉：保留原有节点和交互，只收紧层级与首屏信息量。 */
+    :root{--page:#f6f7fb;--surface:#fff;--line:#e5e9f1;--ink:#172033;--muted:#78859a;--accent:#4f6fe0;--soft:#f3f6fb}
+    body{background:var(--page);color:var(--ink)}
+    .topbar{position:sticky;top:0;z-index:20;height:64px;padding:0 max(20px,calc((100vw - 1240px)/2));gap:12px;background:#172238;box-shadow:0 1px 0 #ffffff12,0 8px 24px #15223b14}
+    .brand{width:32px;height:32px;border-radius:9px;font-size:15px}
+    .top-title{font-size:15px;letter-spacing:.1px}.top-sub{font-size:11px;color:#b7c3d6}.origin{font-size:11px;color:#aab8cc}
+    .top-balance,.top-btn,.theme-toggle{border-radius:7px;padding:7px 10px;font-size:11px}
+    .topbar a{font-size:12px;color:#dce5f3}
+    main{max-width:1240px;margin:20px auto;padding:0 20px 36px}
+    .notice{border-radius:10px;margin-bottom:12px;padding:11px 14px;font-size:12px;line-height:1.55;box-shadow:none}
+    .notice-details>summary{display:flex;align-items:center;justify-content:space-between;gap:16px}
+    .notice-details>summary span{margin-left:auto;color:#738198;font-weight:400;text-align:right}
+    .notice-details-body{margin-top:9px;padding-top:9px;border-top:1px solid #dce5f2}
+    .security-details{background:var(--surface);border-color:var(--line);color:var(--muted)}
+    .security-details>summary{display:flex;align-items:center;gap:12px;list-style:none;cursor:pointer}
+    .security-details>summary::-webkit-details-marker{display:none}
+    .security-details>summary b{color:#35527f;white-space:nowrap}
+    .security-details>summary span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .security-details-body{margin-top:8px;padding-top:8px;border-top:1px solid var(--line);font-size:11px;color:var(--muted)}
+    .layout{grid-template-columns:minmax(320px,380px) minmax(0,1fr);gap:20px}
+    .card{border-color:var(--line);border-radius:14px;box-shadow:0 8px 28px #182a4810}
+    .composer,.task-card{padding:20px}
+    .card-head{margin-bottom:14px}.card h1,.card h2{font-size:16px}.card-head p{font-size:11px;color:var(--muted)}
+    .badge{padding:4px 8px;font-size:10px}
+    .field{margin:13px 0}.field label{font-size:12px;margin-bottom:6px}.hint{font-size:10px}
+    .input,.select,.textarea{border-radius:8px;border-color:#dce2ec;padding:9px 10px;font-size:12px}
+    .input,.select{min-height:40px}.textarea{min-height:118px}
+    .btn{border-radius:8px;padding:9px 12px;font-size:12px;background:var(--accent)}.btn.small{padding:6px 9px;font-size:11px}
+    .btn.secondary{background:#eef2f8;color:#3c506f}.btn.ghost{background:transparent;color:#4c6490;border-color:#dbe3ef}
+    .key-row{gap:7px}.row{gap:10px}.token-note,.point-note{font-size:10px;color:#8792a3}
+    .remember-row{font-size:10px;margin-top:8px}.filebox{padding:10px;border-radius:8px;background:#fafbfd}
+    .file-list{margin-top:7px;gap:4px}.file-list li{font-size:10px}
+    .capability{min-height:40px;padding:9px 10px;border-radius:8px;font-size:11px}
+    .checkbox-row{margin-top:13px;padding:9px 10px;border-radius:8px;font-size:11px}
+    .submit-row{margin-top:14px;gap:7px}.submit-row .btn{padding:10px}
+    .task-card .card-head{align-items:center}.statusbar{font-size:11px}
+    .tabbar{border-bottom:1px solid var(--line);padding-bottom:7px;margin-bottom:2px!important}
+    .tab{padding:5px 8px;font-size:11px}.tab.active{border-color:#d7e0f0;background:#edf2fb}
+    .stat-strip{gap:8px;margin-top:13px}.stat{border-radius:9px;padding:9px 10px;background:#fafbfd;border-color:var(--line)}.stat b{font-size:16px}.stat span{font-size:10px}
+    .task-top{margin-top:15px!important;gap:10px}.task-status{font-size:13px}.task-stage{font-size:11px}.task-actions{gap:6px}
+    .prog{height:5px;margin-top:12px}.prog-note{font-size:10px}.meta-grid{margin-top:14px;padding-top:12px;font-size:11px;grid-template-columns:72px 1fr}
+    .upstream-note{font-size:10px}.raw{margin-top:11px;padding-top:10px}.raw summary{font-size:11px}
+    .list-head{padding:0 0 12px}.list-head h2{font-size:15px}.jobs-tools{margin-bottom:10px}.jobs th,.jobs td{padding:9px 10px;font-size:11px}
+    .jobs{min-width:620px}.row-btn{font-size:10px;padding:3px 4px}
+    .dlg{border-radius:12px}.dlg-head{padding:13px 16px}.dlg-body{padding:14px 16px 16px}.dlg-note{font-size:11px}
+    :root[data-theme="dark"]{--page:#0e1522;--surface:#141e2d;--line:#29384d;--ink:#e6edf7;--muted:#9aa9bd;--soft:#172436}
+    :root[data-theme="dark"] body{background:var(--page)}
+    :root[data-theme="dark"] .security-details{background:var(--surface);border-color:var(--line);color:var(--muted)}
+    :root[data-theme="dark"] .security-details>summary b{color:#b6cbf5}
+    :root[data-theme="dark"] .notice-details-body,:root[data-theme="dark"] .security-details-body{border-color:var(--line)}
+    :root[data-theme="dark"] .notice-details>summary span{color:#aab8cb}
+    :root[data-theme="dark"] .card{background:var(--surface);border-color:var(--line);box-shadow:0 8px 28px #0002}
+    :root[data-theme="dark"] .input,:root[data-theme="dark"] .select,:root[data-theme="dark"] .textarea{border-color:#34445a}
+    :root[data-theme="dark"] .filebox,:root[data-theme="dark"] .stat{background:#111c2b;border-color:var(--line)}
+    :root[data-theme="dark"] .tabbar{border-color:var(--line)}
+    @media(max-width:900px){main{margin-top:14px;padding:0 16px 30px}.layout{grid-template-columns:1fr}.composer{order:0}.right{order:1}}
+    @media(max-width:560px){main{padding:0 11px 24px}.topbar{height:58px;padding:0 12px}.top-sub,.origin,.topbar a{display:none}.top-balance{margin-left:auto}.security-details>summary span{max-width:58%;}.row{gap:8px}.composer,.task-card{padding:16px}.task-actions{width:100%;justify-content:flex-start}.stat-strip{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+    /* ── 深色补丁：脚本分镜页（2026-09-28）──────────────────────────────
+       背景：深色规则主要写在块1，块2/块3 后来做了一轮「浅色改版」
+       （换了更浅的边框/底色、收紧了字号），但只改了浅色那一份 ——
+       深色下这些选择器仍命中旧的浅色值，于是出现「深色页面里白底的
+       分镜表 / 下拉框 / 输入框、以及白底的状态胶囊」。
+       这里只**新增**覆盖，不改上面任何一条已有规则；整段可一次性回滚。
+       取值对齐既有深色锚点，保证和「视频任务」页同一套层次：
+         surface #141e2d  line #29384d  muted #93a1b5
+         th #182435  td 文字 #d0dbea  输入框 #0d1725 / 边框 #34445a */
+    /* 顶层双页签 */
+    :root[data-theme="dark"] .top-tabs{border-bottom-color:var(--line)}
+    :root[data-theme="dark"] .ptab{color:#a0aec1}
+    :root[data-theme="dark"] .ptab:hover{color:#9db8ff}
+    :root[data-theme="dark"] .ptab.active{color:#9db8ff;border-bottom-color:#9db8ff}
+    /* 脚本列表 */
+    :root[data-theme="dark"] .ss-item{color:#d0dbea}
+    :root[data-theme="dark"] .ss-item:hover{background:#1b293a}
+    :root[data-theme="dark"] .ss-item.active{background:#22334b;border-color:#3a5272}
+    :root[data-theme="dark"] .ss-item small{color:#93a1b5}
+    /* 分镜表：表头、单元格分隔线、钉在右侧的操作列
+       ⚠️ 操作列（last-child）的背景必须**不透明**，否则横滚时下面的
+       单元格会从它背后透出来；深色下用 --surface 与卡片同色。 */
+    :root[data-theme="dark"] .ss-shots th,:root[data-theme="dark"] .ss-shots td{border-bottom-color:#2a374a}
+    :root[data-theme="dark"] .ss-shots th{color:#aab9cc;background:#182435}
+    :root[data-theme="dark"] .ss-shots th:last-child,
+    :root[data-theme="dark"] .ss-shots td:last-child{background:var(--surface);box-shadow:-7px 0 9px -7px rgba(0,0,0,.55)}
+    :root[data-theme="dark"] .ss-shots thead th:last-child{background:#182435}
+    /* 分镜表里的输入控件：test.js 生成的是**裸** textarea/select（不带
+       .input/.select 类），所以块1 的深色输入框规则命中不到，必须单独补 —— 
+       这是「深色下白底黑字」最刺眼的一处。 */
+    :root[data-theme="dark"] .ss-shots textarea,
+    :root[data-theme="dark"] .ss-shots select{background:#0d1725;border-color:#34445a;color:#e3ebf6}
+    :root[data-theme="dark"] .ss-shots textarea::placeholder{color:#7f8ea3}
+    /* 文案色阶 */
+    :root[data-theme="dark"] .ss-meta{color:#93a1b5}
+    :root[data-theme="dark"] .ss-note{color:#93a1b5}
+    :root[data-theme="dark"] .ss-dirty{color:#e5bc72}
+    :root[data-theme="dark"] .ss-err{color:#ffada3}
+    /* 状态胶囊：脚本列表与分镜头部共用 .ss-tag，一处覆盖两处生效。
+       色板与块1 的 .tag/.tag.ready/.failed/.running 保持一致。 */
+    :root[data-theme="dark"] .ss-tag{background:#293548;color:#c2cee0}
+    :root[data-theme="dark"] .ss-tag.ok{background:#1c3a2b;color:#a4e0b6}
+    :root[data-theme="dark"] .ss-tag.bad{background:#402629;color:#ffb7ad}
+    :root[data-theme="dark"] .ss-tag.warn{background:#3a2c14;color:#e0b070}
+    /* 分镜图：缩略图与空占位框 */
+    :root[data-theme="dark"] .ss-thumb{border-color:#2a374a;background:#182333}
+    :root[data-theme="dark"] .ss-thumb-empty{border-color:#3a4a5e;color:#93a1b5;background:#131c29}
+    /* 链接式按钮的悬停：:hover 的特异性低于块1 的深色基础规则，
+       不显式补会被吃掉，导致鼠标悬停没有任何反馈。 */
+    :root[data-theme="dark"] .ss-hist:hover{color:#b9cfff}
+    :root[data-theme="dark"] .ss-ref:hover{color:#b9cfff}
   </style>
 </head>
 <body>
@@ -207,7 +465,16 @@
       </div>
     </details>
     <div id="fileModeNotice" class="notice notice-file-mode hidden" role="alert"><b>请通过正式网址打开</b><span>当前页面是本地文件预览，无法连接后台或读取任务。请通过工作台的正式网址访问以使用完整功能。</span></div>
-    <div class="notice"><b>令牌安全</b><span>只输入你自己的用户令牌。默认<b>不落盘</b> —— 令牌只在当前页面内存中使用，刷新即失效；只有显式勾选「在本机记住令牌」时才会写进浏览器 localStorage（公共电脑上不要勾）。所有请求只发往当前网站。创建任务会扣除令牌积分，并可能消耗上游生成额度。</span></div>
+    <details class="notice security-details">
+      <summary><b>令牌安全与计费</b><span>令牌默认只在当前页面使用，创建任务会扣除积分</span></summary>
+      <div class="security-details-body">只输入你自己的用户令牌。默认不落盘；只有显式勾选「在本机记住令牌」时才会写进浏览器 localStorage。所有请求只发往当前网站，任务创建前会再次确认令牌余额与上游能力。</div>
+    </details>
+    <div class="top-tabs" role="tablist" aria-label="工作台模式">
+      <button id="pageTabVideo" class="ptab active" type="button" role="tab" aria-selected="true">视频任务</button>
+      <button id="pageTabScript" class="ptab" type="button" role="tab" aria-selected="false">脚本分镜</button>
+    </div>
+
+    <div id="page-video" class="page">
     <div class="layout">
       <section class="card composer" aria-labelledby="composerTitle">
         <div class="card-head"><div><h1 id="composerTitle">新建视频任务</h1><p>兼容本地 V1 接口的 JSON 与图片 multipart 请求。</p></div><span class="badge">同源请求</span></div>
@@ -231,6 +498,7 @@
         <div class="field"><label for="prompt">提示词 <span class="hint">必填</span></label><textarea id="prompt" class="textarea" maxlength="12000" placeholder="描述主体、动作、镜头和画面风格"></textarea></div>
         <div class="field"><label for="images">参考图片 <span class="hint">可选，最多 9 张</span></label><div class="filebox"><input id="images" type="file" accept="image/*" multiple><ul id="fileList" class="file-list"></ul></div>
           <div class="mini-actions">
+            <button id="pickFromLibrary" class="btn ghost small" type="button" title="从服务端参考图库选图（分镜出的图会自动收进那里）">从参考图库选</button>
             <button id="saveMaterial" class="btn ghost small" type="button" title="把当前提示词、画幅与参考图存成本机素材（只存在这个浏览器里）">存为素材</button>
             <button id="openMaterials" class="btn ghost small" type="button" title="打开本机素材库：选用 / 删除">素材库</button>
           </div>
@@ -247,14 +515,16 @@
       <div class="right">
         <section class="card task-card" aria-labelledby="taskTitle">
           <div class="card-head">
-            <div><h2 id="taskTitle">任务</h2><p>只轮询当前这一条任务，每 15 秒一次；任务列表不自动刷新。</p></div>
+            <div><h2 id="taskTitle">任务</h2><p>列表自动刷新：有任务在跑时约 4 秒一次，空闲时 20 秒一次；提交后任务会立刻出现在列表里（不用手动点刷新）。</p></div>
             <div class="statusbar"><span id="statusDot" class="dot"></span><span id="connectionState">尚未连接</span></div>
           </div>
           <div class="tabbar" style="margin:0 0 6px">
             <button id="tabRun" class="tab active" type="button">当前任务</button>
             <button id="tabJobs" class="tab" type="button">任务列表</button>
             <span style="flex:1"></span>
-            <button id="ping" class="btn ghost small" type="button">测连通</button>
+            <!-- 初始即 disabled：测连通打的是需要令牌的 /v1/status，没有令牌必然 401。
+                 写在 HTML 上而不是等 JS 来收，是为了消除「先可点、再被禁用」的闪烁窗口。 -->
+            <button id="ping" class="btn ghost small" type="button" disabled title="连接令牌后可用：测连通走的是需要令牌的 /v1/status">测连通</button>
           </div>
 
           <div id="pane-run" class="pane active">
@@ -266,6 +536,10 @@
                 <button id="cancelCurrent" class="btn small danger hidden" type="button">取消任务</button>
                 <button id="clearCurrent" class="btn small ghost" type="button" disabled>清除任务</button>
                 <a id="download" class="btn small hidden" download>下载成片</a>
+                <!-- 「无水印预览」：后端 /v1/videos/:id 本来就带 is_unwatermarked /
+                     unwatermarked_url / url_source，前端一直没用。可见性由
+                     syncUnwatermarkedButton() 算，点了必然报错的状态就不显示。 -->
+                <button id="previewUnwatermarked" class="btn small secondary hidden" type="button">无水印预览</button>
               </div>
             </div>
             <div class="prog" aria-hidden="true"><i id="progressBar"></i></div>
@@ -299,6 +573,72 @@
           </div>
         </section>
       </div>
+    </div>
+    </div><!-- /page-video -->
+
+    <!-- ── 脚本分镜页：与后台 ScriptStudio.vue 同源能力，接口走 /api/scripts/* ── -->
+    <div id="page-script" class="page hidden">
+      <section class="card composer" aria-labelledby="ssComposerTitle">
+        <div class="card-head">
+          <div>
+            <h1 id="ssComposerTitle">脚本分镜</h1>
+            <p>主题生成多镜头脚本，再逐条创建视频任务。本页走后台管理员会话（<code>/api/scripts/*</code>），与「视频任务」页用的 <code>dv_</code> 用户令牌是<b>两套独立鉴权</b>，互不影响。</p>
+          </div>
+          <button id="ssGenerate" class="btn" type="button" disabled>生成脚本</button>
+        </div>
+        <div id="ssAuthWarn" class="notice hidden" role="alert"><b>未登录后台</b><span>脚本分镜读的是管理员会话。请先到 <a href="/login">管理后台登录</a>，再回到本页刷新。</span></div>
+        <div id="ssConfigWarn" class="notice hidden" role="alert"><b>脚本生成暂不可用</b><span id="ssConfigWarnText">请到系统设置 → 脚本工作台，启用生成并配置通道。</span></div>
+        <div class="ss-form">
+          <div class="field" style="margin:0"><label for="ssTopic">主题 / 卖点</label><textarea id="ssTopic" class="textarea" rows="4" maxlength="2000" placeholder="例如：一只橘猫在阳光下的草地上打滚，做成温暖的短视频"></textarea></div>
+          <div class="ss-side">
+            <div class="field" style="margin:0"><label for="ssTone">表达调性</label><input id="ssTone" class="input" type="text" maxlength="500" placeholder="自然、清晰、电影感"></div>
+            <div class="field"><label for="ssShotCount">镜头数 <span class="hint">1～20</span></label><input id="ssShotCount" class="input" type="number" min="1" max="20" step="1" value="6"></div>
+            <div class="ss-note"><span id="ssModelNote">未配置 LLM</span><span id="ssSecondsNote">时长：—</span></div>
+          </div>
+        </div>
+      </section>
+
+      <div class="ss-grid" style="margin-top:18px">
+        <section class="card list-card" aria-labelledby="ssListTitle">
+          <div class="list-head"><h2 id="ssListTitle">脚本列表</h2><button id="ssReload" class="btn small secondary" type="button">刷新</button></div>
+          <div style="padding:12px 14px">
+            <div id="ssList" class="ss-list"></div>
+            <div id="ssListEmpty" class="empty">还没有脚本</div>
+          </div>
+        </section>
+
+        <section class="card task-card" aria-labelledby="ssShotsTitle">
+          <div class="card-head">
+            <div><h2 id="ssShotsTitle">分镜</h2><p id="ssHeadNote">选择一个脚本，或先生成一份新脚本</p></div>
+            <div class="task-actions">
+              <span id="ssStatusTag" class="ss-tag hidden"></span>
+              <button id="ssSave" class="btn small" type="button" disabled>保存修改</button>
+              <button id="ssDelete" class="btn small danger" type="button" disabled>删除脚本</button>
+            </div>
+          </div>
+          <div id="ssEditor" class="hidden">
+            <div class="field"><label for="ssTitle">脚本标题</label><input id="ssTitle" class="input" type="text" maxlength="120" placeholder="脚本标题"></div>
+            <div class="row">
+              <div class="field"><label for="ssCurTopic">主题</label><input id="ssCurTopic" class="input" type="text" maxlength="2000"></div>
+              <div class="field"><label for="ssCurTone">调性</label><input id="ssCurTone" class="input" type="text" maxlength="500"></div>
+            </div>
+            <div class="ss-toolbar">
+              <span class="ss-meta" id="ssShotMeta">分镜 0 个</span>
+              <div class="ss-pick"><span class="ss-meta">扣费令牌</span><select id="ssToken" class="select"></select></div>
+            </div>
+            <div class="list-wrap">
+              <table class="ss-shots"><thead><tr><th style="width:38px">#</th><th style="min-width:220px">画面描述</th><th style="min-width:180px">旁白 / 字幕</th><th style="width:150px">分镜图</th><th style="width:124px">时长 / 比例</th><th style="width:132px">操作</th></tr></thead><tbody id="ssShotRows"></tbody></table>
+            </div>
+            <div class="ss-foot">
+              <button id="ssAddShot" class="btn small ghost" type="button">+ 添加分镜</button>
+              <span id="ssDirty" class="ss-dirty hidden">有未保存修改</span>
+              <span id="ssErr" class="ss-err"></span>
+            </div>
+          </div>
+          <div id="ssEmpty" class="empty">选择左侧脚本后编辑分镜</div>
+        </section>
+      </div>
+      <div id="ssMsg" class="error-box"></div>
     </div>
   </main>
 
@@ -341,6 +681,69 @@
       <p class="dlg-note">素材（提示词 + 画幅 + 参考图）只保存在<b>当前浏览器</b>的 localStorage，不会上传到服务器，也不跟着令牌漫游 —— 换浏览器或清缓存就没了。参考图按 base64 存，占本地空间较多，只存真正会复用的那几条。</p>
       <ul id="materialList" class="material-list"></ul>
       <div id="materialEmpty" class="empty">还没有素材。填好提示词后点「存为素材」。</div>
+    </div>
+  </dialog>
+
+  <!-- ── 弹窗：分镜出图历史。★ 一次生成 = 一组，按批成块，绝不拍平成图片流水 ── -->
+  <dialog id="imgHistDlg" class="dlg" aria-labelledby="imgHistTitle">
+    <div class="dlg-head"><strong id="imgHistTitle">出图历史</strong><span class="spacer"></span><button class="btn ghost small" data-dlg-close="imgHistDlg" type="button">关闭</button></div>
+    <div class="dlg-body">
+      <p class="dlg-note" id="imgHistNote"></p>
+      <div id="imgHistBody"></div>
+      <div id="imgHistError" class="error-box"></div>
+    </div>
+  </dialog>
+
+  <!-- ── 弹窗：从服务端参考图库选图（主工作台用：选中后变成待提交的参考图） ── -->
+  <dialog id="libPickDlg" class="dlg" aria-labelledby="libPickTitle">
+    <div class="dlg-head"><strong id="libPickTitle">从参考图库选</strong><span class="spacer"></span><button class="btn ghost small" data-dlg-close="libPickDlg" type="button">关闭</button></div>
+    <div class="dlg-body">
+      <p class="dlg-note" id="libPickNote">图库里的图存在服务端（不是这台浏览器），分镜出的图会自动收进去。</p>
+      <div class="ref-toolbar">
+        <input id="libPickSearch" class="input" style="width:200px" placeholder="搜索名称或标签">
+        <button id="libPickSearchBtn" class="btn ghost small" type="button">搜索</button>
+        <span class="spacer"></span>
+        <span class="muted" id="libPickCount"></span>
+      </div>
+      <div id="libPickBody"></div>
+      <div class="ref-selected" id="libPickSelected"></div>
+      <div id="libPickError" class="error-box"></div>
+      <div class="dlg-actions"><button class="btn ghost" data-dlg-close="libPickDlg" type="button">取消</button><button id="libPickConfirm" class="btn" type="button">加入参考图</button></div>
+    </div>
+  </dialog>
+
+  <!-- ── 弹窗：分镜参考图。★ 只存「指向」，提交视频任务时才下载成真实图片 ── -->
+  <dialog id="shotRefDlg" class="dlg" aria-labelledby="shotRefTitle">
+    <div class="dlg-head"><strong id="shotRefTitle">分镜参考图</strong><span class="spacer"></span><button class="btn ghost small" data-dlg-close="shotRefDlg" type="button">关闭</button></div>
+    <div class="dlg-body">
+      <p class="dlg-note" id="shotRefNote"></p>
+      <div class="ref-tabs">
+        <button class="ref-tab" type="button" data-reftab="shot">当前分镜图</button>
+        <button class="ref-tab" type="button" data-reftab="library">从参考图库选</button>
+        <button class="ref-tab" type="button" data-reftab="history">从出图历史选</button>
+      </div>
+      <div id="shotRefBody"></div>
+      <div class="ref-selected" id="shotRefSelected"></div>
+      <div id="shotRefError" class="error-box"></div>
+      <div class="dlg-actions">
+        <button class="btn ghost" data-dlg-close="shotRefDlg" type="button">取消</button>
+        <button id="shotRefClear" class="btn ghost" type="button">清空</button>
+        <button id="shotRefSave" class="btn" type="button">保存</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- ── 弹窗：无水印预览 ─────────────────────────────────────────────────
+       单独一个 <video>，不动左侧主播放器 —— 主播放器的源是「归档优先」，
+       旁边「下载成片」也指向同一份；把主播放器临时改指上游无水印直链，
+       会让播放器和下载指向两版不同的成片。源优先级见 test.js 的
+       unwatermarkedSource()：归档（且 is_unwatermarked）→ 上游 unwatermarked_url。 -->
+  <dialog id="uwDlg" class="dlg" aria-labelledby="uwTitle">
+    <div class="dlg-head"><strong id="uwTitle">无水印预览</strong><span class="spacer"></span><button class="btn ghost small" data-dlg-close="uwDlg" type="button">关闭</button></div>
+    <div class="dlg-body">
+      <p class="dlg-note" id="uwNote"></p>
+      <video id="uwPlayer" class="player" controls playsinline></video>
+      <div id="uwError" class="error-box"></div>
     </div>
   </dialog>
 

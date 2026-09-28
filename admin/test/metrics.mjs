@@ -71,7 +71,7 @@ function snapshot(overrides = {}) {
     // "我没采到"伪装成"我很健康"），所以夹具不给就会多出一条激活告警。
     readiness: {
       grade: 'ok', reasons: [], acute: [],
-      seconds: { supported: [10, 15, 20, 30], ready: [10, 15, 20, 30] },
+      seconds: { supported: [15, 30], ready: [15, 30] },
       accounts: { valid: 3, cooling: 0, available: 3 },
       queue: { activeTasks: 0, queueLimit: 20, queueAvailable: 20 },
       at: '2026-01-01T00:00:00.000Z',
@@ -327,11 +327,12 @@ test('★ 指标里输出三个就绪度桶（即使为 0 也要有 —— 否�
 
 test('★ 指标里输出各档位可提交性，且 15/30 的可用性来自 readiness.seconds.ready', () => {
   const text = renderPrometheus(snapshot({
-    readiness: { grade: 'degraded', reasons: [], seconds: { supported: [10, 15, 20, 30], ready: [10, 20] }, accounts: { valid: 5, cooling: 0, available: 5 }, queue: {} },
+    readiness: { grade: 'degraded', reasons: [], seconds: { supported: [15, 30], ready: [15] }, accounts: { valid: 5, cooling: 0, available: 5 }, queue: {} },
   }), { alerts: [] });
-  assert.ok(text.includes('dola_admin_seconds_ready{seconds="10"} 1'));
-  assert.ok(text.includes('dola_admin_seconds_ready{seconds="15"} 0'));
-  assert.ok(text.includes('dola_admin_seconds_ready{seconds="20"} 1'));
+  assert.ok(text.includes('dola_admin_seconds_ready{seconds="15"} 1'));
+  // 档位精简后不再有 10/20 两档的指标序列；30 秒未就绪 → 0
+  assert.ok(!text.includes('dola_admin_seconds_ready{seconds="10"}'));
+  assert.ok(!text.includes('dola_admin_seconds_ready{seconds="20"}'));
   assert.ok(text.includes('dola_admin_seconds_ready{seconds="30"} 0'));
   assert.ok(text.includes('dola_admin_accounts_available 5'));
 });
@@ -339,7 +340,7 @@ test('★ 指标里输出各档位可提交性，且 15/30 的可用性来自 re
 test('★ 常态降级必须可交叉验证：acute_reasons=0 解释了"degraded 为什么安静"', () => {
   // 只有常态缺口的 degraded：grade 桶=degraded、acute_reasons=0、告警 inactive —— 三者自洽
   const chronicSnapshot = snapshot({
-    readiness: { grade: 'degraded', reasons: ['原生 30 秒档位当前不可用'], acute: [], seconds: { supported: [10, 15, 20, 30], ready: [10, 20] }, accounts: { valid: 7, cooling: 0, available: 7 }, queue: {} },
+    readiness: { grade: 'degraded', reasons: ['原生 30 秒档位当前不可用'], acute: [], seconds: { supported: [15, 30], ready: [15] }, accounts: { valid: 7, cooling: 0, available: 7 }, queue: {} },
   });
   const text = renderPrometheus(chronicSnapshot, { alerts: buildAlerts(chronicSnapshot) });
   assert.ok(text.includes('dola_admin_readiness{grade="degraded"} 1'));
@@ -349,7 +350,7 @@ test('★ 常态降级必须可交叉验证：acute_reasons=0 解释了"degraded
 
   // 有异常缺口：acute_reasons>0 ⇒ 告警必须同时为真（两者不一致就是 bug）
   const acuteSnapshot = snapshot({
-    readiness: { grade: 'degraded', reasons: ['2 个账号在限流冷却中'], acute: ['2 个账号在限流冷却中'], seconds: { supported: [10, 15, 20, 30], ready: [10, 15, 20, 30] }, accounts: { valid: 9, cooling: 2, available: 7 }, queue: {} },
+    readiness: { grade: 'degraded', reasons: ['2 个账号在限流冷却中'], acute: ['2 个账号在限流冷却中'], seconds: { supported: [15, 30], ready: [15, 30] }, accounts: { valid: 9, cooling: 2, available: 7 }, queue: {} },
   });
   assert.ok(renderPrometheus(acuteSnapshot, { alerts: [] }).includes('dola_admin_readiness_acute_reasons 1'));
   assert.equal(buildAlerts(acuteSnapshot).find((a) => a.kind === 'readiness_degraded').active, true);
@@ -441,8 +442,8 @@ test('★ [回归钉] 不传 pools 时 collectMetrics 自己取原生能力真�
     db: fakeDb({ accountRows: accounts }), poolReaders: readers, readSetting, ...NO_DEPS,
   });
   assert.deepEqual(calls, [15, 30, 'refs'], '不传 pools 必须就地取真值（这就是修复的核心）');
-  assert.deepEqual(s.readiness.seconds.ready, [10, 15, 20, 30],
-    '★ 原生能力确认后 15/30 必须变成可提交 —— 修复前 pools 恒 {} ⇒ 永远只有 [10,20]');
+  assert.deepEqual(s.readiness.seconds.ready, [15, 30],
+    '★ 原生能力确认后 15/30 必须变成可提交 —— 修复前 pools 恒 {} ⇒ 一档都不可提交');
   assert.equal(s.readiness.grade, 'ok', '★ 原生能力齐备时不该还判 degraded（旧代码永远 degraded）');
   assert.equal(buildAlerts(s).find((a) => a.kind === 'readiness_degraded').active, false);
 
@@ -455,7 +456,8 @@ test('★ [回归钉] 不传 pools 时 collectMetrics 自己取原生能力真�
     ...NO_DEPS,
   });
   assert.equal(calls.length, 3, '显式传入时不该再调读取器');
-  assert.deepEqual(injected.readiness.seconds.ready, [10, 20]);
+  // 档位精简后没有"无需能力确认"的档位：15/30 都要原生能力确认 ⇒ 全关时 ready 为空。
+  assert.deepEqual(injected.readiness.seconds.ready, []);
   assert.equal(injected.readiness.grade, 'degraded');
   // 且只有常态缺口（原生档位未确认）时**不告警**
   assert.equal(buildAlerts(injected).find((a) => a.kind === 'readiness_degraded').active, false,

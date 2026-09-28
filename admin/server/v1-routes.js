@@ -54,11 +54,12 @@ import { readinessSummary, publicReadiness } from './dola/readiness.js';
 
 const router = express.Router();
 
-/** 模型↔时长的唯一权威映射，抄自 dola/generation-policy.js:34 与 :75。不要在这里另立一套。 */
-const MODEL_FOR_SECONDS = { 15: 'seedance_v2.0', 20: 'seedance_v2.5', 30: 'seedance_v2.5' };
+/** 模型↔时长的唯一权威映射，抄自 dola/generation-policy.js。不要在这里另立一套。
+ * 档位精简（2026-09-27）：10/20 下线，只剩 15（专家/2.0）与 30（2.5）。 */
+const MODEL_FOR_SECONDS = { 15: 'seedance_v2.0', 30: 'seedance_v2.5' };
 /** 页面真实提供过的比例（web/src/views/Dola.vue）。ratio 只做记录，不驱动上游。 */
 const ADVERTISED_RATIOS = ['16:9', '9:16', '1:1'];
-const SUPPORTED_SECONDS = [10, 15, 20, 30];
+const SUPPORTED_SECONDS = [15, 30];
 
 /** 票据有效期。短到"链接被转发出去也没多大用"，长到"够下载完一个大文件"。 */
 const FILE_TICKET_HOURS = 10 / 60;
@@ -207,19 +208,19 @@ function modelCatalog() {
       alias: 'seedance_v2.5',
       id: 'seedance_v2.5',
       name: 'Dreamina Seedance 2.5',
-      duration: ['10', '20', '30'],
+      duration: ['30'],
       resolution: [],
       ratio: ADVERTISED_RATIOS,
       image: IMAGE_MAX_COUNT,
       audio: 0,
       video: 0,
-      remark: '20/30 秒按参考站同款「页面选 15/10 秒载体 + 请求层改写 duration」路径；30 秒要求账号已通过只读原生能力探测。resolution 未由本服务控制，故留空。',
+      remark: '30 秒按当前服务的 30 秒准入与提交路径执行；账号必须先通过只读能力探测。resolution 未由本服务控制，故留空。',
     },
     {
       alias: 'seedance_v2.0',
       id: 'seedance_v2.0',
       name: 'Dreamina Seedance 2.0 fast',
-      duration: ['10', '15'],
+      duration: ['15'],
       resolution: [],
       ratio: ADVERTISED_RATIOS,
       image: IMAGE_MAX_COUNT,
@@ -484,23 +485,29 @@ router.get('/model-groups', requireApiToken, (_req, res) => {
  * JSON 与 multipart 都收。字段（参考站的口径 + 我们的少量扩展）：
  *   prompt          必填
  *   model           可选，seedance_v2.0 / seedance_v2.5
- *   seconds         可选，10 / 15 / 20 / 30（默认 10）
+ *   seconds         可选，15 / 30（默认 30）
  *   size            可选，`16:9` 或 `720x1280`
  *   auto_start      可选，默认 true；false → 建任务并冻结积分，等 /start
  *   images          JSON 专用，base64 数组；multipart 用同名文件字段
  *   input_reference multipart 专用，参考图文件（可多张）
  *   audio           参考站有这个字段，**我们没有任何音频能力**，传了就 400
- *   扩展：account_id / strict_account / force_seconds / points / mode
+ *   扩展：account_id / strict_account / force_seconds / mode
+ *   points 只允许后台受信任入口指定；公开 /v1 由服务端计价。
  */
 router.post('/videos', requireApiToken, async (req, res) => {
   const t = req.apiToken;
   try {
     const { fields, files } = await readCreateInput(req);
+    if (Object.prototype.hasOwnProperty.call(fields, 'points')) {
+      return fail(res, 400, 'points 由服务端计价，不能由 API 请求指定；请求未创建任务、未扣积分', 'UNSUPPORTED_PARAMETER');
+    }
 
     const prompt = String(fields.prompt ?? '').trim();
     if (!prompt) return fail(res, 400, '缺少 prompt', 'MISSING_PROMPT');
 
-    const seconds = integerOf(fields.seconds, { name: 'seconds', allowed: SUPPORTED_SECONDS }) ?? 10;
+    // 档位精简后只保留 15/30；默认必须和网关及生成策略一致，否则省略
+    // seconds 的合法请求会先被本适配层改成已下线的 10 秒，再被网关拒绝。
+    const seconds = integerOf(fields.seconds, { name: 'seconds', allowed: SUPPORTED_SECONDS }) ?? 30;
     const model = String(fields.model ?? '').trim() || null;
     if (model && !modelCatalog().some((m) => m.id === model || m.alias === model)) {
       return fail(res, 400, `不支持的 model：${model}（仅支持 ${modelCatalog().map((m) => m.id).join(' / ')}）`, 'UNSUPPORTED_MODEL');
@@ -548,7 +555,6 @@ router.post('/videos', requireApiToken, async (req, res) => {
       images,
       accountId: integerOf(fields.account_id ?? fields.accountId, { name: 'account_id' }),
       strictAccount: String(fields.strict_account ?? fields.strictAccount ?? '').trim().toLowerCase() === 'true',
-      points: integerOf(fields.points, { name: 'points' }),
       autoStart,
     });
 

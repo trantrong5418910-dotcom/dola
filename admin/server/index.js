@@ -13,6 +13,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { initDb, db, DB_PATH } from './db.js';
+import { createErrorHandler } from './error-middleware.js';
 import { authMiddleware, requireAuth, verifyPassword } from './auth.js';
 import authRoutes from './routes/auth.js';
 import userRoutes from './routes/users.js';
@@ -27,6 +28,8 @@ import dolaGoogleLoginRoutes, { stopGoogleLogins } from './routes/dola-google-lo
 import frontendRoutes from './routes/frontend.js';
 import gatewayRoutes from './routes/gateway.js';
 import materialRoutes from './routes/materials.js';
+import referenceImageRoutes from './routes/reference-images.js';
+import scriptRoutes, { recoverStaleScripts } from './routes/scripts.js';
 import proxyPoolRoutes, { ensureProxyPoolSchema } from './proxy-pool.js';
 // 成片库 / 无水印资源（自包含模块，见 server/media-routes.js 文件头）。
 // 建表用不上 —— 它读写的 dola_videos 是既有表，只加挂载。
@@ -60,6 +63,11 @@ const HOST = String(process.env.HOST || '127.0.0.1').trim();
 const EXPOSED = !['127.0.0.1', 'localhost', '::1'].includes(HOST);
 
 await initDb();
+// A crash/restart can interrupt an LLM request before its route handler writes
+// the failure state.  Do not leave those script rows permanently locked in
+// `generating` after the new process comes up.
+const staleScripts = recoverStaleScripts();
+if (staleScripts) console.log(`[script] 已把 ${staleScripts} 个中断的脚本标记为 failed`);
 // 代理池建表（自包含模块，见 server/proxy-pool.js 文件头）。
 // ⚠️ 必须 try/catch：这个模块是后加的，建表若出错**不能**把整个服务拦在启动阶段
 //    —— 后台进不去，比没有代理池严重得多。
@@ -158,6 +166,8 @@ app.use('/api/dola/google-login', dolaGoogleLoginRoutes);
 app.use('/api/frontend', frontendRoutes);
 app.use('/api/gateway', gatewayRoutes);
 app.use('/api/materials', materialRoutes);
+app.use('/api/reference-images', referenceImageRoutes);
+app.use('/api/scripts', scriptRoutes);
 app.use('/api/proxy-pool', proxyPoolRoutes);
 app.use('/api/media', mediaRoutes);
 app.use('/v1', v1Routes);
@@ -198,20 +208,10 @@ process.on('unhandledRejection', (reason) => {
   console.error('[fatal?] 未处理的 Promise rejection（路由忘了 try/catch？）:', reason);
 });
 
-app.use((err, req, res, next) => {
-  // Body-parser errors carry err.body, which can contain submitted passwords.
-  // Never log raw exceptions or echo parser messages on credential endpoints.
-  const credentialRequest = req.path.toLowerCase().startsWith('/api/dola/google-login');
-  if (credentialRequest) {
-    console.error('[google-login] 请求失败，敏感内容已省略');
-    if (res.headersSent) return next();
-    return res.status(err.status >= 400 && err.status < 500 ? err.status : 500)
-      .json({ ok: false, message: '登录请求格式错误或暂不可用，请检查后重试' });
-  }
-  console.error('[error]', err);
-  if (res.headersSent) return next(err);
-  res.status(500).json({ ok: false, message: err.message || '服务器内部错误' });
-});
+/**
+ * 取出框架/中间件**已经分好类**的 HTTP 状态码（实现与说明见 error-middleware.js）。
+ */
+app.use(createErrorHandler());
 
 // 退出时收尾：把「打开前台」起的真实浏览器关掉，别留孤儿进程
 for (const sig of ['SIGINT', 'SIGTERM']) {

@@ -318,10 +318,11 @@
 const $ = (s) => document.querySelector(s);
 const main = $('#main');
 // 后台 15/30 秒要「原生能力已确认 + 代理已隔离」才放行（expertSecondsReady /
-// fixedSecondsReady）。两者都没就绪时默认 30 秒会让「创建视频任务」按钮一进页面
-// 就是禁用的 —— 所以默认落在 10 秒（唯一不需要额外能力闸门的档位）。
+// fixedSecondsReady）。两者都没就绪时「创建视频任务」按钮一进页面就是禁用的 ——
+// 这是有意为之：原先那个不需要额外能力闸门的兜底档位（10 秒）已于 2026-09-27 下线。
 // 单租户 provider 只支持 30 秒时，下面 activeSeconds() 会自动回退到 options[0]。
-const DEFAULT_SECONDS = 10;
+// 档位精简（2026-09-27）：10 秒与 20 秒已下线，默认档位改为 30 秒（主档位，2 额度）。
+const DEFAULT_SECONDS = 30;
 const FALLBACK_SECONDS = [30];
 const FALLBACK_EXPERT_SECONDS = [];
 const DEFAULT_MODE = 'standard';
@@ -331,7 +332,7 @@ const FORCE_LOGIN_KEY = 'video_workbench_force_login';
 const THEME_KEY = 'video_workbench_theme';
 const ZH = { queued: '排队中', processing: '处理中', succeeded: '已成功', failed: '已失败', unknown: '未知' };
 
-const state = { page: 'tasks', tasks: [], taskSearch: '', taskPage: 1, session: null, health: null, serverNow: null, serverNowAt: null, serverClockTimer: null, mode: DEFAULT_MODE, seconds: DEFAULT_SECONDS, durationPlan: '10', materials: [], materialKey: 'video_workbench_materials_local', materialSearch: '', editingMaterialId: null, editingMaterialImages: [], selectedImages: [], currentVideoUrl: null, toastTimer: null };
+const state = { page: 'tasks', tasks: [], taskSearch: '', taskPage: 1, session: null, health: null, serverNow: null, serverNowAt: null, serverClockTimer: null, mode: DEFAULT_MODE, seconds: DEFAULT_SECONDS, durationPlan: '30', materials: [], materialKey: 'video_workbench_materials_local', materialSearch: '', editingMaterialId: null, editingMaterialImages: [], selectedImages: [], currentVideoUrl: null, toastTimer: null };
 const polling = { timer: null, running: false, stopped: true, epoch: 0, failures: 0, controller: null, balancePending: false };
 const taskRequests = new Map();
 let refreshPromise = null;
@@ -425,7 +426,7 @@ function imagesSupported() { return imagesReadyOnGateway(); }
 function imagesReadyOnGateway() { return state.health?.referenceImagesSupported === true; }
 function supportedSeconds() {
   const raw = Array.isArray(state.health?.supportedSeconds) ? state.health.supportedSeconds : FALLBACK_SECONDS;
-  return [...new Set(raw.map(Number).filter((value) => Number.isInteger(value) && [10, 15, 20, 30].includes(value)))].sort((a, b) => a - b);
+  return [...new Set(raw.map(Number).filter((value) => Number.isInteger(value) && [15, 30].includes(value)))].sort((a, b) => a - b);
 }
 function expertSeconds() {
   const raw = Array.isArray(state.health?.expertSeconds) ? state.health.expertSeconds : FALLBACK_EXPERT_SECONDS;
@@ -440,12 +441,12 @@ function secondsFromPlan(plan = state.durationPlan) {
   const value = String(plan || '');
   if (value === '15x2') return 15;
   const n = Number(value);
-  if ([10, 15, 20, 30].includes(n)) return n;
+  if ([15, 30].includes(n)) return n;
   return Number(state.seconds) || DEFAULT_SECONDS;
 }
 function activeSeconds() {
   const plan = String(state.durationPlan || '');
-  if (plan === '15x2' || plan === '15' || plan === '10' || plan === '20' || plan === '30') return secondsFromPlan(plan);
+  if (['15x2', '15', '30'].includes(plan)) return secondsFromPlan(plan);
   const options = availableSeconds();
   return options.includes(Number(state.seconds)) ? Number(state.seconds) : (options.includes(DEFAULT_SECONDS) ? DEFAULT_SECONDS : options[0]);
 }
@@ -493,14 +494,16 @@ function durationNotice(seconds, ready) {
 /** 创作页主时长：health 支持的原生秒数 + 15秒×2；选项本身不写 disabled */
 function durationOptionMarkup(selectedPlan = state.durationPlan || '30') {
   const plan = String(selectedPlan || '30');
+  // 档位精简（2026-09-27）：10 秒与 20 秒选项已整体删除（后台 supportedSeconds
+  // 也不再下发它们，即使这里写了也会被过滤掉，索性不留入口）。
+  // 15秒×2 保留：它是"两段各 15 秒拼成约 30 秒成片"，走的是 15 秒专家链路，
+  // 与已下线的 10/20 不是一回事。
   const items = [
-    { value: '10', label: '10秒', show: availableSeconds().includes(10) },
     { value: '15', label: '15秒', show: availableSeconds().includes(15) },
     { value: '15x2', label: '15秒×2', show: availableSeconds().includes(15) },
-    { value: '20', label: '20秒', show: availableSeconds().includes(20) },
     { value: '30', label: '30秒（原生单次，非×2）', show: availableSeconds().includes(30) },
   ].filter((item) => item.show);
-  const current = items.some((item) => item.value === plan) ? plan : (items.find((item) => item.value === '10')?.value || items.find((item) => item.value === '30')?.value || items[0]?.value || '10');
+  const current = items.some((item) => item.value === plan) ? plan : (items.find((item) => item.value === '30')?.value || items[0]?.value || '30');
   state.durationPlan = current;
   state.seconds = secondsFromPlan(current);
   return items.map((item) => `<option value="${item.value}" ${item.value === current ? 'selected' : ''}>${item.label}</option>`).join('');
@@ -630,7 +633,7 @@ function renderTasksPage() {
 }
 
 function renderCreatePage() {
-  if (!['10', '15', '15x2', '20', '30'].includes(String(state.durationPlan || ''))) state.durationPlan = availableSeconds().includes(10) ? '10' : (availableSeconds().includes(30) ? '30' : String(availableSeconds()[0] || '10'));
+  if (!['15', '15x2', '30'].includes(String(state.durationPlan || ''))) state.durationPlan = availableSeconds().includes(30) ? '30' : String(availableSeconds()[0] || '30');
   const seconds = activeSeconds();
   state.seconds = seconds;
   const ready = durationReady(seconds);
@@ -638,7 +641,7 @@ function renderCreatePage() {
   const durationMarkup = durationOptionMarkup(state.durationPlan);
   const modeMarkup = `<option value="standard" ${state.mode === 'standard' ? 'selected' : ''}>标准模式</option><option value="expert" ${state.mode === 'expert' ? 'selected' : ''}>专家模式</option>`;
   const imageMarkup = state.selectedImages.map((item, index) => { const src = item.preview || (item.file ? URL.createObjectURL(item.file) : ''); item.preview = src; return `<div class="image-item"><img src="${escapeHtml(src)}" alt=""><span>${escapeHtml(item.name)}</span><button class="image-remove" type="button" data-action="remove-image" data-index="${index}" aria-label="移除图片">×</button></div>`; }).join('');
-  main.innerHTML = `<section class="page"><div class="page-head"><div><div class="kicker">创作空间</div><h1>创建视频</h1><div class="info-box" style="margin-top:8px;padding:8px 10px" data-server-clock>${escapeHtml(serverDayNotice() || '等待服务器时间')}</div></div><div class="page-head-actions"><button class="ghost small" data-action="refresh-health">刷新能力状态</button></div></div><section class="panel form-panel"><form id="createForm"><div class="field"><div class="field-label"><label for="prompt">视频描述</label><small><span id="promptCount">0</span>/${max}</small></div><textarea id="prompt" maxlength="${max}" placeholder="描述场景、人物、动作与镜头语言"></textarea></div><div class="form-grid"><div class="field"><div class="field-label"><label for="generationMode">生成模式</label><small>选 15 秒时自动使用专家模式（Seedance 2.0）</small></div><select id="generationMode">${modeMarkup}</select></div><div class="field"><div class="field-label"><label for="seconds">视频时长</label><small>10 / 15 / 15×2 / 20 / 30 秒</small></div><select id="seconds">${durationMarkup}</select></div><div class="field"><div class="field-label"><label for="ratio">画面比例</label></div><select id="ratio"><option>16:9</option><option>9:16</option><option>1:1</option><option>3:4</option><option>4:3</option><option>21:9</option></select></div></div><div class="field"><div class="field-label"><label>参考图片（可选）</label><small>最多 9 张，JPEG/PNG</small></div><div class="upload-box"><div class="upload-copy"><strong>${state.selectedImages.length ? `已选择 ${state.selectedImages.length} 张图片` : '添加参考图片'}</strong><span>图片只用于本次视频任务，也可以从素材库选用。</span></div><label class="ghost small">选择图片<input id="imageInput" type="file" accept="image/jpeg,image/png" multiple></label></div><div id="imageList" class="image-list">${imageMarkup}</div></div><div class="form-actions"><button type="button" class="ghost" data-action="pick-material">从素材库选用</button><button type="button" class="ghost" data-action="save-material">保存为素材</button><button type="submit" class="primary">创建视频任务</button></div><div class="info-box ${ready ? '' : 'warning'}"></div><div id="createError" class="error-box hidden"></div></form></section></section>`;
+  main.innerHTML = `<section class="page"><div class="page-head"><div><div class="kicker">创作空间</div><h1>创建视频</h1><div class="info-box" style="margin-top:8px;padding:8px 10px" data-server-clock>${escapeHtml(serverDayNotice() || '等待服务器时间')}</div></div><div class="page-head-actions"><button class="ghost small" data-action="refresh-health">刷新能力状态</button></div></div><section class="panel form-panel"><form id="createForm"><div class="field"><div class="field-label"><label for="prompt">视频描述</label><small><span id="promptCount">0</span>/${max}</small></div><textarea id="prompt" maxlength="${max}" placeholder="描述场景、人物、动作与镜头语言"></textarea></div><div class="form-grid"><div class="field"><div class="field-label"><label for="generationMode">生成模式</label><small>选 15 秒时自动使用专家模式（Seedance 2.0）</small></div><select id="generationMode">${modeMarkup}</select></div><div class="field"><div class="field-label"><label for="seconds">视频时长</label><small>15 / 15×2 / 30 秒（10 秒与 20 秒已下线）</small></div><select id="seconds">${durationMarkup}</select></div><div class="field"><div class="field-label"><label for="ratio">画面比例</label></div><select id="ratio"><option>16:9</option><option>9:16</option><option>1:1</option><option>3:4</option><option>4:3</option><option>21:9</option></select></div></div><div class="field"><div class="field-label"><label>参考图片（可选）</label><small>最多 9 张，JPEG/PNG</small></div><div class="upload-box"><div class="upload-copy"><strong>${state.selectedImages.length ? `已选择 ${state.selectedImages.length} 张图片` : '添加参考图片'}</strong><span>图片只用于本次视频任务，也可以从素材库选用。</span></div><label class="ghost small">选择图片<input id="imageInput" type="file" accept="image/jpeg,image/png" multiple></label></div><div id="imageList" class="image-list">${imageMarkup}</div></div><div class="form-actions"><button type="button" class="ghost" data-action="pick-material">从素材库选用</button><button type="button" class="ghost" data-action="save-material">保存为素材</button><button type="submit" class="primary">创建视频任务</button></div><div class="info-box ${ready ? '' : 'warning'}"></div><div id="createError" class="error-box hidden"></div></form></section></section>`;
   $('#prompt').addEventListener('input', () => { $('#promptCount').textContent = Array.from($('#prompt').value).length; });
   $('#generationMode').addEventListener('change', (event) => { state.mode = event.target.value; updateCreateReadiness(); });
   $('#seconds').addEventListener('change', (event) => { state.durationPlan = String(event.target.value || '30'); state.seconds = secondsFromPlan(state.durationPlan); if (state.durationPlan === '15' || state.durationPlan === '15x2') { state.mode = 'expert'; const modeSelect = $('#generationMode'); if (modeSelect) modeSelect.value = 'expert'; } updateCreateReadiness(); });
@@ -831,7 +834,7 @@ async function previewTask(id) { showToast('正在加载视频…', 1200); const
 async function downloadTask(id) { showToast('正在准备下载…', 1200); const blob = await mediaBlob(id, 'download'); const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = `${id}.mp4`; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); }
 async function redeemCard(event) { event.preventDefault(); const input = $('#cardInput'); const error = $('#redeemError'); error.classList.add('hidden'); const card = input.value.trim(); if (!card) { error.textContent = '请输入卡密'; error.classList.remove('hidden'); return; } const button = event.submitter; button.disabled = true; button.textContent = '兑换中…'; try { const result = await api('/api/redeem', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ card }) }); updateBalance(result.balance ?? result.tokenPoints); input.value = ''; showToast(`兑换成功，增加 ${result.points ?? 0} 积分`); } catch (err) { error.textContent = err.message; error.classList.remove('hidden'); } finally { button.disabled = false; button.textContent = '确认兑换'; } }
 
-async function handleMainClick(event) { const button = event.target.closest('[data-action]'); if (!button) return; const action = button.dataset.action; try { if (action === 'go-create') setActivePage('create'); if (action === 'batch-create') openBatchDialog(); if (action === 'refresh-tasks') await refreshTasks(true); if (action === 'task-prev') { state.taskPage = Math.max(1, state.taskPage - 1); renderTasksPage(); } if (action === 'task-next') { state.taskPage = Math.min(Math.max(1, Math.ceil(filteredTasks().length / TASK_PAGE_SIZE)), state.taskPage + 1); renderTasksPage(); } if (action === 'refresh-health') { button.disabled = true; button.textContent = '检查中…'; const health = await refreshHealth({ render: true }); showToast(health?.fixedSecondsReady === true && health?.expertSecondsReady === true ? '已确认原生 15 / 30 秒账号；10 / 20 秒仍按页面原生选项检查' : health?.expertSecondsReady === true ? '已确认原生 15 秒账号；30 秒原生能力仍未确认' : '15 / 30 秒原生能力仍未确认；请先在后台账号池完成只读探测'); } if (action === 'query') await showTaskDetail(button.dataset.id); if (action === 'preview') await previewTask(button.dataset.id); if (action === 'download') await downloadTask(button.dataset.id); if (action === 'delete') { if (!confirm('确定删除这个任务吗？')) return; const deleteId = button.dataset.id; button.disabled = true; try { await api(`/api/tasks/${encodeURIComponent(deleteId)}`, { method: 'DELETE' }); state.tasks = state.tasks.filter((task) => String(task.id) !== String(deleteId)); if (state.page === 'tasks') renderTasksPage(); showToast('任务已删除'); await refreshTasks().catch(() => {}); } catch (error) { button.disabled = false; throw error; } } if (action === 'remove-image') { state.selectedImages.splice(Number(button.dataset.index), 1); renderCreatePage(); } if (action === 'pick-material') openMaterialPicker(); if (action === 'save-material') await saveCurrentAsMaterial(); if (action === 'new-material') openMaterialEditor(); if (action === 'material-use' || action === 'picker-use') useMaterial(button.dataset.id); if (action === 'material-image') openMaterialImage(button.dataset.id, button.dataset.index); if (action === 'material-edit') openMaterialEditor(button.dataset.id); if (action === 'material-delete') { if (!confirm('确定删除这个素材吗？')) return; state.materials = state.materials.filter((item) => item.id !== button.dataset.id); saveMaterials(); renderMaterialsPage(); showToast('素材已删除'); } } catch (error) { showToast(error.message); } }
+async function handleMainClick(event) { const button = event.target.closest('[data-action]'); if (!button) return; const action = button.dataset.action; try { if (action === 'go-create') setActivePage('create'); if (action === 'batch-create') openBatchDialog(); if (action === 'refresh-tasks') await refreshTasks(true); if (action === 'task-prev') { state.taskPage = Math.max(1, state.taskPage - 1); renderTasksPage(); } if (action === 'task-next') { state.taskPage = Math.min(Math.max(1, Math.ceil(filteredTasks().length / TASK_PAGE_SIZE)), state.taskPage + 1); renderTasksPage(); } if (action === 'refresh-health') { button.disabled = true; button.textContent = '检查中…'; const health = await refreshHealth({ render: true }); showToast(health?.fixedSecondsReady === true && health?.expertSecondsReady === true ? '已确认原生 15 / 30 秒账号（10 / 20 秒档位已下线）' : health?.expertSecondsReady === true ? '已确认原生 15 秒账号；30 秒原生能力仍未确认' : '15 / 30 秒原生能力仍未确认；请先在后台账号池完成只读探测'); } if (action === 'query') await showTaskDetail(button.dataset.id); if (action === 'preview') await previewTask(button.dataset.id); if (action === 'download') await downloadTask(button.dataset.id); if (action === 'delete') { if (!confirm('确定删除这个任务吗？')) return; const deleteId = button.dataset.id; button.disabled = true; try { await api(`/api/tasks/${encodeURIComponent(deleteId)}`, { method: 'DELETE' }); state.tasks = state.tasks.filter((task) => String(task.id) !== String(deleteId)); if (state.page === 'tasks') renderTasksPage(); showToast('任务已删除'); await refreshTasks().catch(() => {}); } catch (error) { button.disabled = false; throw error; } } if (action === 'remove-image') { state.selectedImages.splice(Number(button.dataset.index), 1); renderCreatePage(); } if (action === 'pick-material') openMaterialPicker(); if (action === 'save-material') await saveCurrentAsMaterial(); if (action === 'new-material') openMaterialEditor(); if (action === 'material-use' || action === 'picker-use') useMaterial(button.dataset.id); if (action === 'material-image') openMaterialImage(button.dataset.id, button.dataset.index); if (action === 'material-edit') openMaterialEditor(button.dataset.id); if (action === 'material-delete') { if (!confirm('确定删除这个素材吗？')) return; state.materials = state.materials.filter((item) => item.id !== button.dataset.id); saveMaterials(); renderMaterialsPage(); showToast('素材已删除'); } } catch (error) { showToast(error.message); } }
 function handleMainChange(event) { if (event.target.id === 'imageInput') onImagesSelected(event.target.files); if (event.target.id === 'generationMode') { state.mode = event.target.value; updateCreateReadiness(); } if (event.target.id === 'seconds') { state.durationPlan = String(event.target.value || '30'); state.seconds = secondsFromPlan(state.durationPlan); if (state.durationPlan === '15' || state.durationPlan === '15x2') { state.mode = 'expert'; const modeSelect = $('#generationMode'); if (modeSelect) modeSelect.value = 'expert'; } updateCreateReadiness(); } }
 function handleMainInput(event) { if (event.target.id === 'taskSearch') { const input = event.target; const pos = input.selectionStart; state.taskSearch = input.value; state.taskPage = 1; renderTasksPage(); const next = $('#taskSearch'); if (next) { next.focus(); try { next.setSelectionRange(pos, pos); } catch {} } } if (event.target.id === 'materialSearch') { state.materialSearch = event.target.value; renderMaterialsPage(); $('#materialSearch')?.focus(); } }
 async function doLogin() { const input = $('#credInput'); const error = $('#loginErr'); const credential = input.value.trim(); error.classList.add('hidden'); if (!credential) { error.textContent = '请输入访问令牌'; error.classList.remove('hidden'); return; } const button = $('#loginBtn'); button.disabled = true; button.textContent = '验证中…'; try { const response = await fetch('/api/session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ credential }) }); const body = await response.json().catch(() => ({})); if (!response.ok) throw new Error(body.message || `登录失败（HTTP ${response.status}）`); setToken(credential); localStorage.removeItem(FORCE_LOGIN_KEY); location.reload(); } catch (err) { error.textContent = err.message; error.classList.remove('hidden'); } finally { button.disabled = false; button.textContent = '登录'; } }

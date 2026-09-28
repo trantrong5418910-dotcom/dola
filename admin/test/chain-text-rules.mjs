@@ -6,12 +6,18 @@
  *   ① **规则顺序**：prompt_echo 必须垫底，否则会把每一轮都吃掉，其余规则全部失效
  *   ② **假告警防护**：没法判定（没提示词/提示词太短）时不能计入漂移，
  *      否则上游没变、我们自己天天报警
+ *
+ * 另外：几条**终态规则**（quota_exhausted / voided / content_refused / duration_inquiry）
+ * 都对应着真实事故，每条都配了「认得出 + 不误伤」成对的用例。
+ * 误伤方向也要钉死 —— 判错的代价是任务被判死并**自动退款**，
+ * 假阳性比漏判更贵（钱已经退了）。
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   classifyChainText, createChainTextObserver, recordChainText,
   CHAIN_TEXT_RULES, DEFAULT_DRIFT_THRESHOLD,
+  readChainRefused, readChainClarifying, DURATION_INQUIRY_RES_CODE,
 } from '../server/dola/chain-text-rules.js';
 
 const PROMPT = '一只橘猫在窗台上打哈欠，阳光洒进来';
@@ -69,6 +75,219 @@ test('voided：上游明确报生成失败', () => {
     const r = classifyChainText(text, { prompt: PROMPT });
     assert.equal(r.rule, 'voided', `「${text}」应判 voided，实际 ${r.rule}`);
   }
+});
+
+test('★ voided：肖像保护软拒绝（生产任务 #188 原话，逐字）', () => {
+  // 真实样本：账号 #436 / 30 秒 + 参考图 / 会话 38417956948437265。
+  // 上游没建视频任务、只回了这句话（chain 里 ai_create_show_mode=text、content_type=9999），
+  // 旧规则全部落空 ⇒ 白跑满时限 ⇒ uncertain（不终局、不退款、锁号）。
+  const text = '出于肖像保护考虑，未认证人脸暂不支持用 Dreamina Seedance 2.5 生成视频。'
+    + '你可以尝试换其它参考图或文生视频。';
+  const r = classifyChainText(text, { prompt: PROMPT });
+  assert.equal(r.rule, 'voided', `肖像保护软拒绝应判 voided，实际 ${r.rule}`);
+  assert.match(r.evidence, /肖像保护/);
+});
+
+test('★ voided：肖像保护必须在**短提示词**下也认得出（#188 完全静默的真正原因）', () => {
+  // #188 的提示词是「古代修仙」——4 个字，低于 MIN_ECHO_PROMPT_LENGTH(8)。
+  // 旧行为：兜底判 rule='none' 且 classifiable=false ⇒ 连协议漂移告警都不响。
+  // 新规则必须排在兜底**之前**，与提示词长短无关。
+  const text = '出于肖像保护考虑，未认证人脸暂不支持用 Dreamina Seedance 2.5 生成视频。';
+  const short = classifyChainText(text, { prompt: '古代修仙' });
+  assert.equal(short.rule, 'voided', `短提示词下也应判 voided，实际 ${short.rule}`);
+  assert.equal(short.classifiable, true);
+  // 对照：只有短提示词、没有任何上游拒绝信号时，仍应保持"无法判定"而不是假漂移
+  const onlyEcho = classifyChainText('生成视频：古代修仙，30s', { prompt: '古代修仙' });
+  assert.equal(onlyEcho.rule, 'none');
+  assert.equal(onlyEcho.classifiable, false, '短提示词不应被计入协议漂移');
+});
+
+test('★ voided：肖像保护口径必须收窄，不能误伤描述性文案（假阳性会白退款）', () => {
+  for (const text of [
+    '当前模型不支持用 4K 分辨率生成视频，可以选择 1080P。',
+    '参考图功能已上线，你可以用参考图生成视频。',
+  ]) {
+    const r = classifyChainText(text, { prompt: PROMPT });
+    assert.notEqual(r.rule, 'voided', `「${text}」不应判 voided`);
+  }
+});
+
+// ─────────────── ①b 内容生成限制（content_refused）───────────────
+/**
+ * 事故来源：生产任务 #210（会话 38417957424987153、账号 #453、30 秒、pure-http）。
+ * 上游对本次生成只回了一句拒绝，旧规则全部落空 ⇒ 轮询一路空转到 40 分钟时限
+ * ⇒ 落 uncertain（**不退款 + 永久锁号**）。
+ *
+ * 用户原话：**「碰到这种,应该直接返回失败,不要让 #210 生成中 976s｜已轮询 17 次 一直轮训」**
+ *
+ * 这组用例就是这次事故的回归网 —— 判错的方向有两个，两个都贵：
+ *   · 漏判 → 白等 40 分钟 + 锁号 + 不退钱（本次事故）
+ *   · 误判 → 视频还在正常生成，任务却被判死并退款（假阳性比漏判更贵，钱已经退了）
+ */
+const CONTENT_REFUSED_SAMPLE = '我暂时无法生成你要求的内容。请尝试输入其他要求，我会尽力为你提供帮助。';
+
+/** 把若干个 `ext` 包成 pullChain 的真实 JSON 形状，用于测两个 readChain* 结构化读取器。 */
+const wrapExt = (...exts) => ({
+  downlink_body: { pull_singe_chain_downlink_body: { messages: exts.map((ext) => ({ ext })) } },
+});
+
+test('★ content_refused：认得出 #210 的真实拒绝原话（逐字）', () => {
+  const r = classifyChainText(CONTENT_REFUSED_SAMPLE, { prompt: PROMPT });
+  assert.equal(r.rule, 'content_refused', `实际 ${r.rule}`);
+  // upstreamError 要带**上游原话里命中的那一段**，且与 evidence 同步 ——
+  // 这条一开始是红过的：文案兜底路径漏了 upstreamError，结构化路径却带，
+  // 同类规则（quota_exhausted / duration_inquiry）的文案路径也都带。属于真实的不对称。
+  assert.equal(typeof r.upstreamError, 'string', '终态说明要带出上游口径，不能只说"到时限了"');
+  assert.match(r.upstreamError, /无法生成你要求的内容/);
+  assert.match(r.evidence, /无法生成你要求的内容/, 'evidence 要留下命中的原话，方便对着日志复盘');
+});
+
+test('★ content_refused：上游换措辞也要认得出（宽口径，同 quota_exhausted / voided 的做法）', () => {
+  // 上游一天之内在同类事故上换过多次措辞（见 QUOTA_EXHAUSTED_PATTERN 的注释），
+  // 只钉一种说法 = 下次改文案又静默穿透回空转。
+  for (const text of [
+    '我目前不能生成该内容。请尝试输入其他要求。',
+    '当前无法为你生成这段内容，请换个其他要求试试。',
+    '抱歉，我暂时无法生成此视频。请尝试输入其他要求，我会尽力为您提供帮助。',
+  ]) {
+    assert.equal(classifyChainText(text, { prompt: PROMPT }).rule, 'content_refused', `「${text}」应判 content_refused`);
+  }
+});
+
+test('★⚠️ content_refused 必须**两半都命中**：只有「无法生成」那半句一律不判', () => {
+  // 「无法生成」单独出现时基本是**描述性文案**，不是对本次请求的拒绝。
+  // 判错的代价：视频还在正常生成，任务却被判终态失败并自动退款。
+  for (const text of [
+    '该模型无法生成长视频，建议拆成两段。',
+    '当前配置无法生成 4K 分辨率视频。',
+    '如果无法生成视频，请检查网络后重试。',
+    '我暂时无法生成你要求的内容。',                     // ← 缺"让你重说一个"那半句：不许判
+  ]) {
+    assert.notEqual(classifyChainText(text, { prompt: PROMPT }).rule, 'content_refused', `「${text}」不该判 content_refused`);
+  }
+});
+
+test('★ content_refused：窗口有界 —— 拒绝句与「换个要求」隔太远不算同一次拒绝', () => {
+  // 窗口是 80 字。实测样本里两半只隔「。请」2 个字；窗开太大只会扩大误伤面。
+  const nope = `我暂时无法生成你要求的内容。${'。'.repeat(100)}请尝试输入其他要求。`;
+  assert.notEqual(classifyChainText(nope, { prompt: PROMPT }).rule, 'content_refused', '超过 80 字窗口不该命中');
+});
+
+test('★ content_refused：结构化字段优先于文案（refused 非空即判，完全不看措辞）', () => {
+  const r = classifyChainText('随便一句完全没有拒绝含义的话', {
+    prompt: PROMPT, refused: '上游消息标记 volcano_refused="1"',
+  });
+  assert.equal(r.rule, 'content_refused');
+  assert.match(r.evidence, /volcano_refused/);
+  assert.equal(r.classifiable, true);
+});
+
+test('★ content_refused > duration_inquiry：两个结构化确证同时到达时，拒绝优先', () => {
+  // 上游已经明确拒了这次生成，就不该再被当成"在等你回答时长方案"。
+  // 顺序反了的表现是：一条本该退款+放行的任务，变成"已在等你回复"的终态说明。
+  const r = classifyChainText(CONTENT_REFUSED_SAMPLE, {
+    prompt: PROMPT,
+    clarifying: '上游回执码 ai_creation_res_code=710082041',
+    refused: '上游收尾原因 finish_reason_chat=safety_terminated:completion',
+  });
+  assert.equal(r.rule, 'content_refused');
+});
+
+test('★ readChainRefused：两个结构化判据都认得出（实测自 #210）', () => {
+  assert.match(readChainRefused(wrapExt({ volcano_refused: '1', finish_reason_chat: 'safety_terminated:completion' })),
+    /volcano_refused/, '上游自己标的"被模型侧拒了"最干净，应优先报它');
+  assert.match(readChainRefused(wrapExt({ finish_reason_chat: 'safety_terminated:completion' })),
+    /finish_reason_chat/, '同一件事的收尾原因口径，防上游不改 flag');
+  // 形状健壮性：这个函数会被挂在每一轮轮询里，不能因为上游改结构就抛异常
+  assert.equal(readChainRefused(null), '');
+  assert.equal(readChainRefused({}), '');
+  assert.equal(readChainRefused(wrapExt()), '');
+  assert.equal(readChainRefused({ downlink_body: { pull_singe_chain_downlink_body: { messages: 'x' } } }), '');
+});
+
+test('★⚠️ readChainRefused 的头号负向：正常出片样本绝不能被判成拒绝（实测 #208/#205/#204）', () => {
+  // 正常出片：finish_reason_chat="succeed:completion"，且**不存在** volcano_refused。
+  assert.equal(readChainRefused(wrapExt({ finish_reason_chat: 'succeed:completion' })), '');
+  // ⚠️⚠️ 这条最要紧：`use_content_block="1"` 在**成功样本的每条消息上也是 1**。
+  //    名字像"内容拦截"，差点被当成判据 —— 真用了就会把全部正常任务判死并退款。
+  assert.equal(readChainRefused(wrapExt({ use_content_block: '1', finish_reason_chat: 'succeed:completion' })), '',
+    'use_content_block 不是判据！它在成功样本上同样是 1');
+  // 只收**明确的拒绝前缀**，绝不用"不等于 succeed 就算拒绝"的写法
+  for (const finish of ['succeed:completion', 'length:completion', 'stop', '']) {
+    assert.equal(readChainRefused(wrapExt({ finish_reason_chat: finish })), '', `finish_reason_chat=${finish} 不该判拒绝`);
+  }
+});
+
+// ─────────────── ①c 时长问询（duration_inquiry）───────────────
+/**
+ * 事故来源：生产任务 #202（会话 38417920542418193、账号 #448、30 秒、pure-http）——
+ * 上游回「视频生成目前支持 4 到 15 秒…你回复 A 或 B，我就直接生成」，
+ * 它在**等你回答**、永远不自己出片；而我们的轮询循环里没有"回答提问"这一步
+ * ⇒ 白等 40 分钟 ⇒ uncertain（不退款 + 永久锁号）。
+ *
+ * 这组用例是**补的**：当时修完没带测试（`admin/test` 里一直缺这一组）。
+ */
+const DURATION_INQUIRY_SAMPLE = '视频生成目前支持 4 到 15 秒。我可以按最接近的支持时长生成：\n'
+  + '- 方案 A：生成 15 秒版本，压缩保留核心动作与台词\n'
+  + '- 方案 B：拆成两段生成：第一段 15 秒，第二段 15 秒，再由你后期拼接成 30 秒\n'
+  + '你回复 A 或 B，我就直接生成。';
+
+test('★ duration_inquiry：认得出 #202 的真实问询原话（逐字）', () => {
+  const r = classifyChainText(DURATION_INQUIRY_SAMPLE, { prompt: PROMPT });
+  assert.equal(r.rule, 'duration_inquiry', `实际 ${r.rule}`);
+  assert.match(r.evidence, /4 到 15 秒/, 'evidence 要留下命中的原话');
+  assert.equal(typeof r.upstreamError, 'string', '终态说明要显示"上游在等你选方案"');
+});
+
+test('★⚠️ duration_inquiry 的头号负向：#199 那种**陈述句**必须放行（假阳性会白退款）', () => {
+  // 「**我将**按最接近的支持时长生成：15 秒」是话术，上游随后照样按 30 秒出片
+  // （#199 实测成片 30.080 秒）。判据是「有没有在问你要回答」，
+  // **不是**「有没有提到 4 到 15 秒」—— 这一条翻车的代价是正常任务被判死并退款。
+  const statement = '视频生成目前支持 4 到 15 秒。我将按最接近的支持时长生成：15 秒。'
+    + '本次使用 Dreamina Seedance 2.5 生成，将消耗 2 个视频生成额度。';
+  const r = classifyChainText(statement, { prompt: PROMPT });
+  assert.notEqual(r.rule, 'duration_inquiry', `陈述句不该判问询，实际 ${r.rule}`);
+});
+
+test('★ duration_inquiry 也必须**两半都命中**：只有区间、或只有提问词，都不算', () => {
+  for (const text of [
+    '视频生成目前支持 4 到 15 秒。',
+    '本模型支持 4 到 15 秒，超出部分会被裁剪。',
+    '你想生成多长？可以直接回复我。',
+  ]) {
+    assert.notEqual(classifyChainText(text, { prompt: PROMPT }).rule, 'duration_inquiry', `「${text}」不该判问询`);
+  }
+});
+
+test('★ duration_inquiry：英文双语版本也认得出（推断口径，见 DURATION_ASK_HINT 注释）', () => {
+  // 上游会**双语回答**（英文样本见 dola-generation-channel-triage 里的 #192）。
+  // 中文「**我可以**…你回复 A 或 B」= 提问（实测不出片）；中文「**我将**…15 秒」= 陈述（实测出片）。
+  // 按中英对照推出 `I can` 对应提问、`I will` 对应陈述 —— 所以只收 `I can`，故意不收 `I will`。
+  const asking = 'Video generation currently supports durations from 4 to 15 seconds. '
+    + 'I can generate it at the nearest supported duration of 15 seconds. Reply A or B and I will start.';
+  assert.equal(classifyChainText(asking, { prompt: PROMPT }).rule, 'duration_inquiry');
+
+  const telling = 'Video generation currently supports durations from 4 to 15 seconds. '
+    + 'I will generate it at the nearest supported duration of 15 seconds.';
+  assert.notEqual(classifyChainText(telling, { prompt: PROMPT }).rule, 'duration_inquiry',
+    '`I will` 是陈述，必须放行；只收 `I can`');
+});
+
+test('★ duration_inquiry：结构化确证优先（is_creation_clarifying / 回执码 710082041）', () => {
+  const r = classifyChainText('随便一句完全没有问询含义的话', {
+    prompt: PROMPT, clarifying: '上游消息标记 is_creation_clarifying="1"',
+  });
+  assert.equal(r.rule, 'duration_inquiry');
+  assert.equal(r.classifiable, true);
+});
+
+test('★ readChainClarifying：两个判据都认得出，且不误伤出片样本', () => {
+  assert.match(readChainClarifying(wrapExt({ is_creation_clarifying: '1' })), /is_creation_clarifying/);
+  assert.match(readChainClarifying(wrapExt({ ai_creation_res_code: DURATION_INQUIRY_RES_CODE })), /710082041/);
+  // 出片样本：ai_creation_res_code="0" + fc 步骤有耗时（#199 实测 1007ms）
+  assert.equal(readChainClarifying(wrapExt({ ai_creation_res_code: '0' })), '');
+  assert.equal(readChainClarifying(null), '');
+  assert.equal(readChainClarifying(wrapExt()), '');
 });
 
 test('quota：认得出额度回执（复用项目既有的口径）', () => {
@@ -167,6 +386,30 @@ test('★ 顺序：提示词 + 额度回执同时出现 → 判 quota', () => {
 test('★ 顺序：voided 与 quota 同时出现 → voided 优先（失败比额度重要）', () => {
   const chain = '视频生成失败（今日剩余 4 个视频生成额度）';
   assert.equal(classifyChainText(chain, { prompt: PROMPT }).rule, 'voided');
+});
+
+test('★ 顺序：内容拒绝 + 我们自己的提示词同时出现 → 判 content_refused，不能被 prompt_echo 吃掉', () => {
+  // 这是**生产上的真实形态**：链里必然有我们刚提交的那条用户消息，
+  // 所以任何排在 prompt_echo 之后的规则都永远轮不到（#210 的拒绝文案就是这样被吃掉的）。
+  const chain = `${CONTENT_REFUSED_SAMPLE}\n生成视频：${PROMPT}`;
+  assert.equal(classifyChainText(chain, { prompt: PROMPT }).rule, 'content_refused');
+});
+
+test('★ 顺序：时长问询 + 额度回执同时出现 → 判 duration_inquiry，不能被 quota 吃掉', () => {
+  // 上游哪天把额度句一并带上（"本次将消耗 2 个…额度"），若 quota 排在前面，
+  // 就会把"在等你回答"误当成"已经在生成了"，于是又白等满时限。
+  const chain = `${DURATION_INQUIRY_SAMPLE}\n今日剩余 4 个视频生成额度`;
+  assert.equal(classifyChainText(chain, { prompt: PROMPT }).rule, 'duration_inquiry');
+});
+
+test('★ 顺序：结构化确证（clarifying / refused）压过所有文案正则', () => {
+  // 文案可能同时命中多条（甚至命中 quota 这种"非终态"规则），
+  // 结构化字段才是唯一truth —— 它不受上游换措辞影响。
+  const quotaish = '今日剩余 4 个视频生成额度';
+  assert.equal(classifyChainText(quotaish, { prompt: PROMPT, clarifying: 'ai_creation_res_code=710082041' }).rule,
+    'duration_inquiry');
+  assert.equal(classifyChainText(quotaish, { prompt: PROMPT, refused: 'volcano_refused="1"' }).rule,
+    'content_refused');
 });
 
 // ─────────────────────── ③ 回显判定的健壮性 ───────────────────────
@@ -354,6 +597,19 @@ test('★ 新规则必须进枚举，否则计数被静默丢弃（本项目真�
   const before = obs.snapshot().rules.upstream_error;
   obs.record({ rule: 'upstream_error' });
   assert.equal(obs.snapshot().rules.upstream_error, before + 1, 'upstream_error 必须在 CHAIN_TEXT_RULES 里');
+});
+
+test('★ 两个终态新规则（content_refused / duration_inquiry）也必须在枚举里', () => {
+  // 这两条是后补的终态规则，#210 / #202 两次事故的直接产物。
+  // 它们各自都有一个**只有这里能发现**的失效模式：不在枚举里 → 计数静默丢弃，
+  // 而监控上看到的是"一切正常"，下一次事故依然要跑满 40 分钟才发现。
+  const { obs } = mk();
+  for (const rule of ['content_refused', 'duration_inquiry']) {
+    assert.ok(CHAIN_TEXT_RULES.includes(rule), `${rule} 必须出现在 CHAIN_TEXT_RULES 里`);
+    const before = obs.snapshot().rules[rule];
+    obs.record({ rule });
+    assert.equal(obs.snapshot().rules[rule], before + 1, `${rule} 的计数被丢弃了（八成漏加了枚举）`);
+  }
 });
 
 test('reset 清干净', () => {

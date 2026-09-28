@@ -46,9 +46,8 @@ export const COST_DEFAULT_KEY = 'default';
  *
  * ⚠️ 这条规则**必须与 `generation-policy.js` 的 `normalizeVideoDuration().targetModel` 一致**，
  *    否则会出现"按 v2.5 收费、实际跑 v2.0"这种对不上账的情况。
- *    那边对 10 秒返回 `null`（表示沿用页面默认），而 10 秒的页面默认是 v2.5
- *    （见 `generation-model.js` 的 `selectSeedance(page, 'seedance_v2.5')`），
- *    所以这里把 10 秒也归到 v2.5。测试里会拿真函数交叉核对 15/20/30 三档。
+ *    档位精简（2026-09-27）后只剩两档：15 → v2.0（专家模式），30 → v2.5。
+ *    测试里会拿真函数交叉核对这两档。
  */
 export function modelForTask({ seconds } = {}) {
   const s = Number(seconds);

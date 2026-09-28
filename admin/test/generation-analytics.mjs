@@ -23,7 +23,8 @@ function fixture(t) {
 }
 
 const nativeProbe = seconds => ({ ok: true, state: 'available', seconds, uiSeconds: seconds,
-  model: seconds === 15 ? 'seedance_v2.0' : 'seedance_v2.5', native: true, rewriteCarrier: false });
+  model: seconds === 15 ? 'seedance_v2.0' : 'seedance_v2.5', native: true, rewriteCarrier: false,
+  ...(seconds === 30 ? { source: 'native_single' } : {}) });
 
 test('hourly cohorts reconcile, include current hour, fill zeros and use created not finished time', t => {
   const h = fixture(t);
@@ -178,4 +179,65 @@ test('text-only success does not mask earlier successful reference-image evidenc
   h.add(3, 'ready', '2026-09-20T19:00:00.000Z');
   assert.equal(seedHistoricalGenerationGuards(h.db), 0);
   assert.equal(hasGenerationGuard(h.db, 1, 15, true), false);
+});
+
+/**
+ * ★ 下面这组钉住的是「永久锁」这一整类缺陷里**读取侧**的那一半。
+ *
+ * `recordGenerationGuard` 里写着
+ *     // A newer verified probe wins over an old failed callback / historical import.
+ * 但那条保护原先**只在写入时**生效。真实序列（账号 #424，2026-09-26）是：
+ *     09:12:21  30 秒任务失败（模型控件未加载完）→ 建 `duration:30` 防护
+ *     10:32:29  只读探针确认「10 秒载体可用」→ native_30s_state='available'
+ *     之后每次选号：防护仍在 → 30 秒永远 0 个可选账号
+ * 即使 native_30s_note 里明写着"已确认…可用"，hasGenerationGuard 也看不见。
+ */
+test('★ 更晚的可用探针在读取时证伪旧的时长防护（把永久锁解开）', t => {
+  const h = fixture(t);
+  h.add(1, 'failed', '2026-09-26T09:12:21.220Z',
+    'Seedance 2.5 模型能力探测未完成：模型控件未加载完成或存在多个可见控件', 30);
+  assert.equal(recordGenerationGuard(h.db, h.row(1), h.account()), true);
+  assert.equal(hasGenerationGuard(h.db, 1, 30), true, '刚建好时必须拦着');
+
+  // 早于失败 → 不是新证据
+  h.db.exec("UPDATE dola_accounts SET native_30s_state='available', native_30s_at='2026-09-26T09:00:00.000Z'");
+  assert.equal(hasGenerationGuard(h.db, 1, 30), true, '早于失败的探针不能证伪');
+  // 同刻 → 也不算（避免同一批写入把自己解开）
+  h.db.exec("UPDATE dola_accounts SET native_30s_at='2026-09-26T09:12:21.220Z'");
+  assert.equal(hasGenerationGuard(h.db, 1, 30), true, '同刻不能证伪');
+  // unknown 即使在更晚也不是证据 —— unknown 是"没确认"
+  h.db.exec("UPDATE dola_accounts SET native_30s_state='unknown', native_30s_at='2026-09-26T10:32:29.551Z'");
+  assert.equal(hasGenerationGuard(h.db, 1, 30), true, 'unknown 不是证据');
+  // 更晚的 available → 证伪
+  h.db.exec("UPDATE dola_accounts SET native_30s_state='available', native_30s_at='2026-09-26T10:32:29.551Z'");
+  assert.equal(hasGenerationGuard(h.db, 1, 30), false, '更晚的可用探针必须压过旧的失败');
+
+  // 后台展示必须与调度**同一判据**：否则页面显示"已拦截"、调度却认为可派号。
+  assert.deepEqual(listGenerationGuards(h.db), []);
+  // 防护行本身仍留作证据（审计链不能断），只是不再生效。
+  assert.equal(h.db.prepare('SELECT COUNT(*) n FROM dola_generation_guards').get().n, 1);
+});
+
+test('★ 证伪只作用于同一条时长防护，不波及其它时长', t => {
+  const h = fixture(t);
+  h.add(1, 'failed', '2026-09-26T09:00:00.000Z', '未确认原生 15 秒', 15);
+  h.add(2, 'failed', '2026-09-26T09:00:00.000Z', '未确认原生 30 秒', 30);
+  assert.equal(recordGenerationGuard(h.db, h.row(1), h.account()), true);
+  assert.equal(recordGenerationGuard(h.db, h.row(2), h.account()), true);
+  h.db.exec("UPDATE dola_accounts SET native_30s_state='available', native_30s_at='2026-09-26T10:00:00.000Z'");
+  assert.equal(hasGenerationGuard(h.db, 1, 30), false);
+  assert.equal(hasGenerationGuard(h.db, 1, 15), true, '30 秒的证据不能带走 15 秒的防护');
+  assert.equal(listGenerationGuards(h.db).length, 1);
+  assert.equal(listGenerationGuards(h.db)[0].scope, 'duration:15');
+});
+
+test('★ 没有账号级能力字段的时长（10/20 秒）不会被探针自动证伪', t => {
+  const h = fixture(t);
+  h.add(1, 'failed', '2026-09-26T09:00:00.000Z', '原生 10 秒能力探测未完成', 10);
+  assert.equal(recordGenerationGuard(h.db, h.row(1), h.account()), true);
+  // 库与账号表里根本没有 native_10s_* / native_20s_*（capabilityColumn 对它们返回 null），
+  // 不存在"更晚的探针"这种东西可比 —— 必须保持拦截，不能凭空推断。
+  h.db.exec("UPDATE dola_accounts SET native_30s_state='available', native_30s_at='2099-01-01T00:00:00.000Z'");
+  assert.equal(hasGenerationGuard(h.db, 1, 10), true);
+  assert.equal(listGenerationGuards(h.db).length, 1);
 });

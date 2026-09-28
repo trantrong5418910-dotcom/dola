@@ -118,8 +118,8 @@ test('parseModelCosts：正常表原样保留（含"模型|秒数"这种带竖�
 });
 
 // ─────────────────────── ② 模型推导：与生成链路交叉核对 ───────────────────────
-test('★ modelForTask 与 normalizeVideoDuration().targetModel 对 10/15/20/30 完全一致', () => {
-  for (const seconds of [10, 15, 20, 30]) {
+test('★ modelForTask 与 normalizeVideoDuration().targetModel 对 15/30 完全一致', () => {
+  for (const seconds of [15, 30]) {
     const truth = normalizeVideoDuration({ seconds }).targetModel;
     // 生成链路对 10 秒返回 null（= 沿用页面默认），而页面默认就是 v2.5。
     const expected = truth === null ? 'seedance_v2.5' : truth;

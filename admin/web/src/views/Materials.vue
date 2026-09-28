@@ -65,12 +65,12 @@
               v-if="editForm.images.length < 9"
               :show-file-list="false"
               :before-upload="onPickImage"
-              accept="image/png,image/jpeg,image/webp"
+              accept="image/png,image/jpeg,image/gif"
             >
               <div class="img-add"><el-icon><Plus /></el-icon><span>添加</span></div>
             </el-upload>
           </div>
-          <div class="hint">最多 9 张，单张 8MB 以内；仅 png / jpeg / webp。</div>
+          <div class="hint">最多 9 张，单张 8MB 以内；仅 png / jpeg / gif（gif 自动取首帧）。</div>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -172,9 +172,9 @@ async function onPickImage(file) {
     r.onerror = reject;
     r.readAsDataURL(file);
   });
-  const match = /^data:(image\/(png|jpeg|webp));base64,(.+)$/.exec(dataUrl || '');
+  const match = /^data:(image\/(png|jpeg|gif));base64,(.+)$/.exec(dataUrl || '');
   if (!match) {
-    ElMessage.error('只支持 png / jpeg / webp');
+    ElMessage.error('只支持 png / jpeg / gif');
     return false;
   }
   editForm.images.push({ mime: match[1], dataBase64: match[3] });

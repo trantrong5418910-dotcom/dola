@@ -1,3 +1,5 @@
+import { isGeoBlockedCode, geoBlockedKind } from './geo-block.js';
+
 /** Only explicit session-expiry responses justify automatic quarantine. */
 const DEAD_CODES = new Set([710012001, 710012014]);
 
@@ -10,6 +12,15 @@ export function accountHealth(session, profile) {
   const dead = responses.find(([status, code]) => status === 200 && DEAD_CODES.has(Number(code)));
   if (dead && profile.ok) return { kind: 'unknown', message: '会话接口结果不一致，等待复查' };
   if (dead) return { kind: 'invalid', message: `会话已失效（code=${dead[1]}）` };
+  // ★ 出口地区不受支持（geo 封锁）：**仍然 unknown、仍然不改账号状态** ——
+  //   号是好的，坏的是代理出口落地的国家/地区。
+  //   这里只把原因说清楚，替掉原来那句「暂未完成校验（HTTP 200，code=710022003）」：
+  //   那句话把"地区不可用"说成了"还没校验完"，是本次故障里最误导人的一处文案
+  //   —— 看到它的人会去重试、去等，而真相是"换个出口才行"。
+  const geo = responses.find(([status, code]) => status === 200 && isGeoBlockedCode(code));
+  if (geo && !profile.ok) {
+    return { kind: 'unknown', message: `${geoBlockedKind({ code: geo[1] })}，保留原状态` };
+  }
   if (profile.ok && session.valid) return { kind: 'valid', message: '' };
   return { kind: 'unknown', message: `暂未完成校验（HTTP=${profile.status || 0}，code=${profile.code ?? '-'}），保留原状态` };
 }

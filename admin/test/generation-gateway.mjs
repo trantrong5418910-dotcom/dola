@@ -135,7 +135,7 @@ test('actual gateway router enforces owner and readiness, with an isolated datab
     assert.equal((await fetch(`${base}/gen/1/file?token=fixture-token-2`, { headers })).status, 404);
     const closedHealth = await (await fetch(`${base}/health`, { headers })).json();
     assert.equal(closedHealth.fixedSeconds, 30);
-    assert.deepEqual(closedHealth.supportedSeconds, [10, 15, 20, 30]);
+    assert.deepEqual(closedHealth.supportedSeconds, [15, 30]);
     assert.deepEqual(closedHealth.expertSeconds, [15]);
     assert.equal(closedHealth.expertSecondsReady, false);
     assert.equal(closedHealth.fixedSecondsReady, false);
@@ -180,8 +180,8 @@ test('actual gateway router enforces owner and readiness, with an isolated datab
     // gateway exposes only safe capacity counters so the user can retry later.
     db.prepare("UPDATE dola_videos SET status='ready' WHERE id=1").run();
     db.prepare("UPDATE settings SET value='1' WHERE key='dola_gen_queue_limit'").run();
-    db.prepare("INSERT INTO dola_videos(id,owner_token_id,seconds,status,created_at,updated_at) VALUES(99,1,10,'queued',?,?)").run(at, at);
-    const full = await fetch(`${base}/gen`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ token: 'fixture-token-1', prompt: 'queue capacity fixture', seconds: 10 }) });
+    db.prepare("INSERT INTO dola_videos(id,owner_token_id,seconds,status,created_at,updated_at) VALUES(99,1,30,'queued',?,?)").run(at, at);
+    const full = await fetch(`${base}/gen`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ token: 'fixture-token-1', prompt: 'queue capacity fixture', seconds: 30 }) });
     const fullBody = await full.json();
     assert.equal(full.status, 429);
     assert.equal(fullBody.code, 'GENERATION_QUEUE_FULL');

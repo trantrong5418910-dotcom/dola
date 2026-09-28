@@ -36,7 +36,7 @@ const log = (o) => console.log(JSON.stringify(o));
 
 // 提示词必须唯一：submitGenerationTask 对同一 token 的相同提示词有冷却，会直接 409
 const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
-const prompt = `闭环验证 ${stamp} 一只橘猫坐在窗台上打盹，阳光洒在毛上`;
+const prompt = `预热复测 ${stamp} 一只橘猫趴在窗台上晒太阳，毛发细节清晰，浅景深`;
 
 const jwt = signJwt({ uid: 1 }, 1);
 log({ stage: 'submit-request', seconds: SECONDS, tokenId: TOKEN_ID, prompt,

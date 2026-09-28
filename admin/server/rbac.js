@@ -38,10 +38,26 @@ export const PERMISSIONS = [
   { code: 'dola:delete', label: '删除账号', group: 'dola 账号池' },
   { code: 'dola:convert', label: '额度转积分', group: 'dola 账号池' },
   { code: 'dola:create', label: '创建生成任务', group: 'dola 账号池' },
+  // ★ 删任务与删账号是两件事，不复用 dola:delete（后者语义是「删除 dola 账号」）。
+  // 2026-09-27 成片库删除功能新增；超级管理员 permissions=['*'] 自动放行。
+  { code: 'dola:task:delete', label: '删除生成任务（成片库）', group: 'dola 账号池' },
+  { code: 'script:list', label: '查看脚本工作台', group: '脚本工作台' },
+  { code: 'script:generate', label: '生成脚本', group: '脚本工作台' },
+  { code: 'script:update', label: '编辑脚本', group: '脚本工作台' },
+  { code: 'script:delete', label: '删除脚本', group: '脚本工作台' },
   { code: 'material:list', label: '查看素材', group: '素材库' },
   { code: 'material:create', label: '新建素材', group: '素材库' },
   { code: 'material:update', label: '修改素材', group: '素材库' },
   { code: 'material:delete', label: '删除素材', group: '素材库' },
+  // ★ 参考图库是**独立模块**，不复用 material:* ——
+  // 素材是「提示词 + 可选参考图」的模板，参考图库是「可复用的图片资产」，
+  // 两者权限面不同（参考图库要被分镜页读取，素材库不需要）。
+  // ⚠️ 新增权限点不会自动授予已有角色：超级管理员（permissions=['*']）自动放行，
+  //    其它角色需要到「角色」页手动勾选，否则图库页面与分镜页的「从图库选」会 403。
+  { code: 'refimage:list', label: '查看参考图库', group: '参考图库' },
+  { code: 'refimage:create', label: '收图进图库（上传/直链/分镜图）', group: '参考图库' },
+  { code: 'refimage:update', label: '修改参考图（改名/标签）', group: '参考图库' },
+  { code: 'refimage:delete', label: '删除参考图', group: '参考图库' },
   { code: 'setting:view', label: '查看设置', group: '系统' },
   { code: 'setting:update', label: '修改设置', group: '系统' },
   { code: 'log:list', label: '查看操作日志', group: '系统' },

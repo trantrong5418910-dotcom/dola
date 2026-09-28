@@ -32,9 +32,6 @@
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="能力" width="150">
-          <template #default="{ row }">30 秒 {{ row.native_30s_state === 'available' ? '✓' : '—' }} · 参考图 {{ row.reference_image_state === 'available' ? '✓' : '—' }}</template>
-        </el-table-column>
         <el-table-column label="冷却" width="170">
           <template #default="{ row }">{{ row.cooldown_until && new Date(row.cooldown_until) > new Date() ? fmt(row.cooldown_until) : '—' }}</template>
         </el-table-column>

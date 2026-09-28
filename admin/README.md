@@ -243,18 +243,32 @@ Google 关于受信任设备的 Cookie 建议针对两步验证，不代表保�
 | `dola_auto_cleanup_invalid` | true | 明确会话失效后隔离，保留账号和 Cookie；关闭时标为待复查 |
 | `dola_auto_quota_probe` | true | 巡检时通过只读 HTTP 接口探测明确账户余额 |
 | `dola_auto_maintenance_interval_minutes` | 180 | 巡检间隔，支持 15～1440 分钟 |
-| `dola_submit_mode` | browser | 视频提交通道：`browser`=浏览器模拟提交（默认）/ `scheme-a`=Abort取签名+页内重放提交（实验） |
+| `dola_submit_mode` | browser | 视频提交通道：`browser`=浏览器模拟提交（默认）/ `scheme-a`=Abort取签名+页内重放提交（实验）/ `pure-http`=纯协议、Node 自算 a_bogus 后直发（不开浏览器） |
+| `dola_hello_probe_mode` | pure-http | 「你好」探测通道：`pure-http`=纯协议直发（默认，不开浏览器）/ `browser`=开浏览器走 UI（慢，仅回退用） |
 
-### 视频提交通道（browser / scheme-a）
+### 视频提交通道（browser / scheme-a / pure-http）
 
-`server/dola/generator.js` 的提交阶段支持双通道，由设置项 `dola_submit_mode` 切换（系统设置 → dola 账号池，保存即时生效，无需重启）：
+`server/dola/generator.js` 的提交阶段支持三通道，由设置项 `dola_submit_mode` 切换（系统设置 → dola 账号池，保存即时生效，无需重启）：
 
 - `browser`（默认）：操作页面 UI（选模型/时长、填提示词、点发送），观察 SSE 拿 conversationId。
 - `scheme-a`（实验，`server/dola/scheme-a.js`）：页内 fetch 触发一次 `/chat/completion`，路由拦截捕获带 `a_bogus` 签名的完整请求后 abort（探测不消耗额度），再用同一浏览器把请求原样重放一次完成真正提交，随后立刻关浏览器。
+- `pure-http`（`server/dola/pure-http.js`）：**完全不开浏览器**。把厂商自己的 bdms 签名 SDK 跑在 Node 沙箱里算出 `a_bogus`（`server/dola/abogus/`），再用 undici + 账号代理把同一个 body 直接发出去。零 Playwright、零 profile 目录，不受浏览器并发上限约束。签名器已被服务端实测接受：正例拿 `SSE_ACK`，负对照（破坏签名）立即返回 `710022002`。
 
-两个通道拿回 conversationId 之后走同一条下游：纯 HTTP 轮询 `/im/chain/single` → fallback 解析无水印 → 归档 → 计费/退款 → 任务日志。限流（710022002）冷却、提交日志、防自毁登出等保护在两个通道都生效。
+三个通道拿回 conversationId 之后走同一条下游：纯 HTTP 轮询 `/im/chain/single` → fallback 解析无水印 → 归档 → 计费/退款 → 任务日志。限流冷却、提交日志、防自毁登出等保护在三个通道都生效。
 
-限制：`scheme-a` 暂不支持参考图任务（会直接失败并提示切回 browser）。
+限制：`scheme-a` 与 `pure-http` 都不支持参考图（带图任务在选择通道阶段自动回落 `browser`，不会判失败）。
+
+⚠️ 纯协议通道的铁律：**签哪个 body 就必须发哪个 body**。`a_bogus` 绑定请求体，所以 `pure-http` 直接用最终 duration 造 body（要 30 秒就写 `duration:30`）取签后原样发送，**不存在** `browser` 通道那套「UI 选 10s 载体 + 网络层改写成 30s」——那套做法在纯协议下会自废签名。
+
+### 「你好」探测通道（pure-http / browser）
+
+账号池的「发送“你好”探测」（`dola_hello_probe` 任务）默认走**纯协议**（`server/dola/hello-probe.js` 的 `sendHelloProbeViaPureHttp`）：
+
+- 复用已实测过的普通对话信封（`chat-bridge.js` 的 `buildPlainChatBody`，**不带 `chat_ability`** ⇒ 不会变成视频任务）+ Node 沙箱自算 `a_bogus`，用账号代理直接 POST `/chat/completion`，读 SSE 判有没有 `conversation_id`。
+- **零 Playwright、零 profile 目录、不占浏览器并发**；旧实现要等创作输入框渲染（慢代理 20~30 秒），纯协议典型 1~3 秒。
+- 判定口径两条通道一致：`available`=上游受理；`unavailable`=上游**明确**说会话失效（710012001/710012014 或 HTTP 401/403）；其余（限流 710022002、出口异常、超时）一律 `unknown`，**不判账号失效**。
+- 回退：设置项 `dola_hello_probe_mode=browser`（旧实现保留在 `hello-probe.js` 的 `sendHelloProbeViaBrowser`，不再往里加新能力）。
+- 离线契约测试：`npm run test:hello-probe`；真机验证（默认零副作用，用无效 bot_id 让上游在创建会话前挡回）：`node --experimental-sqlite server/scripts/verify-hello-probe-pure.mjs <accountId>`。
 
 ### 自动维护与额度读数
 

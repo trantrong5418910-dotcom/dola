@@ -1,182 +1,129 @@
+<!--
+  仪表盘 = 只放「关键可视化饼盘」。
+
+  2026-09-27 精简：原先这里是 10 个统计卡 + 生成统计（3 张明细表）+ dola 账号池表格
+  + 内容状态横条 + 最近操作时间线 + 近 7 天柱条 —— 一屏塞不下、要滚动才看得全，
+  而真正每天要瞄一眼的只有三件事：**任务成不成、号够不够、内容多少**。
+  所以只留三个环，其余全删（统计卡/账号表格/时间线/柱条已移除）。
+
+  ⚠️ 唯一从「生成统计」里抢救出来的功能是 **重复失败保护 · 只读复核** ——
+     那个按钮全后台只有这一处能点到，删掉就等于丢了「解除能力保护」的入口。
+     所以它被压缩成下方的一张小表保留着。
+-->
 <template>
   <div v-loading="loading">
     <el-row :gutter="14">
-      <el-col v-for="c in cards" :key="c.key" :xs="12" :sm="12" :md="6">
-        <div class="stat">
-          <div class="stat-icon" :style="{ background: c.bg, color: c.color }">
-            <el-icon :size="20"><component :is="c.icon" /></el-icon>
-          </div>
-          <div>
-            <div class="stat-num">{{ c.value }}</div>
-            <div class="stat-label">{{ c.label }}</div>
-          </div>
-        </div>
+      <!-- ① 生成任务结果 —— 业务最关心的一个环 -->
+      <el-col v-if="canDolaList" :xs="24" :sm="24" :md="8">
+        <el-card shadow="never" v-loading="genLoading" class="ring-card">
+          <template #header>
+            <div class="card-head">
+              <span class="card-title">生成任务结果</span>
+              <el-select v-model="hours" size="small" style="width:112px" @change="() => loadGeneration()">
+                <el-option :value="24" label="最近 24 小时" />
+                <el-option :value="72" label="最近 3 天" />
+                <el-option :value="168" label="最近 7 天" />
+              </el-select>
+            </div>
+          </template>
+          <el-alert v-if="genError" :title="genError" type="warning" :closable="false" show-icon class="ring-alert" />
+          <DonutRing
+            :segments="genSegments"
+            :center-value="genCenterValue"
+            center-label="已结案成功率"
+            :aria-label="`生成任务结果：${rangeLabel}`"
+          />
+          <p class="ring-note">成功率 = 成功 ÷（成功 + 失败）；取消与进行中不计入。</p>
+          <p class="ring-note">全部留存：{{ gen.allTime.created }} 创建 · {{ gen.allTime.succeeded }} 成功 · {{ gen.allTime.failed }} 失败 · {{ gen.allTime.cancelled }} 取消 · {{ gen.allTime.pending }} 进行中</p>
+        </el-card>
+      </el-col>
+
+      <!-- ② dola 账号池健康 —— 号够不够、有多少已经废了 -->
+      <el-col v-if="canDolaList" :xs="24" :sm="24" :md="8">
+        <el-card shadow="never" v-loading="accountLoading" class="ring-card">
+          <template #header>
+            <div class="card-head">
+              <span class="card-title">dola 账号池</span>
+              <el-button size="small" plain :loading="accountLoading" @click="loadAccounts()">刷新</el-button>
+            </div>
+          </template>
+          <el-alert v-if="accountError" :title="accountError" type="warning" :closable="false" show-icon class="ring-alert" />
+          <DonutRing
+            :segments="accountSegments"
+            :center-value="accountTotal"
+            center-label="账号总数"
+            aria-label="dola 账号池状态分布"
+          />
+          <p class="ring-note">
+            冷却中 {{ accountState.summary.cooling ?? 0 }} 个
+            · 有效号未配代理 {{ accountState.summary.validNoProxy ?? 0 }} 个
+          </p>
+        </el-card>
+      </el-col>
+
+      <!-- ③ 内容状态分布 -->
+      <el-col :xs="24" :sm="24" :md="canDolaList ? 8 : 24">
+        <el-card shadow="never" class="ring-card">
+          <template #header>
+            <div class="card-head">
+              <span class="card-title">内容状态</span>
+              <el-button size="small" plain @click="$router.push('/contents')">内容管理</el-button>
+            </div>
+          </template>
+          <DonutRing
+            :segments="contentSegments"
+            :center-value="contentTotal"
+            center-label="内容总数"
+            aria-label="内容状态分布"
+          />
+        </el-card>
       </el-col>
     </el-row>
 
-    <DolaGenerationAnalytics v-if="canDolaList" class="mt" />
-
-    <el-card v-if="canDolaList" shadow="never" class="mt account-card">
+    <!--
+      从「生成统计与复核」里唯一保留的功能块。
+      这处按钮是**全后台唯一**能给账号解除「重复失败保护」的入口，不能跟着明细表一起删。
+    -->
+    <el-card v-if="canDolaList" shadow="never" class="mt">
       <template #header>
-        <div class="card-head account-head">
+        <div class="card-head">
           <div>
-            <span class="card-title">dola 账号池</span>
-            <span class="muted account-head-sub">已并入 8788 仪表盘 · {{ dolaSummary.total ?? 0 }} 个账号</span>
+            <span class="card-title">重复失败保护</span>
+            <span class="muted card-sub">{{ guards.length }} 项待复核</span>
           </div>
-          <div class="account-actions">
-            <el-button v-if="canDolaCheck" size="small" plain :loading="dolaLoading" @click="loadDolaAccounts">刷新</el-button>
-            <el-button v-if="canDolaCheck" size="small" plain :loading="maintenanceLoading" @click="runDolaMaintenance">立即维护</el-button>
-            <el-button size="small" type="primary" plain @click="$router.push('/dola')">完整账号池</el-button>
-          </div>
+          <el-button size="small" plain @click="$router.push('/dola')">完整账号池</el-button>
         </div>
       </template>
-
-      <div class="account-summary">
-        <div class="account-summary-item"><span>有效</span><b class="ok">{{ dolaSummary.valid ?? 0 }}</b></div>
-        <div class="account-summary-item"><span>失效</span><b class="danger">{{ dolaSummary.invalid ?? 0 }}</b></div>
-        <div class="account-summary-item"><span>未校验</span><b>{{ dolaSummary.unknown ?? 0 }}</b></div>
-        <div class="account-summary-item"><span>已确认剩余额度</span><b>{{ dolaSummary.quotaKnown ? (dolaSummary.quotaRemaining ?? '未知') : '未知' }}</b></div>
-        <div class="account-summary-item"><span>原生 30 秒</span><b :class="dolaSummary.native30Ready ? 'ok' : 'warning'">{{ dolaSummary.native30Ready ? `${dolaSummary.native30Available} 个可用` : '暂无可用' }}</b></div>
-      </div>
-
       <el-alert
-        v-if="dolaError"
-        type="warning"
-        :title="dolaError"
+        type="info"
         :closable="false"
         show-icon
-        class="account-alert"
+        class="guard-alert"
+        title="能力失败后暂停该账号该能力的提交。只有通过绑定代理做一次只读控件复核才能解除 —— 不填提示词、不生成视频、不消耗额度；复核通过也不代表有额度或能保证成片。"
       />
-
-      <div class="account-toolbar">
-        <el-input v-model="dolaQuery.keyword" clearable placeholder="搜索备注 / 账号标识" style="width:240px" @keyup.enter="loadDolaAccounts" />
-        <el-select v-model="dolaQuery.status" clearable placeholder="全部状态" style="width:130px" @change="loadDolaAccounts">
-          <el-option label="有效" value="valid" />
-          <el-option label="失效" value="invalid" />
-          <el-option label="未校验" value="unknown" />
-          <el-option label="已停用" value="disabled" />
-        </el-select>
-        <el-button plain @click="loadDolaAccounts">查询</el-button>
-        <span class="spacer" />
-        <el-button v-if="canDolaImport" size="small" @click="dolaImportDlg = true">导入 Cookie</el-button>
-      </div>
-
-      <el-table :data="dolaAccounts" v-loading="dolaLoading" stripe border size="small" empty-text="暂无账号">
-        <el-table-column prop="id" label="ID" width="64" />
-        <el-table-column label="账号" min-width="210" show-overflow-tooltip>
-          <template #default="{ row }">
-            <div class="cell-stack">
-              <span class="main">{{ dolaName(row) }}</span>
-              <span class="sub">{{ row.account_hint || '未识别账号' }} · {{ row.proxy ? '已配代理' : '直连风险' }}</span>
-            </div>
-          </template>
+      <el-table :data="guards" border stripe size="small" empty-text="暂无待复核保护项">
+        <el-table-column prop="account_id" label="账号 ID" width="90" />
+        <el-table-column prop="label" label="暂停能力" min-width="130" />
+        <el-table-column label="触发任务" width="100">
+          <template #default="{ row }">#{{ row.source_task_id }}</template>
         </el-table-column>
-        <el-table-column label="状态" width="125">
-          <template #default="{ row }">
-            <div class="cell-stack">
-              <span><el-tag :type="dolaStatusType(row.status)" size="small">{{ dolaStatusLabel(row.status) }}</el-tag></span>
-              <span class="sub">{{ dolaStateText(row) }}</span>
-            </div>
-          </template>
+        <el-table-column label="触发时间" min-width="175">
+          <template #default="{ row }">{{ fmt(row.blocked_at) }}</template>
         </el-table-column>
-        <el-table-column label="额度" width="130">
+        <el-table-column label="操作" min-width="170">
           <template #default="{ row }">
-            <span :class="quotaClass(row)">{{ quotaText(row) }}</span>
-            <div class="sub">{{ row.quota_source ? `来源：${row.quota_source}` : '未确认' }}</div>
-          </template>
-        </el-table-column>
-        <el-table-column label="30 秒" width="105">
-          <template #default="{ row }">
-            <el-tag size="small" :type="native30Type(row.native_30s_state)">{{ native30Label(row.native_30s_state) }}</el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="最近校验" width="150" show-overflow-tooltip>
-          <template #default="{ row }">{{ fmt(row.last_check_at) }}</template>
-        </el-table-column>
-        <el-table-column label="操作" width="230" fixed="right">
-          <template #default="{ row }">
-            <el-button v-if="canDolaCheck" link type="primary" size="small" :loading="dolaBusyId === row.id" @click="probeDolaAccount(row)">探测</el-button>
-            <el-button v-if="canDolaUpdate" link size="small" @click="toggleDolaAccount(row)">{{ row.status === 'disabled' ? '启用' : '停用' }}</el-button>
-            <el-button link type="primary" size="small" @click="$router.push('/dola')">详情</el-button>
-            <el-button v-if="canDolaDelete" link type="danger" size="small" @click="removeDolaAccount(row)">删除</el-button>
+            <el-button
+              v-if="canDolaCheck"
+              size="small"
+              :disabled="Boolean(probing)"
+              :loading="probing === `${row.account_id}/${row.scope}`"
+              @click="probeGuard(row)"
+            >只读复核后恢复</el-button>
+            <span v-else class="muted">需账号校验权限</span>
           </template>
         </el-table-column>
       </el-table>
-      <div class="account-foot muted">当前显示 {{ dolaAccounts.length }} / {{ dolaTotal }} 条。完整探测、代理修复、原生能力探测和批量操作仍可从“完整账号池”进入。</div>
     </el-card>
-
-    <el-row :gutter="14" class="mt">
-      <el-col :md="12" :sm="24">
-        <el-card shadow="never">
-          <template #header><span class="card-title">内容状态分布</span></template>
-          <div v-if="byStatus.length" class="bars">
-            <div v-for="s in byStatus" :key="s.status" class="bar-row">
-              <span class="bar-label">{{ statusLabel(s.status) }}</span>
-              <div class="bar-track">
-                <div class="bar-fill" :style="{ width: pct(s.c) + '%', background: statusColor(s.status) }" />
-              </div>
-              <span class="bar-num">{{ s.c }}</span>
-            </div>
-          </div>
-          <el-empty v-else description="暂无内容" :image-size="70" />
-        </el-card>
-      </el-col>
-
-      <el-col :md="12" :sm="24">
-        <el-card shadow="never">
-          <template #header>
-            <div class="card-head">
-              <span class="card-title">最近操作</span>
-              <el-link type="primary" :underline="false" @click="$router.push('/logs')">全部</el-link>
-            </div>
-          </template>
-          <el-timeline v-if="recentLogs.length" class="tl">
-            <el-timeline-item
-              v-for="l in recentLogs"
-              :key="l.id"
-              :timestamp="fmt(l.created_at)"
-              size="small"
-              :type="l.action.includes('delete') || l.action.includes('failed') ? 'danger' : 'primary'"
-            >
-              <b>{{ l.username }}</b>
-              <span class="muted"> · {{ actionLabel(l.action) }}</span>
-              <el-tag v-if="l.target_type" size="small" effect="plain" class="ml">{{ l.target_type }}</el-tag>
-            </el-timeline-item>
-          </el-timeline>
-          <el-empty v-else description="暂无记录" :image-size="70" />
-        </el-card>
-      </el-col>
-    </el-row>
-
-    <el-card shadow="never" class="mt">
-      <template #header><span class="card-title">近 7 天新增内容</span></template>
-      <div v-if="trend.length" class="trend">
-        <div v-for="d in trend" :key="d.d" class="trend-col">
-          <div class="trend-bar" :style="{ height: trendHeight(d.c) }" :title="`${d.d}：${d.c} 条`" />
-          <span class="trend-label">{{ d.d.slice(5) }}</span>
-        </div>
-      </div>
-      <el-empty v-else description="近 7 天没有新增" :image-size="70" />
-    </el-card>
-
-    <el-dialog v-model="dolaImportDlg" title="导入 dola Cookie" width="620px" destroy-on-close>
-      <el-alert type="warning" :closable="false" show-icon title="Cookie 只在当前请求中传输，不要把密码或完整凭据粘贴到操作日志、截图或聊天中。" class="import-alert" />
-      <el-form label-width="90px" class="import-form">
-        <el-form-item label="Cookie">
-          <el-input v-model="dolaImportForm.raw" type="textarea" :rows="7" placeholder="每行一份已登录 Cookie；也支持 JSON Cookie 对象" />
-        </el-form-item>
-        <el-form-item label="备注前缀">
-          <el-input v-model="dolaImportForm.labelPrefix" placeholder="可选，例如 batch-" />
-        </el-form-item>
-        <el-form-item label="备注">
-          <el-input v-model="dolaImportForm.note" placeholder="可选" />
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="dolaImportDlg = false">取消</el-button>
-        <el-button type="primary" :loading="dolaImporting" @click="importDolaAccounts">导入并刷新</el-button>
-      </template>
-    </el-dialog>
   </div>
 </template>
 
@@ -184,252 +131,201 @@
 // keep-alive 靠组件名匹配 include，<script setup> 默认没有 name，
 // 少了这一行缓存会**静默失效**（不报错、也不生效）。
 defineOptions({ name: 'Dashboard' });
-import { computed, onMounted, reactive, ref } from 'vue';
+import { computed, onActivated, onDeactivated, onMounted, onUnmounted, ref } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import { api } from '../api.js';
+import { api, qs } from '../api.js';
 import { can } from '../store.js';
-import DolaGenerationAnalytics from '../components/DolaGenerationAnalytics.vue';
+import DonutRing from '../components/DonutRing.vue';
+
+/**
+ * 环图的取色。直接写死 Element Plus 的色板值（而不是 var(--el-color-*)）：
+ * SVG 的 stroke 吃 CSS 变量是没问题的，但图例里的圆点是靠 background 上色的，
+ * 两处都写成同一个字面量最不容易出现「环上一个色、图例另一个色」。
+ */
+const PALETTE = {
+  ok: '#67c23a', danger: '#f56c6c', warn: '#e6a23c', info: '#909399', brand: '#9b6eff',
+};
 
 const loading = ref(true);
-const data = ref({ counts: {}, contentByStatus: [], recentLogs: [], contentTrend: [] });
-
 const canDolaList = computed(() => can('dola:list'));
 const canDolaCheck = computed(() => can('dola:check'));
-const canDolaUpdate = computed(() => can('dola:update'));
-const canDolaImport = computed(() => can('dola:import'));
-const canDolaDelete = computed(() => can('dola:delete'));
-const dolaLoading = ref(false);
-const dolaError = ref('');
-const dolaAccounts = ref([]);
-const dolaTotal = ref(0);
-const dolaSummary = ref({});
-const dolaBusyId = ref(null);
-const maintenanceLoading = ref(false);
-const dolaImportDlg = ref(false);
-const dolaImporting = ref(false);
-const dolaQuery = reactive({ keyword: '', status: '', page: 1, pageSize: 100 });
-const dolaImportForm = reactive({ raw: '', labelPrefix: '', note: '' });
 
-const cards = computed(() => [
-  { key: 'users', label: '用户数', value: data.value.counts.users ?? 0, icon: 'User', bg: 'rgba(64,158,255,.15)', color: '#409eff' },
-  { key: 'tokens', label: `访问令牌（启用 ${data.value.counts.tokensActive ?? 0}）`, value: data.value.counts.tokens ?? 0, icon: 'Postcard', bg: 'rgba(155,110,255,.15)', color: '#9b6eff' },
-  { key: 'cards', label: `充值卡（未用 ${data.value.counts.cardsUnused ?? 0}）`, value: data.value.counts.cards ?? 0, icon: 'Tickets', bg: 'rgba(230,162,60,.15)', color: '#e6a23c' },
-  { key: 'cardPoints', label: '待兑积分（未用卡面额）', value: data.value.counts.cardsUnusedPoints ?? 0, icon: 'Coin', bg: 'rgba(103,194,58,.15)', color: '#67c23a' },
-  { key: 'tokenPoints', label: '令牌积分总量', value: data.value.counts.tokenPoints ?? 0, icon: 'Wallet', bg: 'rgba(64,158,255,.12)', color: '#409eff' },
-  { key: 'dola', label: `dola 账号（有效 ${data.value.counts.dolaValid ?? 0}）`, value: data.value.counts.dolaAccounts ?? 0, icon: 'Cloudy', bg: 'rgba(155,110,255,.12)', color: '#9b6eff' },
-  { key: 'dolaCredits', label: 'dola 额度合计', value: data.value.counts.dolaCredits ?? 0, icon: 'Money', bg: 'rgba(230,162,60,.12)', color: '#e6a23c' },
-  { key: 'contents', label: '内容数', value: data.value.counts.contents ?? 0, icon: 'Document', bg: 'rgba(144,147,153,.18)', color: '#909399' },
-  { key: 'roles', label: '角色数', value: data.value.counts.roles ?? 0, icon: 'Key', bg: 'rgba(103,194,58,.12)', color: '#67c23a' },
-  { key: 'logs', label: '日志条数', value: data.value.counts.logs ?? 0, icon: 'List', bg: 'rgba(144,147,153,.14)', color: '#909399' },
-]);
+/* ---------------- ① 生成任务结果 ---------------- */
 
-const byStatus = computed(() => data.value.contentByStatus || []);
-const recentLogs = computed(() => data.value.recentLogs || []);
-const trend = computed(() => data.value.contentTrend || []);
-const maxTrend = computed(() => Math.max(1, ...trend.value.map((t) => t.c)));
+const EMPTY_COUNTS = { created: 0, succeeded: 0, failed: 0, cancelled: 0, pending: 0, other: 0 };
+const hours = ref(24);
+const genLoading = ref(false);
+const genError = ref('');
+const gen = ref({ totals: { ...EMPTY_COUNTS }, allTime: { ...EMPTY_COUNTS }, successRate: null });
+const guards = ref([]);
+const probing = ref('');
 
-const STATUS = {
-  draft: '草稿', published: '已发布', archived: '已归档',
-  active: '启用', disabled: '停用',
-};
-const ACTION = {
-  login: '登录', logout: '退出', login_failed: '登录失败',
-  'user.create': '新建用户', 'user.update': '修改用户', 'user.delete': '删除用户',
-  'user.reset_password': '重置密码', change_password: '修改密码',
-  'content.create': '新建内容', 'content.update': '修改内容', 'content.delete': '删除内容',
-  'content.bulk_delete': '批量删除内容',
-  'role.create': '新建角色', 'role.delete': '删除角色', 'role.update_permissions': '配置权限',
-  'setting.update': '修改设置',
-  'token.generate': '生成令牌', 'token.reveal': '查看令牌', 'token.points': '调整令牌积分',
-  'token.disable': '停用令牌', 'token.enable': '启用令牌', 'token.revoke': '撤销令牌',
-  'token.delete': '删除令牌', 'token.expire': '设置令牌过期', 'token.export': '导出令牌',
-  'card.generate': '生成卡密', 'card.redeem': '兑换卡密', 'card.revoke': '撤销卡密',
-  'card.restore': '恢复卡密', 'card.delete': '删除卡密', 'card.bulk_delete': '批量删除卡密',
-  'card.reveal': '查看卡密', 'card.export': '导出卡密',
-  'dola.import': '导入 dola 账号', 'dola.reveal': '查看账号 cookie', 'dola.probe': '探测额度接口',
-  'dola.check': '校验账号', 'dola.disable': '停用账号', 'dola.enable': '启用账号',
-  'dola.set_credits': '手动录入额度', 'dola.convert': '额度转积分',
-  'dola.delete': '删除账号', 'dola.force_delete': '强制删除账号', 'dola.bulk_delete': '批量删除账号',
-  'dola.job_create': '提交批量任务', 'dola.job_cancel': '取消批量任务',
-};
+const rangeLabel = computed(() => ({ 24: '最近 24 小时', 72: '最近 3 天', 168: '最近 7 天' }[hours.value] || ''));
 
-function statusLabel(s) { return STATUS[s] || s; }
-function statusColor(s) {
-  return { draft: '#909399', published: '#67c23a', archived: '#e6a23c' }[s] || '#409eff';
+const genSegments = computed(() => {
+  const t = gen.value.totals || {};
+  return [
+    { key: 'succeeded', label: '成功', value: t.succeeded || 0, color: PALETTE.ok },
+    { key: 'failed', label: '失败', value: t.failed || 0, color: PALETTE.danger },
+    { key: 'cancelled', label: '取消', value: t.cancelled || 0, color: PALETTE.info },
+    { key: 'pending', label: '进行中', value: t.pending || 0, color: PALETTE.warn },
+    // other 只在真有这种状态时才进环，平时不占图例格子
+    ...(t.other ? [{ key: 'other', label: '其他状态', value: t.other, color: PALETTE.brand }] : []),
+  ];
+});
+
+const genCenterValue = computed(() =>
+  gen.value.successRate === null || gen.value.successRate === undefined ? '—' : `${gen.value.successRate}%`);
+
+/**
+ * 只读复核：解除某账号某能力的「重复失败保护」。
+ * 这是重活（要驱动浏览器打开页面控件），所以按 dola 前缀走 300 秒超时档。
+ */
+async function probeGuard(row) {
+  try {
+    await ElMessageBox.confirm(
+      `通过账号 #${row.account_id} 已绑定代理复核 ${row.label} 控件；不提交视频、不消耗生成额度。复核成功才解除此项保护，是否继续？`,
+      '只读能力复核',
+      { type: 'info' },
+    );
+  } catch { return; }
+  probing.value = `${row.account_id}/${row.scope}`;
+  try {
+    const result = await api.post(`/api/dola/accounts/${row.account_id}/generation-guard-probe`, { scope: row.scope });
+    ElMessage[result.cleared ? 'success' : 'warning'](result.message);
+    await loadGeneration();
+  } catch { /* api 层已经弹过错误了 */ } finally { probing.value = ''; }
 }
-function actionLabel(a) { return ACTION[a] || a; }
-function pct(n) {
-  const total = byStatus.value.reduce((s, x) => s + x.c, 0) || 1;
-  return Math.round((n / total) * 100);
-}
-function trendHeight(n) { return Math.max(6, Math.round((n / maxTrend.value) * 100)) + '%'; }
+
+/* ---------------- ② dola 账号池健康 ---------------- */
+
+const accountLoading = ref(false);
+const accountError = ref('');
+const accountState = ref({ items: [], total: 0, summary: {} });
+const accountTotal = computed(() => accountState.value.summary?.total ?? 0);
+
+const accountSegments = computed(() => {
+  const s = accountState.value.summary || {};
+  return [
+    { key: 'valid', label: '有效', value: s.valid || 0, color: PALETTE.ok },
+    { key: 'invalid', label: '失效', value: s.invalid || 0, color: PALETTE.danger },
+    { key: 'unknown', label: '未校验', value: s.unknown || 0, color: PALETTE.info },
+    { key: 'disabled', label: '已停用', value: s.disabled || 0, color: PALETTE.warn },
+  ];
+});
+
+/* ---------------- ③ 内容状态 ---------------- */
+
+const stats = ref({ counts: {}, contentByStatus: [] });
+const contentTotal = computed(() => stats.value.counts?.contents ?? 0);
+
+const CONTENT_STATUS = { draft: '草稿', published: '已发布', archived: '已归档' };
+const CONTENT_COLOR = { draft: PALETTE.info, published: PALETTE.ok, archived: PALETTE.warn };
+const contentSegments = computed(() =>
+  (stats.value.contentByStatus || []).map((s) => ({
+    key: s.status,
+    label: CONTENT_STATUS[s.status] || s.status,
+    value: s.c,
+    color: CONTENT_COLOR[s.status] || '#409eff',
+  })));
+
 function fmt(iso) { return iso ? new Date(iso).toLocaleString('zh-CN', { hour12: false }) : '—'; }
 
-const DOLA_STATUS = { valid: '有效', invalid: '失效', unknown: '未校验', disabled: '已停用' };
-function dolaStatusLabel(status) { return DOLA_STATUS[status] || status || '未知'; }
-function dolaStatusType(status) { return ({ valid: 'success', invalid: 'danger', unknown: 'info', disabled: 'warning' })[status] || 'info'; }
-function dolaName(row) { return String(row.label || row.account_hint || '').trim() || `账号 #${row.id}`; }
-function dolaStateText(row) {
-  if (row.cooldown_until && Date.parse(row.cooldown_until) > Date.now()) return `冷却至 ${fmt(row.cooldown_until)}`;
-  if (row.fail_streak) return `连续失败 ${row.fail_streak} 次`;
-  return row.last_error ? String(row.last_error).slice(0, 28) : '—';
-}
-function quotaText(row) {
-  if (row.quotaKnown && Number.isFinite(Number(row.quotaAvailable))) return `剩 ${row.quotaAvailable}`;
-  if (row.quotaState === 'stale') return '待确认';
-  return '未知';
-}
-function quotaClass(row) {
-  if (row.quotaKnown && Number(row.quotaAvailable) === 0) return 'danger';
-  if (row.quotaKnown) return 'ok';
-  return row.quotaState === 'stale' ? 'warning' : 'muted';
-}
-function native30Label(state) { return ({ available: '可用', unavailable: '不可用', unknown: '未判定' })[state] || '未判定'; }
-function native30Type(state) { return ({ available: 'success', unavailable: 'warning', unknown: 'info' })[state] || 'info'; }
+/* ---------------- 加载 ---------------- */
 
-async function loadDolaAccounts() {
+async function loadStats(silent = false) {
+  try {
+    const res = await api.get('/api/stats', { silent });
+    stats.value = { counts: res.counts || {}, contentByStatus: res.contentByStatus || [] };
+  } catch { /* api 层已提示（silent 时静默） */ }
+}
+
+async function loadAccounts(silent = false) {
   if (!canDolaList.value) return;
-  dolaLoading.value = true;
-  dolaError.value = '';
+  if (!silent) accountLoading.value = true;
+  accountError.value = '';
   try {
-    const res = await api.get(`/api/dola/accounts?page=${dolaQuery.page}&pageSize=${dolaQuery.pageSize}&keyword=${encodeURIComponent(dolaQuery.keyword)}&status=${encodeURIComponent(dolaQuery.status)}`, { silent: true });
-    dolaAccounts.value = res.items || [];
-    dolaTotal.value = res.total || 0;
-    dolaSummary.value = {
-      ...(res.summary || {}),
-      native30Available: (res.items || []).filter((row) => row.status === 'valid' && row.native_30s_state === 'available').length,
-      native30Ready: (res.items || []).some((row) => row.status === 'valid' && row.native_30s_state === 'available'),
+    // pageSize 保持 100：环图只用 summary（**全池**统计，不受 keyword/status 过滤影响）。
+    const res = await api.get(`/api/dola/accounts${qs({ page: 1, pageSize: 100 })}`, { silent: true });
+    accountState.value = { items: res.items || [], total: res.total || 0, summary: res.summary || {} };
+  } catch (error) {
+    accountError.value = error.message || '账号池加载失败';
+  } finally {
+    if (!silent) accountLoading.value = false;
+  }
+}
+
+/**
+ * @param silent 轮询/回到页面时的静默刷新：不转圈、不弹错、**不清空旧数字**
+ *   （失败时保留上一次的结果并挂个「可能已过期」的提示，比整块变空好判断）。
+ */
+async function loadGeneration(silent = false) {
+  if (!canDolaList.value) return;
+  if (!silent) genLoading.value = true;
+  try {
+    // timezone 只影响小时明细的标签文字；明细表已删，所有展示数字与它无关，故固定传北京。
+    const res = await api.get(`/api/dola/generation-analytics${qs({ hours: hours.value, timezone: 'Asia/Shanghai' })}`, { silent: true });
+    gen.value = {
+      totals: { ...EMPTY_COUNTS, ...(res.totals || {}) },
+      allTime: { ...EMPTY_COUNTS, ...(res.allTime || {}) },
+      successRate: res.successRate ?? null,
     };
-  } catch (error) {
-    dolaError.value = error.message || '账号池加载失败';
+    guards.value = res.guards || [];
+    genError.value = '';
+  } catch {
+    if (!silent) genError.value = '统计读取失败，请刷新；环上数字可能已过期。';
   } finally {
-    dolaLoading.value = false;
+    if (!silent) genLoading.value = false;
   }
 }
 
-async function probeDolaAccount(row) {
-  dolaBusyId.value = row.id;
-  try {
-    const res = await api.post(`/api/dola/accounts/${row.id}/probe`, {}, { silent: true });
-    ElMessage.success(res.message || '探测完成');
-    await loadDolaAccounts();
-  } catch (error) {
-    ElMessage.error(error.message || '探测失败');
-  } finally {
-    dolaBusyId.value = null;
-  }
+async function loadAll({ silent = false } = {}) {
+  if (!silent) loading.value = true;
+  const tasks = [loadStats(silent)];
+  if (canDolaList.value) tasks.push(loadAccounts(silent), loadGeneration(silent));
+  await Promise.allSettled(tasks);
+  if (!silent) loading.value = false;
 }
 
-async function toggleDolaAccount(row) {
-  const action = row.status === 'disabled' ? 'enable' : 'disable';
-  try {
-    await api.post(`/api/dola/accounts/${row.id}/action`, { action });
-    ElMessage.success(action === 'enable' ? '账号已启用' : '账号已停用');
-    await loadDolaAccounts();
-  } catch (error) {
-    ElMessage.error(error.message || '更新账号状态失败');
-  }
-}
+/* ---------------- 轮询（keep-alive 就绪） ---------------- */
 
-async function removeDolaAccount(row) {
-  try {
-    await ElMessageBox.confirm(`确定删除账号「${dolaName(row)}」？删除会从 8788 号池移除 Cookie 记录，无法通过本页撤回。`, '删除确认', {
-      type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消',
-    });
-  } catch { return; }
-  try {
-    await api.del(`/api/dola/accounts/${row.id}`);
-    ElMessage.success('账号已删除');
-    await loadDolaAccounts();
-  } catch (error) {
-    ElMessage.error(error.message || '删除失败；如有换算记录，请到完整账号池处理');
-  }
+/**
+ * Dashboard 在 AdminLayout 的 KEEP_ALIVE 名单里 ⇒ 组件被缓存后 **onUnmounted 不再触发**，
+ * 老写法（只在 onMounted 挂 setTimeout）会让定时器在后台一直跑，白烧服务端。
+ * 所以：onDeactivated 停、onActivated 续，start 幂等（已在排队就不重复挂）。
+ */
+let timer = null, disposed = false, parked = false;
+function startPolling() {
+  if (disposed || timer) return;
+  timer = setTimeout(async () => {
+    timer = null; // ★ 先置空，否则下面 startPolling 会被自己这个残留 id 挡住
+    if (!genLoading.value) await loadGeneration(true);
+    startPolling();
+  }, 30000);
 }
+function stopPolling() { clearTimeout(timer); timer = null; }
 
-async function runDolaMaintenance() {
-  if (!canDolaCheck.value) return;
-  maintenanceLoading.value = true;
-  try {
-    const res = await api.post('/api/dola/maintenance/run', {}, { silent: true });
-    ElMessage.success(res.created ? '账号维护已提交' : '已有维护任务运行中');
-    await loadDolaAccounts();
-  } catch (error) {
-    ElMessage.error(error.message || '提交维护失败');
-  } finally {
-    maintenanceLoading.value = false;
-  }
-}
-
-async function importDolaAccounts() {
-  if (!dolaImportForm.raw.trim()) {
-    ElMessage.warning('请先粘贴 Cookie');
-    return;
-  }
-  dolaImporting.value = true;
-  try {
-    const res = await api.post('/api/dola/accounts/import', { ...dolaImportForm }, { silent: true });
-    ElMessage.success(`新增 ${res.inserted || 0} 个，刷新 ${res.refreshed || 0} 个`);
-    dolaImportForm.raw = '';
-    dolaImportDlg.value = false;
-    await loadDolaAccounts();
-  } catch (error) {
-    ElMessage.error(error.message || '导入失败');
-  } finally {
-    dolaImporting.value = false;
-  }
-}
-
-onMounted(async () => {
-  const results = await Promise.allSettled([
-    api.get('/api/stats'),
-    canDolaList.value ? loadDolaAccounts() : Promise.resolve(),
-  ]);
-  if (results[0].status === 'fulfilled') data.value = results[0].value;
-  loading.value = false;
+onMounted(() => { loadAll(); startPolling(); });
+onActivated(() => {
+  // parked 区分「首次挂载」和「从缓存里回来」，避免 onMounted + onActivated 各拉一遍
+  if (!parked) return;
+  parked = false;
+  loadAll({ silent: true });
+  startPolling();
 });
+onDeactivated(() => { parked = true; stopPolling(); });
+onUnmounted(() => { disposed = true; stopPolling(); });
 </script>
 
 <style scoped>
 .mt { margin-top: 14px; }
-.account-card { overflow: hidden; }
-.account-head { gap: 14px; }
-.account-head-sub { margin-left: 10px; font-size: 12px; }
-.account-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-.account-summary { display: flex; flex-wrap: wrap; gap: 8px 28px; margin-bottom: 14px; padding: 10px 12px; border: 1px solid var(--el-border-color-light); border-radius: 8px; background: var(--el-fill-color-blank); }
-.account-summary-item { display: flex; align-items: baseline; gap: 7px; font-size: 12px; color: var(--el-text-color-secondary); }
-.account-summary-item b { font-size: 16px; color: var(--el-text-color-primary); }
-.account-alert { margin-bottom: 12px; }
-.account-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
-.account-foot { margin-top: 10px; font-size: 12px; }
-.account-card .cell-stack { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.account-card .cell-stack .main { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.account-card .cell-stack .sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.warning { color: var(--el-color-warning) !important; }
-.danger { color: var(--el-color-danger) !important; }
-.ok { color: var(--el-color-success) !important; }
-.import-alert { margin-bottom: 14px; }
-.import-form { padding-top: 4px; }
-.stat {
-  display: flex; align-items: center; gap: 14px; padding: 16px;
-  background: var(--el-bg-color); border: 1px solid var(--el-border-color-light);
-  border-radius: 10px; margin-bottom: 14px;
-}
-.stat-icon { width: 42px; height: 42px; border-radius: 10px; display: grid; place-items: center; }
-.stat-num { font-size: 22px; font-weight: 700; line-height: 1.2; }
-.stat-label { font-size: 12px; color: var(--el-text-color-secondary); }
-.card-title { font-weight: 600; font-size: 14px; }
-.card-head { display: flex; align-items: center; justify-content: space-between; }
-.bars { display: flex; flex-direction: column; gap: 14px; padding: 6px 0; }
-.bar-row { display: flex; align-items: center; gap: 10px; font-size: 13px; }
-.bar-label { width: 60px; color: var(--el-text-color-secondary); }
-.bar-track { flex: 1; height: 8px; background: var(--el-fill-color); border-radius: 4px; overflow: hidden; }
-.bar-fill { height: 100%; border-radius: 4px; transition: width .3s; }
-.bar-num { width: 32px; text-align: right; }
-.tl { padding-left: 2px; max-height: 290px; overflow: auto; }
 .muted { color: var(--el-text-color-secondary); }
-.ml { margin-left: 6px; }
-.trend { display: flex; align-items: flex-end; gap: 12px; height: 130px; padding: 8px 4px 0; }
-.trend-col { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; gap: 6px; }
-.trend-bar { width: 100%; max-width: 46px; background: var(--el-color-primary); border-radius: 4px 4px 0 0; transition: height .3s; }
-.trend-label { font-size: 11px; color: var(--el-text-color-secondary); }
+.card-title { font-weight: 600; font-size: 14px; }
+.card-sub { margin-left: 10px; font-size: 12px; }
+.card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+/* 三张环图卡等高：内容多少不一样，不对齐会显得参差 */
+.ring-card { height: 100%; }
+.ring-alert { margin-bottom: 12px; }
+.ring-note { margin: 10px 0 0; font-size: 12px; line-height: 1.7; color: var(--el-text-color-secondary); }
+.guard-alert { margin-bottom: 12px; }
 </style>

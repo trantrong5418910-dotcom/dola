@@ -573,6 +573,12 @@ export async function fetchCreditsViaBrowser(cookies, {
   if (proxy) launchOptions.proxy = proxy;
   let browser = null;
   let bridge = null;
+  // ★ ctx 必须声明在 try **外面**：下面的 finally 要用它做清理，
+  //   而 `const ctx` 是块级作用域 —— 写在 try 里的话，finally 引用它会直接抛
+  //   `ReferenceError: ctx is not defined`，把 try 里已经算好的成功返回值整个吞掉。
+  //   实测后果：额度探测其实跑通了（26s、页面已加载），但调用方拿到的永远是
+  //   `{ ok:false, error:'ctx is not defined' }` ⇒ 后台「dola 额度合计」恒为 0。
+  let ctx = null;
   const captured = [];
   const hits = [];
   let seen = 0;
@@ -583,7 +589,7 @@ export async function fetchCreditsViaBrowser(cookies, {
       launchOptions.proxy = { server: bridge.url };
     }
     browser = await pw.chromium.launch(launchOptions);
-    const ctx = await browser.newContext({
+    ctx = await browser.newContext({
       serviceWorkers: 'block',
       viewport: { width: 1280, height: 900 },
       locale: 'en-US',
@@ -646,6 +652,8 @@ export async function probeNativeVideoViaBrowser(cookies, {
   proxyUrl = null,
   accountId = null,
   allowUpstreamConcat = false,
+  carriers = null,
+  allowLegacy = false,
 } = {}) {
   timeout = Math.min(120000, Math.max(1, Number(timeout) || 60000));
   const diagnostic = createPreflightDiagnostics({ seconds });
@@ -725,16 +733,54 @@ export async function probeNativeVideoViaBrowser(cookies, {
         profileDir,
         { ...launchOptions, ...ctxOptions, timeout: Math.min(remaining(), 30000) },
       );
-      try {
-        ctx = await launchPersistent();
-      } catch (e) {
-        // 进程被强杀时 Chromium 会留下 SingletonLock，不清理这个号以后永远起不来
-        if (!/SingletonLock|ProcessSingleton|profile.*in use/i.test(String(e.message))) throw e;
-        const { rm } = await import('node:fs/promises');
-        for (const f of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
-          await rm(join(profileDir, f), { force: true, recursive: true }).catch(() => {});
+      /**
+       * ★ 代理隧道自检（2026-09-28 实测加的，与 generator.js 是同一处修复）。
+       *
+       * 事实：persistent context + 带 Basic 认证的 HTTP 代理有约 20% 的间歇导航失败，
+       * 报 `ERR_TUNNEL_CONNECTION_FAILED` / `ERR_EMPTY_RESPONSE`。证据（账号 429）：
+       *   · 失败**那一刻**用 curl 走同一代理仍 200 ⇒ 不是网络/代理故障，是浏览器侧
+       *   · `chromium.launch({proxy})` 6/6 成功，`launchPersistentContext({proxy})` 5/6
+       *   · 同 page 原地重试只救回一半，另一半**必须销毁重建 context** 才恢复
+       * 这就是「生成前只读预检偶发失败（页面未能加载）」的真身 ——
+       * 以前只当成"代理抖动"加了等待，其实抖动在浏览器侧。
+       *
+       * 自检放在装 route / addCookies **之前**：重建成本最低（不用重做任何配置）。
+       * 用 robots.txt + 随机 query：只验隧道通不通（404 也算过），
+       * 随机 query 是为了不命中持久 profile 的磁盘缓存（命中就等于没检）。
+       */
+      const tunnelOk = async (c) => {
+        let probe = null;
+        try {
+          probe = c.pages()[0] || await c.newPage();
+          await probe.goto(`https://www.dola.com/robots.txt?_tunnel=${Date.now()}`,
+            { waitUntil: 'commit', timeout: 10000 });
+          return true;
+        } catch {
+          return false;
+        } finally {
+          await probe?.close().catch(() => {});
         }
-        ctx = await launchPersistent();
+      };
+      const { rm } = await import('node:fs/promises');
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          ctx = await launchPersistent();
+        } catch (e) {
+          // 进程被强杀时 Chromium 会留下 SingletonLock，不清理这个号以后永远起不来
+          if (!/SingletonLock|ProcessSingleton|profile.*in use/i.test(String(e.message))) throw e;
+          for (const f of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+            await rm(join(profileDir, f), { force: true, recursive: true }).catch(() => {});
+          }
+          continue;
+        }
+        if (deadlineExpired) break;
+        if (await tunnelOk(ctx)) break;
+        console.warn(`[probe] 账号 #${accountId} 代理隧道自检未通过（第 ${attempt + 1}/3 次），销毁重建`);
+        await ctx.close().catch(() => {});
+        ctx = null;
+      }
+      if (!ctx) {
+        return { ok: false, state: 'unknown', error: '页面未能加载（代理隧道自检连续 3 次未通过，多半是出口问题）' };
       }
     } else {
       browser = await pw.chromium.launch({ ...launchOptions, timeout: Math.min(remaining(), 30000) });
@@ -782,7 +828,7 @@ export async function probeNativeVideoViaBrowser(cookies, {
     // from the visible composer controls below, not from zero open requests.
     await page.waitForLoadState('networkidle', { timeout: Math.min(remaining(), 5000) }).catch(() => {});
     const capability = await prepareNativeVideoComposer(page, {
-      seconds, model, timeout: remaining(), onPhase: diagnostic.mark, allowUpstreamConcat,
+      seconds, model, timeout: remaining(), onPhase: diagnostic.mark, allowUpstreamConcat, carriers, allowLegacy,
     });
     if (deadlineExpired) throw new Error('capability_probe_timeout');
     return { ok: true, state: 'available', pageLoaded: true, ...capability, diagnostic: diagnostic.snapshot() };
@@ -797,8 +843,8 @@ export async function probeNativeVideoViaBrowser(cookies, {
       // pageLoaded 是「登录未确认」可信度的前提：只有页面真打开了，
       // "创作输入框没出现"才能当成登录态的证据；页面压根没加载时它什么也证明不了。
       pageLoaded: navigated,
-      reason: deadlineExpired ? 'VIDEO_PREPARATION_TIMEOUT' : error?.reason || null,
-      diagnostic: diagnostic.snapshot(deadlineExpired ? 'VIDEO_PREPARATION_TIMEOUT' : error?.reason || 'VIDEO_PROBE_ERROR'),
+      reason: deadlineExpired ? 'VIDEO_PREPARATION_TIMEOUT' : (error?.reason || error?.code || null),
+      diagnostic: diagnostic.snapshot(deadlineExpired ? 'VIDEO_PREPARATION_TIMEOUT' : (error?.reason || error?.code || 'VIDEO_PROBE_ERROR')),
       error: ['NATIVE_CAPABILITY_UNAVAILABLE', 'NATIVE_CAPABILITY_UNKNOWN'].includes(error?.code)
         ? error.message
         : '页面、登录状态或网络未能完成只读能力探测',
@@ -828,6 +874,27 @@ export async function probeNativeFifteenSecondViaBrowser(cookies, options = {}) 
  * checks the real logged-in composer DOM for an explicit image file input so
  * the later upload path is based on observed page capability, not a guessed
  * private endpoint.
+ *
+ * ★ 2026-09-27 修复：本条链路曾经**漏掉了原生探测早已拿到的四项修复**，
+ *   结果在真实账号上 100% 失败（#429 实测 253.4 秒后返回 unknown）。
+ *
+ *   1. **不复用持久化 profile**（最致命）。原生探测有 `accountId` → 用
+ *      `launchPersistentContext` 命中 HTTP 缓存热启动（~0.36MB）；这里却一直
+ *      `browser.newContext()` 冷启动，每次拉 ~12MB。走 5Mbps 住宅静态 IP 时
+ *      光加载就 20 秒起，还没到「查 DOM」就已经超时。生产证据：`data/browser-profiles/`
+ *      里 10 个 profile 全是老号（408~424），**429 及之后一个都没有** —— 因为
+ *      原生探测会建、这条链路根本不会建。而唯一 `reference_image_state='available'`
+ *      的 #424，恰好是唯一有热 profile 的号。
+ *   2. **没有共享预算**。`goto` / `networkidle` / 能力探测各自吃满自己的 timeout，
+ *      整条链路没有一层收敛（见下）。
+ *   3. **`networkidle` 上限 90 秒**。原生探测明确写了「Streaming/telemetry can keep
+ *      the network busy forever」所以只给 5 秒；这里给 90 秒，而 dola 的聊天页
+ *      永远不会 idle ⇒ **每次都必然烧满**。
+ *   4. **导航异常被 `.catch(() => {})` 吞掉**，无法区分「页面没打开」和「没登录」，
+ *      于是坏掉的出口和失效的 cookie 会被混为一谈（原生链路踩过同一个坑，
+ *      provider.js 的导航段落有完整记录）。
+ *
+ *   移植后两条链路口径一致：同一份 profile、同一个预算时钟、同样的归因字段。
  */
 export async function probeReferenceImageViaBrowser(cookies, {
   headless = true,
@@ -835,7 +902,16 @@ export async function probeReferenceImageViaBrowser(cookies, {
   pageUrl = `${DOLA_BASE}/chat/`,
   proxy = undefined,
   proxyUrl = null,
+  accountId = null,
 } = {}) {
+  timeout = Math.min(120000, Math.max(1, Number(timeout) || 60000));
+  // ★ 诊断是必需的，不是锦上添花：这条链路历史上的失败文案是笼统的
+  //   「页面、登录状态或网络未能完成参考图能力探测」，把「网络在失败」「单纯慢」
+  //   「登录态没了」三件该修不同地方的事混成一句，导致长期无法定位。
+  //   `seconds` 传 null：参考图探测没有档位概念，只有 PHASES 里的阶段名。
+  const diagnostic = createPreflightDiagnostics({ seconds: null });
+  const deadline = Date.now() + timeout;
+  const remaining = () => Math.max(1, deadline - Date.now());
   if (!proxyUrl) {
     return { ok: false, state: 'unknown', error: '参考图能力探测必须使用账号已绑定的代理' };
   }
@@ -849,8 +925,19 @@ export async function probeReferenceImageViaBrowser(cookies, {
     args: ['--disable-blink-features=AutomationControlled', '--no-sandbox'],
   };
   let browser = null;
+  let ctx = null;
   let bridge = null;
+  let deadlineTimer = null;
+  let deadlineExpired = false;
+  // 必须声明在 try 之外：catch 分支要用它判断「页面到底有没有打开」。
+  let navError = null;
+  let navigated = false;
+  const releaseAccountBrowserLock = accountId == null ? null : tryAcquireAccountBrowserLock(accountId);
+  if (accountId != null && !releaseAccountBrowserLock) {
+    return { ok: false, state: 'unknown', error: '该账号浏览器正忙，未进行能力判定' };
+  }
   try {
+    launchOptions.executablePath = pw.chromium.executablePath();
     if (/^socks5h?:/i.test(proxyUrl)) {
       const { startSocksBridge } = await import('./socks-bridge.js');
       bridge = await startSocksBridge(proxyUrl);
@@ -861,42 +948,194 @@ export async function probeReferenceImageViaBrowser(cookies, {
       return { ok: false, state: 'unknown', error: '账号代理未能建立浏览器配置' };
     }
 
-    browser = await pw.chromium.launch(launchOptions);
-    const ctx = await browser.newContext({
+    // 整条只读探测共享一个截止时间，而不是每段导航各给一份（见上方 ★ 第 2 点）。
+    deadlineTimer = setTimeout(() => {
+      deadlineExpired = true;
+      void Promise.resolve(ctx?.close()).catch(() => {});
+      void browser?.close().catch(() => {});
+    }, remaining());
+
+    const ctxOptions = {
       serviceWorkers: 'block',
       viewport: { width: 1280, height: 900 },
       locale: 'zh-CN',
       userAgent: DOLA_HEADERS['user-agent'],
-    });
+    };
+    if (accountId) {
+      // 与原生探测共用同一个 profile 目录：登录态、HTTP 缓存、指纹都复用，
+      // 既热启动又少一次「新设备」风控暴露。
+      const { mkdir } = await import('node:fs/promises');
+      const { dirname, join } = await import('node:path');
+      const { fileURLToPath } = await import('node:url');
+      const profileDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'data', 'browser-profiles', String(accountId));
+      await mkdir(profileDir, { recursive: true });
+      const launchPersistent = () => pw.chromium.launchPersistentContext(
+        profileDir,
+        { ...launchOptions, ...ctxOptions, timeout: Math.min(remaining(), 30000) },
+      );
+      /**
+       * ★ 代理隧道自检（2026-09-28 实测加的，与 generator.js 是同一处修复）。
+       *
+       * 事实：persistent context + 带 Basic 认证的 HTTP 代理有约 20% 的间歇导航失败，
+       * 报 `ERR_TUNNEL_CONNECTION_FAILED` / `ERR_EMPTY_RESPONSE`。证据（账号 429）：
+       *   · 失败**那一刻**用 curl 走同一代理仍 200 ⇒ 不是网络/代理故障，是浏览器侧
+       *   · `chromium.launch({proxy})` 6/6 成功，`launchPersistentContext({proxy})` 5/6
+       *   · 同 page 原地重试只救回一半，另一半**必须销毁重建 context** 才恢复
+       * 这就是「生成前只读预检偶发失败（页面未能加载）」的真身 ——
+       * 以前只当成"代理抖动"加了等待，其实抖动在浏览器侧。
+       *
+       * 自检放在装 route / addCookies **之前**：重建成本最低（不用重做任何配置）。
+       * 用 robots.txt + 随机 query：只验隧道通不通（404 也算过），
+       * 随机 query 是为了不命中持久 profile 的磁盘缓存（命中就等于没检）。
+       */
+      const tunnelOk = async (c) => {
+        let probe = null;
+        try {
+          probe = c.pages()[0] || await c.newPage();
+          await probe.goto(`https://www.dola.com/robots.txt?_tunnel=${Date.now()}`,
+            { waitUntil: 'commit', timeout: 10000 });
+          return true;
+        } catch {
+          return false;
+        } finally {
+          await probe?.close().catch(() => {});
+        }
+      };
+      const { rm } = await import('node:fs/promises');
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          ctx = await launchPersistent();
+        } catch (e) {
+          // 进程被强杀时 Chromium 会留下 SingletonLock，不清理这个号以后永远起不来
+          if (!/SingletonLock|ProcessSingleton|profile.*in use/i.test(String(e.message))) throw e;
+          for (const f of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+            await rm(join(profileDir, f), { force: true, recursive: true }).catch(() => {});
+          }
+          continue;
+        }
+        if (deadlineExpired) break;
+        if (await tunnelOk(ctx)) break;
+        console.warn(`[probe] 账号 #${accountId} 代理隧道自检未通过（第 ${attempt + 1}/3 次），销毁重建`);
+        await ctx.close().catch(() => {});
+        ctx = null;
+      }
+      if (!ctx) {
+        return { ok: false, state: 'unknown', error: '页面未能加载（代理隧道自检连续 3 次未通过，多半是出口问题）' };
+      }
+    } else {
+      browser = await pw.chromium.launch({ ...launchOptions, timeout: Math.min(remaining(), 30000) });
+      ctx = await browser.newContext(ctxOptions);
+    }
+    if (deadlineExpired) throw new Error('reference_image_probe_timeout');
+    diagnostic.mark('context');
     await ctx.route('**/passport/**/logout**', route => route.abort());
 
     const cookieList = toPlaywrightCookies(cookies);
     if (!cookieList.length) {
-      await ctx.close().catch(() => {});
       return { ok: false, state: 'unknown', error: '账号没有可用 cookie，未进行能力判定' };
     }
     await ctx.addCookies(cookieList);
     const page = await ctx.newPage();
+    diagnostic.attach(page);
     observeVideoComposerBootstrap(page);
     await ctx.route('**/chat/**', route => route.request().method() === 'POST' ? route.abort() : route.continue());
-    await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout }).catch(() => {});
-    await page.waitForLoadState('networkidle', { timeout: Math.min(timeout + 15000, 90000) }).catch(() => {});
+    diagnostic.mark('navigate');
+    // 导航异常必须留住：吞掉它就分不清「代理/网络坏了」和「cookie 失效了」。
+    await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: Math.min(remaining(), 60000) })
+      .catch((e) => { navError = e; });
+    if (navError && !deadlineExpired) {
+      // ⚠️ 这里是 `try` 内的**提前 return**，不走下面的 catch —— 所以必须自己记日志。
+      //    曾经漏掉，结果是「代理连不上」这条最该留痕的路径反而一条日志都没有。
+      const navDiagnostic = diagnostic.snapshot('REFERENCE_IMAGE_NAVIGATION_FAILED');
+      try {
+        console.error('[probe] reference-image probe failed: code=nav reason=REFERENCE_IMAGE_NAVIGATION_FAILED '
+          + `message=${String(navError?.message || navError).replace(/\s+/g, ' ').slice(0, 200)} `
+          + `diagnostic=${JSON.stringify(navDiagnostic)}`);
+      } catch { /* 日志不能影响探测返回 */ }
+      return {
+        ok: false, state: 'unknown', pageLoaded: false,
+        reason: 'REFERENCE_IMAGE_NAVIGATION_FAILED',
+        diagnostic: navDiagnostic,
+        error: `页面未能加载（代理或网络故障），未做能力判定：${String(navError?.message || navError).replace(/\s+/g, ' ').slice(0, 160)}`,
+      };
+    }
+    navigated = true;
+    // ⚠️ 上限 5 秒，与原生探测同口径：聊天页有常驻流式/遥测请求，
+    //    `networkidle` 永远不会触发，给 90 秒就等于每次白烧 90 秒。
+    //    页面就绪与否由下面的可见控件决定，不由「零未完成请求」决定。
+    await page.waitForLoadState('networkidle', { timeout: Math.min(remaining(), 5000) }).catch(() => {});
     await page.getByRole('button', { name: '我知道了' }).click({ timeout: 3000 }).catch(() => {});
-    const capability = await prepareReferenceImageComposer(page, { timeout });
-    await ctx.close().catch(() => {});
-    return { ok: true, state: 'available', ...capability };
+    diagnostic.mark('entry');
+    const capability = await prepareReferenceImageComposer(page, { deadline, log: () => {}, onPhase: diagnostic.mark });
+    diagnostic.mark('verified');
+    // 不在这里 close：上下文统一由 finally 关，避免同一次探测关两遍。
+    return { ok: true, state: 'available', pageLoaded: true, ...capability };
   } catch (error) {
+    /**
+     * ★ 结构化原因的三级兜底：超时 > error.reason > error.code。
+     *
+     * 原来这里是 `error?.reason || null` —— 只要能力层漏传就退化成 null，
+     * 于是一路变成「无原因」。2026-09-27 实测：#436 撞在没带 reason 的
+     * 「页面没有发现明确的图片文件控件」上，后台只看到一句通用文案，
+     * 完全不知道是「没有 file input」还是「网络没通」。
+     * 退回 `error.code` 至少还能区分 NATIVE_CAPABILITY_UNKNOWN / ENOENT / TimeoutError。
+     */
+    const reasonCode = deadlineExpired
+      ? 'REFERENCE_IMAGE_PREPARATION_TIMEOUT'
+      : (error?.reason || error?.code || null);
+    /**
+     * ★ 文案必须从**同一个** `reasonCode` 派生，不能各自判断。
+     *
+     * 曾经这里用 `error?.reason === 'VIDEO_PAGE_NOT_READY'` 选文案、却用
+     * `deadlineExpired` 选 reason，两者会在「等创作输入框正好耗尽共享预算」时打架：
+     * 2026-09-27 实测 #449 / #451 的备注写「创作输入框未出现（登录态或页面结构不符）」，
+     * 而原因标的是 `［REFERENCE_IMAGE_PREPARATION_TIMEOUT］` —— 一个说「登录态没了」、
+     * 一个说「页面太慢」，指向的修法完全相反，排障时只能二选一瞎猜。
+     *
+     * 现在超时优先：真是预算耗尽，就老实说预算耗尽（并提示可能是登录态或网络慢），
+     * 不要假装已经判定出「输入框不会出现」。
+     */
+    const failureMessage = (() => {
+      if (error?.code === 'NATIVE_CAPABILITY_UNAVAILABLE') return error.message;
+      if (reasonCode === 'REFERENCE_IMAGE_PREPARATION_TIMEOUT') {
+        return '页面准备超过总时限（登录态或网络过慢），未完成参考图能力探测';
+      }
+      if (reasonCode === 'VIDEO_PAGE_NOT_READY') {
+        return '页面已加载但创作输入框未出现（登录态或页面结构不符），未完成参考图能力探测';
+      }
+      if (error?.code === 'NATIVE_CAPABILITY_UNKNOWN') {
+        // 能力层已经给出了具体原因（如「页面没有发现明确的图片文件控件」）。
+        // 这句比笼统兜底文案有用得多，`［reason］` 会由路由层追加在后面。
+        // ⚠️ 刻意**不**要求 reason 存在：恰恰在 reason 漏传时，这句 message
+        //    是唯一还能看出「到底哪里不对」的线索（2026-09-27 #436 的教训）。
+        return String(error.message).slice(0, 180);
+      }
+      return '页面、登录状态或网络未能完成参考图能力探测';
+    })();
+    // 失败必须留痕：把「真实异常 + 分阶段耗时 + 失败/错误请求数」打出来，
+    // 否则永远只能看到一句笼统文案（2026-09-27 之前的实际状况）。
+    try {
+      console.error('[probe] reference-image probe failed: '
+        + `code=${error?.code || 'none'} reason=${reasonCode} `
+        + `message=${String(error?.message || error).slice(0, 200)} `
+        + `diagnostic=${JSON.stringify(diagnostic.snapshot(reasonCode === null ? 'REFERENCE_IMAGE_PROBE_ERROR' : reasonCode))}`);
+    } catch { /* 日志不能影响探测返回 */ }
     return {
       ok: false,
       state: referenceImageCapabilityState(error),
-      error: error?.code === 'NATIVE_CAPABILITY_UNAVAILABLE'
-        ? error.message
-        : '页面、登录状态或网络未能完成参考图能力探测',
+      pageLoaded: navigated,
+      reason: reasonCode,
+      diagnostic: diagnostic.snapshot(reasonCode === null ? 'REFERENCE_IMAGE_PROBE_ERROR' : reasonCode),
+      error: failureMessage,
       controls: error?.controls || undefined,
     };
   } finally {
+    diagnostic.dispose();
+    clearTimeout(deadlineTimer);
+    await ctx?.close().catch(() => {});
     await browser?.close().catch(() => {});
     await bridge?.close().catch(() => {});
+    releaseAccountBrowserLock?.();
   }
 }
 

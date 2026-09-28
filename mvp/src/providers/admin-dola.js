@@ -27,7 +27,10 @@ const GEN_STATUS_MAP = {
   failed: Status.FAILED,
   cancelled: Status.FAILED,
 };
-const SUPPORTED_SECONDS = Object.freeze([10, 15, 20, 30]);
+// 档位精简（2026-09-27）：10 秒与 20 秒已下线，只剩 15（专家模式）与 30（主档位）。
+const SUPPORTED_SECONDS = Object.freeze([15, 30]);
+/** 已下线档位：只用于给出更明确的报错，不做任何静默降级。 */
+const RETIRED_SECONDS = Object.freeze([10, 20]);
 
 export class AdminDolaProvider {
   /**
@@ -87,6 +90,12 @@ export class AdminDolaProvider {
     if (!prompt || !String(prompt).trim()) throw new VideoProviderError('prompt 不能为空');
     if (String(prompt).length > 12000) throw new VideoProviderError('prompt 超过 12000 字上限');
     const requestedSeconds = Number(seconds);
+    if (RETIRED_SECONDS.includes(Number(seconds))) {
+      throw Object.assign(
+        new VideoProviderError(`${seconds} 秒档位已下线，当前工作台仅支持 15 秒（专家模式）或 30 秒`),
+        { status: 400, code: 'DURATION_RETIRED' },
+      );
+    }
     if (!Number.isInteger(requestedSeconds) || !SUPPORTED_SECONDS.includes(requestedSeconds)) {
       throw new VideoProviderError(`当前工作台支持 ${SUPPORTED_SECONDS.join('、')} 秒视频（收到 ${seconds}）`);
     }

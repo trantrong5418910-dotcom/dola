@@ -342,3 +342,78 @@
    所以走这条路径时适配器**只观察不改写**，先收证据再决定要不要动。
 3. 2026-09-25 的实测记录里，至少有一个真实账号的时长菜单只有 `5s / 10s`（免费号额度用完的样子）——
    连 15s 都没有。上游合成档位能不能出现，取决于账号，不取决于我们的代码。
+
+---
+
+## 2026-09-26 30 秒死锁修复并上线（载体口径可配 + 两道默认不变量）
+
+### 要解决的问题
+
+30 秒在这套系统里**永久不可达**，而且跟「上游到底收不收 30 秒」无关：
+
+```
+请求 30s
+  → candidates()            :328  要求 native_30s_state === 'available'
+  → preflightGenerationAccount :686 同样要求
+  → generationRouteView    :2022 排除原因也写这句
+  → 三个门禁的字段只由 native-30s-probe 写
+  → isVerifiedNativeCapability(30) 只认「页面有原生 15 秒档位」
+  → 服务端 /alice/slot/action_bar_v3/get_item_conf 的 video-duration
+    option_list 实测只有 {5} 和 {10}（三个模型重看三次一致）
+  ⇒ 15s 在配置层面不存在 ⇒ 探针永远 unknown ⇒ 三处门禁永远拒绝
+```
+
+`uiCarrierSeconds(30)` 硬编码返回 `15`，于是连「选一个存在的档位当载体」也做不到。
+
+### 代码改动（`generation-duration.js` / `generation-policy.js` / `generator.js` / `routes/dola.js`）
+
+1. **载体映射可配**：新增 `dola_duration_carrier_map`（JSON，如 `{"20":10,"30":10}`）+
+   `parseDurationCarrierMap()` / `resolveDurationCarrierMap()`。显式配置 > 开关默认 > 历史口径。
+   解析失败一律静默回落内置默认（生成链路不该因为一个手写 JSON 挂掉）。
+2. **判定放开**：`isVerifiedNativeCapability(result, seconds, { allowCarrierRewrite })`。
+   `allowCarrierRewrite` 默认 `false` = **旧口径原样保留**；打开后 30 秒接受「任何真实存在、
+   数值型、严格短于目标的档位」。20 秒分支一行未动。
+3. **三处硬门禁挂开关**：新增 `dola_allow_30s_rewrite`（默认 `false`）。
+   `candidates():328`、`preflightGenerationAccount():686`、`generationRouteView():2022`
+   全部改成 `!allow30sRewrite() && ...`。**默认关 ⇒ 上线本身不改变任何线上行为。**
+4. **载体同源**：`carriers` 从 `generator.js` 一路透传到 `native-capability.js` → `provider.js` →
+   `selectNativeVideoDuration()`，探测与生成用同一个值，避免"探针说 10s 载体、生成去找 15s"。
+5. **设置入口校验**：`settings.js` 新增 `validateDurationCarrierSettings()`（纯函数，可单测），
+   复用同一个解析器做真相来源 —— 凡是解析器会丢掉的输入，在入口直接 400，不让它静默回落。
+6. **诊断可见**：`generationRouteView()` 回显 `allow30sRewrite` / `upstreamConcatEnabled` / `carrierMap`，
+   排障时不用翻 settings 表。30 秒池空时的兜底文案也随之区分开关开/关两种说法。
+
+### 为什么不担心"放开后交付错时长"
+
+验收口子在**出口**而不是入口：归档阶段 `validateArchivedVideo()` 用 ffprobe 量真实时长，
+差 > 1.5 秒判 `duration_mismatch` → `fail()` → `settleFailedVideoRefund()` 自动退款。
+最坏情况是「诚实报错 + 自动退款」，不会把 10 秒片子当 30 秒交付。
+
+### 本轮验证
+
+- 全量生成可靠性套件 **534 通过 / 0 失败**（新增 `test/settings-duration-switch.mjs` 3 例、
+  `generation-duration.mjs` 新增载体映射 4 例、`generation-policy.mjs` 新增口径 1 例、
+  `generator-isolated.mjs` 新增开关 2 例）。
+- `scripts/check-native-duration-offline.mjs` **12/12 通过**（本地与生产机各跑一次）。
+  这个脚本此前**从加入起就一直红**（用例表停在"20/30 秒必须有原生档位"的年代），已按载体契约重写。
+- 生产上线后实测 `/api/dola/route`：
+  `seconds=30` 从「0 个可选账号」变为 **4 个可选**；`seconds=10/15/20` 与改动前逐字一致。
+- 生产 DB `settings` 由 48 行变 50 行，`frontend_url` 未被启动迁移改动。
+
+### 仍未证明的事（不要越界宣称）
+
+1. **上游到底接不接受 `duration=30`、并交出 30 秒成片 —— 仍未验证。**
+   全库历史 30 秒任务（#103–#121）**全部 failed、成片时长为 null**，失败原因集中在
+   能力门禁与上游限流（710022002），也就是说**从来没有一个 30 秒请求真正发出去过**。
+   本轮的修复让请求**能发出去**了，答案要等第一次真实生成。
+2. 若上游接受请求但返回 10 秒成片，表现是任务失败 + 退款，且**该账号当天额度已被消耗**
+   （Dola 按"次"计费，10 秒和 30 秒上游成本相同）。
+3. 15 秒仍然要求原生能力确认，本轮**没有**动（它的门禁是 `native_15s_state`，与 30 秒路径无关）。
+4. `dola_upstream_concat` 仍为 `false`：参考站那条"催上游拆两段"的路径没有独立证据，
+   而且当前页面根本没有合成档位。
+
+### 回滚
+
+- 代码：`/www/backup/dola-30s-fix-20260925-202552/`（改动前 8 个文件）。
+- 行为：把 `dola_allow_30s_rewrite` 改回 `false` 即刻回到改动前口径（不需要回滚代码）。
+- 进程：`PM2_HOME=/root/.pm2 pm2 restart dola-admin --update-env`（PM2 id 0，cwd `admin/`）。

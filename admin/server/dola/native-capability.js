@@ -1,9 +1,31 @@
 import { selectSeedance } from './generation-model.js';
 import { NATIVE_DURATION_CONTROL_SELECTOR, selectNativeVideoDuration } from './generation-duration.js';
+import { SUPPORTED_VIDEO_SECONDS } from './generation-policy.js';
 import { waitForVideoComposerBootstrap } from './composer-bootstrap.js';
+// Expert mode is a real composer state, not a gateway-only flag.  Keep the
+// helper exported from this capability module so callers that already import
+// the native composer probes use one stable entry point.
+export { ensureExpertMode, EXPERT_MODE_UNCONFIRMED } from './generation-mode.js';
 
 export const VIDEO_COMPOSER_INPUT_SELECTOR = 'textarea, [contenteditable="true"], [role="textbox"]';
 
+/**
+ * 造一个「能力未知」错误。
+ *
+ * ★ `reason` 是**必填的语义**，不是可选装饰：调用方（`provider.js` 的 catch、
+ *   `routes/dola.js` 的写回）都是按 `error.reason` 决定：
+ *     ① 账号备注里带不带 `［结构化原因］`；
+ *     ② 诊断日志里能不能分清「网络没通 / 页面慢到超时 / 登录态没了 / DOM 变了」。
+ *
+ *   漏传的后果非常隐蔽（2026-09-27 实测账号 #436）：
+ *   `reason` 为空 → provider 返回 `reason: null` → 路由层只能拼出一句通用文案
+ *   「页面、登录状态或网络未能完成参考图能力探测」→ 管理后台**看不到任何原因**，
+ *   而真正有用的信息（到底有没有文件控件、是不是图片类型）全被丢掉。
+ *   同一天 #430 因为在别处带了 reason，备注就能显示 `［VIDEO_PAGE_NOT_READY］`。
+ *
+ *   所以：**新增任何 throw 点都必须给 reason**。`test/reference-image-probe.mjs`
+ *   里有一条静态守卫会扫描本文件，漏传直接变红。
+ */
 function unknownCapability(label, detail, reason = '') {
   const error = new Error(`${label}能力探测未完成：${detail}`);
   error.code = 'NATIVE_CAPABILITY_UNKNOWN';
@@ -127,7 +149,9 @@ async function openVideoComposerEntry(page, {
     throw unknownCapability(label, '页面没有可见的视频生成入口（未能打开创作条时长控件）', 'VIDEO_ENTRY_NOT_READY');
   }
   await page.waitForSelector(VIDEO_COMPOSER_INPUT_SELECTOR, { timeout: remaining() }).catch(() => {
-    throw unknownCapability(label, '视频创作面板未完成加载');
+    // 时长控件已经可见、创作输入框却等不到 —— 和「入口没打开」是两件事，
+    // 给独立 reason，否则排障时只能看到一句通用文案。
+    throw unknownCapability(label, '视频创作面板未完成加载', 'VIDEO_PANEL_NOT_READY');
   });
 }
 
@@ -139,6 +163,11 @@ async function openVideoComposerEntry(page, {
  * `allowUpstreamConcat` 决定是否把页面自己的合成档位（`30s (15s ×2)`）也算作
  * 一种可用证据。默认关闭；开启后返回的 `source` 会标成 `upstream_concat`，
  * 调用方据此关闭请求改写（合成档位本身就是目标时长，不该再被改写）。
+ *
+ * `carriers` 是本次生效的载体映射（见 generation-duration.js 的
+ * `resolveDurationCarrierMap`）。**不传 = 历史口径**（20→10s、30→15s）；
+ * 传 `{30: 10}` 才是"30 秒用页面上真实存在的 10s 档承载"。
+ * 探测与生成两条路径必须传同一份映射，否则会出现"探针说可用、生成选不到档位"。
  */
 export async function prepareNativeVideoComposer(page, {
   seconds = 30,
@@ -148,8 +177,13 @@ export async function prepareNativeVideoComposer(page, {
   log = () => {},
   onPhase = () => {},
   allowUpstreamConcat = false,
+  carriers = null,
+  allowLegacy = false,
 } = {}) {
-  if (![10, 15, 20, 30].includes(Number(seconds))) throw new TypeError('seconds must be 10, 15, 20 or 30');
+  // allowLegacy=true：历史防护解锁探针专用，放行 10/20 这些已下线档位（见 LEGACY_DURATION_CHOICES）。
+  if (!allowLegacy && !SUPPORTED_VIDEO_SECONDS.includes(Number(seconds))) {
+    throw new TypeError('seconds must be 15 or 30');
+  }
   if (!['seedance_v2.0', 'seedance_v2.5'].includes(model)) throw new TypeError('unsupported Seedance model');
   const targetSeconds = Number(seconds);
   const remaining = preparationBudget(timeout, `原生 ${targetSeconds} 秒`);
@@ -163,29 +197,49 @@ export async function prepareNativeVideoComposer(page, {
 
   log('只读打开视频创作控件');
   try {
-    await openVideoComposerEntry(page, { timeout: remaining(), clickDelayMs, log, label: `原生 ${targetSeconds} 秒`, onPhase });
+    // 入口点击本身的预算是**有上限**的：不能让它把整条准备预算吃光，
+    // 否则后面的模型/时长控件就没有余量了（曾经是 remaining() 全给）。
+    await openVideoComposerEntry(page, {
+      timeout: Math.min(remaining(), 45000), clickDelayMs, log, label: `原生 ${targetSeconds} 秒`, onPhase,
+    });
   } catch (error) {
     if (error?.code === 'NATIVE_CAPABILITY_UNKNOWN' || error?.code === 'NATIVE_CAPABILITY_UNAVAILABLE') throw error;
-    throw unknown(targetSeconds, error?.message || '页面没有可见的视频生成入口');
+    throw unknown(targetSeconds, error?.message || '页面没有可见的视频生成入口', 'VIDEO_ENTRY_NOT_READY');
   }
 
+  /**
+   * ★ 控件水合顺序（2026-09-26 实测，账号 #424 经住宅代理）：
+   *
+   *   点击「视频生成」→ +3.0s 时长控件可见 → **+6.0s 模型控件才可见**
+   *
+   * 也就是说**模型控件是最后水合的**。而这里原先给它和时长控件各写死 15 秒，
+   * 在慢代理下（页面启动实测 19.5s ~ 70.8s 波动）经常不够，表现为
+   * 「模型控件未加载完成或存在多个可见控件」（MODEL_CONTROL_NOT_READY）。
+   * 线上任务 #163 就是这么失败的。
+   *
+   * 现在按角色分配剩余预算：模型控件拿大头（它最晚），时长控件拿剩下的。
+   * 注意不是"等更久"——`remaining()` 仍然兜住总时限，超了照样抛
+   * VIDEO_PREPARATION_TIMEOUT，只是把余量给对了地方。
+   */
   try {
     reportPhase(onPhase, 'model');
-    await selectSeedance(page, model, { timeout: Math.min(remaining(), 15000) });
+    await selectSeedance(page, model, { timeout: Math.min(remaining(), 40000) });
   } catch (error) {
     if (['NATIVE_CAPABILITY_UNAVAILABLE', 'NATIVE_CAPABILITY_UNKNOWN'].includes(error?.code)) throw error;
-    throw unknown(targetSeconds, '页面模型控件未完成加载');
+    throw unknown(targetSeconds, '页面模型控件未完成加载', 'VIDEO_MODEL_CONTROL_NOT_READY');
   }
   let duration;
   try {
     reportPhase(onPhase, 'duration');
     duration = await selectNativeVideoDuration(page, targetSeconds, {
-      timeout: Math.min(remaining(), 15000),
+      timeout: Math.min(remaining(), 30000),
       allowUpstreamConcat,
+      carriers,
+      allowLegacy,
     });
   } catch (error) {
     if (['NATIVE_CAPABILITY_UNAVAILABLE', 'NATIVE_CAPABILITY_UNKNOWN'].includes(error?.code)) throw error;
-    throw unknown(targetSeconds, '页面时长控件未完成加载');
+    throw unknown(targetSeconds, '页面时长控件未完成加载', 'VIDEO_DURATION_CONTROL_NOT_READY');
   }
   remaining();
   reportPhase(onPhase, 'verified');
@@ -215,21 +269,52 @@ export async function prepareNativeThirtySecondComposer(page, options = {}) {
  */
 export async function prepareReferenceImageComposer(page, {
   timeout = 60000,
+  /**
+   * ★ 可选：与调用方**共享**的绝对截止时间戳（`Date.now()` 口径）。
+   *
+   * 为什么必须支持这个：原来这里只收 `timeout`，而 `timeout` 被**两处各自用满**
+   * —— `waitForSelector` 用一次，`openVideoComposerEntry` 再用一次（后者内部还会
+   * 自己 `preparationBudget(timeout)` 另开一个时钟）。于是"60 秒预算"实际可以跑出
+   * 120 秒以上，整条探测链路没有任何一层收敛。2026-09-27 实测账号 #429 的参考图探测
+   * 跑了 **253.4 秒**才失败，恰好等于各层超时上限之和（60+75+3+60+60≈258 秒）。
+   *
+   * 传了 `deadline` 就只认它，所有等待都从同一个时钟里扣（与
+   * `prepareNativeVideoComposer` 的 `remaining()` 同口径）。
+   */
+  deadline = null,
   clickDelayMs = 2500,
   log = () => {},
+  /**
+   * 与 `prepareNativeVideoComposer` 同口径的阶段回调。**必须传下去**：
+   * `openVideoComposerEntry` 内部是「等启动配置 → 点入口 → 等时长控件」三段，
+   * 不细分就只能看到 entry 一整个阶段的总耗时。2026-09-27 实测 #429 的 entry
+   * 阶段单吃 52 秒，正因为没有细粒度回调，无法判断到底卡在哪一段。
+   */
+  onPhase = () => {},
 } = {}) {
+  const budget = deadline
+    ? () => {
+      const left = deadline - Date.now();
+      if (left <= 0) throw unknownCapability('参考图', '页面准备超过总时限', 'VIDEO_PREPARATION_TIMEOUT');
+      return left;
+    }
+    : preparationBudget(timeout, '参考图');
   try {
-    await page.waitForSelector(VIDEO_COMPOSER_INPUT_SELECTOR, { timeout });
+    await page.waitForSelector(VIDEO_COMPOSER_INPUT_SELECTOR, { timeout: budget() });
   } catch {
-    throw unknownCapability('参考图', '未确认已登录的创作页面');
+    throw unknownCapability('参考图', '未确认已登录的创作页面', 'VIDEO_PAGE_NOT_READY');
   }
 
   log('只读打开视频创作控件，检查参考图上传入口');
   try {
-    await openVideoComposerEntry(page, { timeout, clickDelayMs, log, label: '参考图' });
+    // 入口点击的预算是**有上限**的：不能让它把整条准备预算吃光，否则后面
+    // 检查 DOM 的余量就没有了（曾经是把 timeout 全给，见上方 deadline 注释）。
+    await openVideoComposerEntry(page, {
+      timeout: Math.min(budget(), 45000), clickDelayMs, log, label: '参考图', onPhase,
+    });
   } catch (error) {
     if (error?.code === 'NATIVE_CAPABILITY_UNKNOWN' || error?.code === 'NATIVE_CAPABILITY_UNAVAILABLE') throw error;
-    throw unknownCapability('参考图', error?.message || '页面没有可见的视频生成入口');
+    throw unknownCapability('参考图', error?.message || '页面没有可见的视频生成入口', 'VIDEO_ENTRY_NOT_READY');
   }
 
   const controls = await page.evaluate(() => {
@@ -252,7 +337,21 @@ export async function prepareReferenceImageComposer(page, {
     const detail = controls.fileInputs
       ? `页面有 ${controls.fileInputs} 个文件控件，但没有明确声明图片类型`
       : '页面没有发现明确的图片文件控件';
-    const error = unknownCapability('参考图', `${detail}；暂不放开上传`);
+    /**
+     * ★ 这两种情况必须给**不同**的 reason（2026-09-27 实测账号 #436 栽在这里）。
+     *
+     * 它们的含义完全相反，修法也完全不同：
+     *   · 有 input[type=file] 但 accept 不声明图片 → **DOM 结构变了**，
+     *     要去看 `controls`（fileInputs / labels）重新对选择器；
+     *   · 一个 file input 都没有 → 这个号/这个页面**真的没有上传入口**，
+     *     应该判 unavailable，而不是继续当 unknown 反复烧 80 秒预算。
+     *
+     * 之前这两种共用一句「暂不放开上传」且**没带 reason**，于是：
+     * provider 返回 reason=null → 路由只写出一句通用文案 → 后台看不到任何原因，
+     * 唯一能区分的证据只有 `controls`，而它从来没被写进备注。
+     */
+    const error = unknownCapability('参考图', `${detail}；暂不放开上传`,
+      controls.fileInputs ? 'REFERENCE_IMAGE_CONTROL_UNSPECIFIED' : 'REFERENCE_IMAGE_CONTROL_MISSING');
     error.controls = controls;
     throw error;
   }

@@ -55,3 +55,20 @@ test('click timeout stays uncertain and never triggers a second send', async () 
   await assert.rejects(fillAndSubmitVideoPrompt(h.page, 'synthetic prompt'), e => e.code === 'GENERATION_SUBMISSION_UNCERTAIN');
   assert.equal(h.calls.filter(([call]) => call === 'click').length, 1);
 });
+
+test('missing conversation URL after a completed click is observation uncertainty, not proof of non-submission', async () => {
+  const h = fixture();
+  const result = await fillAndSubmitVideoPrompt(h.page, 'synthetic prompt');
+  assert.equal(result.sendActionCompleted, true);
+  assert.equal(result.conversationLocated, false);
+  assert.equal(result.observationPhase, 'after_click');
+  assert.equal(h.calls.filter(([call]) => call === 'click').length, 1);
+});
+
+test('page closure after click preserves uncertainty instead of a pre-send failure', async () => {
+  const h = fixture();
+  h.page.waitForTimeout = async () => { throw Error('page closed'); };
+  await assert.rejects(fillAndSubmitVideoPrompt(h.page, 'synthetic prompt'),
+    error => error.code === 'GENERATION_SUBMISSION_UNCERTAIN');
+  assert.equal(h.calls.filter(([call]) => call === 'click').length, 1);
+});

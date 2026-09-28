@@ -41,7 +41,15 @@ export async function saveReferenceImages(taskId, inspectedImages) {
   const paths = [];
   for (const [index, image] of inspectedImages.entries()) {
     const ext = image.mime === 'image/jpeg' ? '.jpg' : '.png';
-    const base = safeSegment(image.filename.replace(/\.[^.]+$/, ''), `image-${index}`);
+    // ★ 先剥掉源文件名里已有的「两位序号 + 横杠」前缀，再拼本次的序号。
+    //   为什么必须剥：复用原任务参考图（失败任务「重新提交」）时，源文件名本身就是
+    //   下面这行生成的 `00-xxx.png`，不剥就会落成 `00-00-xxx.png`；而「重新提交」可以
+    //   反复嵌套，前缀会一层层叠上去（00-00-00-…），文件名越来越难认。
+    //   只匹配 `^\d{2}-`（落盘格式就是 padStart(2,'0')），不误伤 `2026-xx.png` 这类真名。
+    const base = safeSegment(
+      image.filename.replace(/\.[^.]+$/, '').replace(/^\d{2}-/, ''),
+      `image-${index}`,
+    );
     const filename = `${String(index).padStart(2, '0')}-${base}${ext}`;
     const dest = path.join(dir, filename);
     if (!dest.startsWith(dir + path.sep)) {

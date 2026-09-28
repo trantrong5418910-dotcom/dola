@@ -184,26 +184,39 @@ export async function ensureReferenceThumb(taskId, name, srcPath) {
   } catch {
     return null;
   }
+  return (await renderThumbJpeg(srcPath, dest)) ? dest : null;
+}
+
+/**
+ * 把 srcPath 缩成 size 像素的 JPEG 写到 destPath。成功 true，失败 false（调用方回退原图）。
+ *
+ * 抽出来是因为**两处**要用同一套 ImageMagick 参数，坑只该踩一遍：
+ *   · 本文件 —— 任务暂存参考图，缩略图落在任务目录的 `.thumbs/`
+ *   · reference-library.js —— 参考图库，缩略图按 sha256 落在库根的 `.thumbs/`
+ * 两边都遇到「为一小块展示位送 4MB 原图」的同一个问题（图库选择器 14 张 = 57MB，
+ * 点一下要等 10 秒，看起来就像坏了）。
+ */
+export async function renderThumbJpeg(srcPath, destPath, size = REFERENCE_THUMB_SIZE) {
   // 先写临时文件再 rename：并发请求同一张图时，谁都不会读到写了一半的文件。
-  const tmp = `${dest}.${process.pid}.${Date.now()}.tmp`;
+  const tmp = `${destPath}.${process.pid}.${Date.now()}.tmp`;
   // `-thumbnail 256x256>` 的 `>` 是「只缩不放」，避免小图被拉大成糊图加大体积；
   // `jpg:` 前缀强制按 JPEG 输出 —— 否则 ImageMagick 会按 .tmp 后缀猜格式而报错。
   // `-strip` 去掉 EXIF/ICC，体积更小，也顺带不给他人留拍摄信息。
-  const args = ['-auto-orient', '-thumbnail', `${REFERENCE_THUMB_SIZE}x${REFERENCE_THUMB_SIZE}>`,
+  const args = ['-auto-orient', '-thumbnail', `${size}x${size}>`,
     '-strip', '-quality', '82', `jpg:${tmp}`];
   // IM7 的正名是 magick，IM6 只有 convert；两种环境都可能遇到，挨个试。
   for (const bin of ['magick', 'convert']) {
     try {
       await run(bin, [srcPath, ...args], { timeout: 20000, maxBuffer: 4 * 1024 * 1024 });
-      await fs.rename(tmp, dest);
-      return dest;
+      await fs.rename(tmp, destPath);
+      return true;
     } catch (error) {
       if (error?.code === 'ENOENT') continue;   // 这个二进制不存在 → 试下一个
       break;                                     // 别的错（超时/图片损坏）→ 直接放弃
     }
   }
   await fs.rm(tmp, { force: true }).catch(() => {});
-  return null;
+  return false;
 }
 
 /**

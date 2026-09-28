@@ -716,8 +716,22 @@
    * 「参考图片」框里的一行：缩略图 + 名字 + 体积 + 移除。
    * ★ 缩略图用 `object-fit: contain` —— 完整比例、**不裁切**（2026-09-29 工单 P2）。
    *   原来是纯文件名堆叠，6 张图分不清谁是谁；改成缩略图后一眼能认。
+   *
+   * ★ 展示名用「图N」而不是真实文件名（2026-09-29 飞哥反馈）：图库取回的图名是
+   *   64 位 sha256（`2664ea54…930f.png`），一列排下来既占地方又完全认不出是哪张。
+   *   真实文件名**不丢**，挪到悬停提示与 aria-label 里 —— 要看「这到底是哪个文件」
+   *   仍然拿得到，只是不再占版面。
+   *
+   * ⚠️ 序号只是**展示用**，不要拿它当身份：删掉第 2 张后第 3 张会变成「图2」。
+   *   提示词里的 `@[…]` 标记因此仍按**文件名**派生（见 mentionLabel / mentionLinks），
+   *   那是稳定标识，改成序号会让「删标记同步删图」删错图。
+   *
+   * @param {File} file
+   * @param {Function} onRemove
+   * @param {string} label 展示名，由调用方按当前列表顺序给出（如「图1」）
    */
-  function refItemNode(file, onRemove) {
+  function refItemNode(file, onRemove, label) {
+    const title = label || file.name;
     const item = document.createElement('li');
     item.className = 'ref-item';
     const link = document.createElement('a');
@@ -725,16 +739,17 @@
     link.href = thumbUrlOf(file);
     link.target = '_blank';
     link.rel = 'noreferrer';
-    link.title = `点击查看大图：${file.name}`;
+    link.title = `点击查看大图：${title}（${file.name}）`;
     const img = document.createElement('img');
     img.className = 'ref-thumb';
     img.src = thumbUrlOf(file);
-    img.alt = file.name;
+    img.alt = title;
     link.appendChild(img);
     const meta = document.createElement('div');
     const name = document.createElement('span');
     name.className = 'ref-item-name';
-    name.textContent = file.name;
+    name.textContent = title;
+    name.title = file.name;      // 真实文件名：悬停可见，不占版面
     const size = document.createElement('span');
     size.className = 'ref-item-size';
     size.textContent = `${(file.size / 1024).toFixed(0)} KB`;
@@ -743,7 +758,7 @@
     remove.type = 'button';
     remove.className = 'ref-item-remove';
     remove.textContent = '移除';
-    remove.setAttribute('aria-label', `移除 ${file.name}`);
+    remove.setAttribute('aria-label', `移除 ${title}（${file.name}）`);
     remove.addEventListener('click', onRemove);
     item.append(link, meta, remove);
     return item;
@@ -762,8 +777,64 @@
         state.files.splice(index, 1);
         renderFiles();
         renderCapability();
-      }));
+      }, `图${index + 1}`));
     });
+  }
+
+  /**
+   * 把刚在工作台选中的参考图**顺手收进服务端参考图库**。
+   *
+   * 为什么要有这一步（2026-09-29 飞哥要求「上传后的图应该直接存到图库去」）：
+   * 图库原本只有「手动上传 / 收直链 / 收分镜图」三条入口。运营在工作台选完文件、
+   * 提交任务之后，这几张图就随任务走了 —— 下次还想复用，得重新翻本地磁盘找。
+   * 自动入库后，图库页与「从参考图库选」立刻能看到同一张图（服务端按 sha256 去重，
+   * 同一张图不会因为重复选择而多出记录）。
+   *
+   * ⚠️ 三条刻意的取舍：
+   *   ① **不阻塞选图**：入库在后台跑，界面先照常把图列出来。原图 3MB 一张，
+   *      串行等上传会让「选完文件」这个动作愣好几秒 —— 那正是用户抱怨的体感。
+   *   ② **失败只提示、不撤销**：本地选中的图仍能正常提交（提交走 multipart，
+   *      跟图库无关）。图库只是「顺手存一份资产」，存不进去不该拦住主流程。
+   *   ③ **从列表移除 ≠ 从图库删除**：删列表项是「这次不用了」，图库是资产库。
+   *      两种语义不能混，提示里要写清楚，否则用户会以为删列表就清了库。
+   *
+   * @param {File[]} files 真正进入列表的那些（已被 9 张上限裁剪过）
+   */
+  function stashToLibrary(files) {
+    const lib = window.DolaRefLib;
+    if (!lib || !files.length) return;
+    let pending = files.length;
+    let added = 0;
+    let reused = 0;
+    let failed = 0;
+    // 9 张一起失败时逐条报错会刷屏，这里只汇总一句。
+    const finish = () => {
+      if (--pending > 0) return;
+      const parts = [];
+      if (added) parts.push(`新收 ${added} 张`);
+      if (reused) parts.push(`${reused} 张已在库中`);
+      if (failed) parts.push(`${failed} 张失败`);
+      if (!parts.length) return;
+      if (failed) setError(`参考图同步到图库：${parts.join('，')}。失败的图不影响本次提交。`);
+      else showConnection(`已同步到参考图库：${parts.join('，')}（移除列表里的图不会删图库）`, 'good');
+    };
+    for (const file of files) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataBase64 = String(reader.result || '').split(',')[1] || '';
+        if (!dataBase64) { failed += 1; finish(); return; }
+        // 单张上限 8MB（base64 后约 11MB）：默认 30 秒对慢上行不够稳，放宽到 90 秒。
+        lib.adminFetch('/api/reference-images', {
+          method: 'POST',
+          body: { name: file.name, dataBase64 },
+          timeoutMs: 90000,
+        }).then((res) => { if (res?.duplicated) reused += 1; else added += 1; })
+          .catch(() => { failed += 1; })
+          .finally(finish);
+      };
+      reader.onerror = () => { failed += 1; finish(); };
+      reader.readAsDataURL(file);
+    }
   }
 
   /** 与 renderFiles 同款，只是作用于批量弹窗自己的 batchFiles / batchFileList。 */
@@ -779,7 +850,7 @@
         dropThumb(file);
         state.batchFiles.splice(index, 1);
         renderBatchFiles();
-      }));
+      }, `图${index + 1}`));
     });
   }
 
@@ -1097,7 +1168,7 @@
     $('refGrid').replaceChildren();
     for (const item of items) {
       const a = document.createElement('a');
-      a.className = 'ref-thumb';
+      a.className = 'ref-panel-thumb';   // 与工作台行的 `.ref-thumb`(56px) 区分，勿合并
       a.href = item.url;              // 点开看**原图**（带票据的直链，10 分钟内有效）
       a.target = '_blank';
       a.rel = 'noopener';
@@ -2776,13 +2847,20 @@
   });
   // 批量弹窗的本机选文件：追加进 batchFiles（上限 9 张，与主工作台互相独立）
   $('batchImages').addEventListener('change', () => {
+    const added = [];
+    let exceeded = false;
     for (const file of $('batchImages').files) {
-      if (state.batchFiles.length >= 9) { setError('参考图片最多 9 张，超出的未加入'); break; }
+      if (state.batchFiles.length >= 9) { exceeded = true; break; }
       state.batchFiles.push(file);
+      added.push(file);
     }
     $('batchImages').value = '';   // 清掉 input：同一张图删掉后还能再选回来
     renderBatchFiles();
+    // ⚠️ 顺序不能反：原先「先 setError 再 clearError」＝ 提示刚显示就被抹掉，
+    //    「超出的未加入」这句用户从来没看见过（2026-09-29 顺带修正）。
     clearError();
+    if (exceeded) setError('参考图片最多 9 张，超出的未加入');
+    stashToLibrary(added);   // 与主工作台同口径：顺手收进服务端参考图库
   });
   // ★ 「@ 引用参考图」：在提示词里打 @ 直接弹出图库选择器。
   //    触发条件收窄为「行首或空白符后的裸 @」—— 邮箱（a@b.com）这类中间的 @ 不该抢。
@@ -2884,11 +2962,14 @@
   $('images').addEventListener('change', (event) => {
     const incoming = Array.from(event.target.files || []);
     const unique = incoming.filter((file) => !state.files.some((existing) => existing.name === file.name && existing.size === file.size && existing.lastModified === file.lastModified));
-    const exceeded = state.files.length + unique.length > 9;
-    state.files = [...state.files, ...unique].slice(0, 9);
+    // 真正能进列表的那些（剩下的被 9 张上限挡掉，不入库 —— 免得用户看着列表里没这张、图库里却多出来）。
+    const kept = unique.slice(0, Math.max(0, 9 - state.files.length));
+    const exceeded = unique.length > kept.length;
+    state.files = [...state.files, ...kept];
     event.target.value = '';
     renderFiles();
     renderCapability();
+    stashToLibrary(kept);   // 顺手收进服务端参考图库（后台跑，不阻塞选图）
     if (exceeded) setError('参考图片最多 9 张，超出的文件未加入。');
   });
   $('create').addEventListener('click', createTask);
@@ -3092,8 +3173,18 @@
     return streamBase;
   }
 
-  /** 库记录的缩略图地址。**必须在 ensureTicket 之后调用**，否则返回空串。 */
-  const src = (row) => (streamBase && row ? `${streamBase}/${row.id}` : '');
+  /** 缩略图最长边。选择器卡片 58px、图库卡片几十像素，256 在 2x 屏也够。 */
+  const THUMB_SIZE = 256;
+
+  /**
+   * 库记录的**缩略图**地址（`?w=` 走服务端现生成并缓存）。**必须在 ensureTicket 之后调用**，否则返回空串。
+   *
+   * ⚠️ 别改回原图：卡片展示位只有 58px，而库图原图 1.8–5.2MB。选择器一打开就并发
+   * 拉 14 张原图（≈57MB）——图没到之前卡片全是空框，点「加入参考图」还要等十几秒，
+   * 用户会以为这个入口坏了 / 是空的（2026-09-29 实测：blob 读回来用了 10.8 秒）。
+   * 走缩略图后单张 16KB 量级，同一个弹窗从 57MB 降到几百 KB。
+   */
+  const src = (row) => (streamBase && row ? `${streamBase}/${row.id}?w=${THUMB_SIZE}` : '');
 
   async function list({ keyword = '', page = 1, pageSize = 24 } = {}) {
     await ensureTicket();

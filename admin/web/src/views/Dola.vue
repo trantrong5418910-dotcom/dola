@@ -657,7 +657,7 @@
         <template #title>逐条创建任务，单条未受理不中断</template>
         <div class="notice-body">
           每条先通过用户端网关建任务并进入后台队列，积分从所选用户令牌扣除；任务是否成片请到任务列表查看。
-          <code>15 秒</code>只能走专家模式（选 15 秒会自动切专家模式）。批量创建不支持参考图。
+          <code>15 秒</code>只能走专家模式（选 15 秒会自动切专家模式）。批量创建支持参考图（与单条提交同源，最多 9 张，png/jpg）。
         </div>
       </el-alert>
       <el-form label-width="90px">
@@ -691,6 +691,40 @@
             <el-option :value="30" label="30 秒" />
           </el-select>
         </el-form-item>
+        <!-- 参考图片：批量场景下「一组图复用给所有任务」是最自然的语义，
+             与用户端 v1 多图接口（每条任务都带同一组 reference_images）一致。
+             上传只入内存、不真正发到对象存储：与单条「测试生成」弹窗同一路径
+             （submitBatchGen → submitGenerationTask → validateReferenceImages），
+             在建任务后由服务端按新 taskId 落盘。 -->
+        <el-form-item label="参考图片">
+          <el-upload
+            ref="batchGenUploadRef"
+            v-model:file-list="batchGenFiles"
+            :auto-upload="false"
+            :limit="9"
+            multiple
+            accept="image/png,image/jpeg"
+            :on-exceed="() => ElMessage.warning('参考图片最多 9 张')"
+          >
+            <el-button>选择图片</el-button>
+            <template #file="{ file, index }">
+              <span class="el-upload-list__item-name" :title="file.name">
+                <el-icon class="el-icon--document"><Document /></el-icon>
+                <span class="el-upload-list__item-file-name">图{{ index + 1 }}</span>
+              </span>
+              <el-icon
+                class="el-icon--close" role="button" tabindex="0" aria-label="移除"
+                @click="removeBatchGenFile(file)"
+                @keydown.enter.prevent="removeBatchGenFile(file)"
+                @keydown.space.prevent="removeBatchGenFile(file)"
+              ><Close /></el-icon>
+            </template>
+            <template #tip>
+              <div class="el-upload__tip">可选；最多 9 张，png/jpg，合计 20MB 以内。批量场景下这组图会随每一条提示词一起提交。</div>
+            </template>
+          </el-upload>
+        </el-form-item>
+
         <!-- 号池可用性：提交前就把「有没有号能上」讲清楚，别等任务失败才说 -->
         <el-form-item v-if="poolRouteText" label="号池">
           <el-alert
@@ -822,6 +856,7 @@
         </el-form-item>
         <el-form-item label="参考图片">
           <el-upload
+            ref="testGenUploadRef"
             v-model:file-list="testGenFiles"
             :auto-upload="false"
             :limit="9"
@@ -830,6 +865,29 @@
             :on-exceed="() => ElMessage.warning('参考图片最多 9 张')"
           >
             <el-button>选择图片</el-button>
+            <!--
+              列项展示名固定成「图1/图2/…」（2026-09-29 反馈：图库取回的图名是 64 位
+              sha256，一列排下来既撑爆版面、又完全认不出是哪张）。
+              真实文件名不丢：挪进 title（悬停可见），**提交时用的仍然是原始文件名**
+              （见 testGenImages —— 它读的是 item.raw.name，不是这里的展示名）。
+
+              ⚠️ 用了 #file 插槽 = el-upload 内建列项被**整体**替换（连右上角的删除按钮
+              一起没）。所以这里必须自己把「名称 + 删除」都画出来；删除走 el-upload
+              暴露的 handleRemove（见 removeTestGenFile），别手撕 testGenFiles ——
+              v-model 那份数组由组件内部同步，直接 splice 会和组件状态脱节。
+            -->
+            <template #file="{ file, index }">
+              <span class="el-upload-list__item-name" :title="file.name">
+                <el-icon class="el-icon--document"><Document /></el-icon>
+                <span class="el-upload-list__item-file-name">图{{ index + 1 }}</span>
+              </span>
+              <el-icon
+                class="el-icon--close" role="button" tabindex="0" aria-label="移除"
+                @click="removeTestGenFile(file)"
+                @keydown.enter.prevent="removeTestGenFile(file)"
+                @keydown.space.prevent="removeTestGenFile(file)"
+              ><Close /></el-icon>
+            </template>
             <template #tip>
               <div class="el-upload__tip">可选；最多 9 张，png/jpg，合计 20MB 以内。随任务一起提交给该账号，用于验证「带参考图能不能出片」。</div>
             </template>
@@ -1129,7 +1187,7 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { useRoute } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import { ArrowDown, CopyDocument, Key, Refresh, Search, Switch, Upload } from '@element-plus/icons-vue';
+import { ArrowDown, Close, CopyDocument, Document, Key, Refresh, Search, Switch, Upload } from '@element-plus/icons-vue';
 import { api, qs } from '../api.js';
 import { can } from '../store.js';
 import DolaGoogleLogin from '../components/DolaGoogleLogin.vue';
@@ -1858,6 +1916,8 @@ async function openBatchGen() {
   batchGenForm.seconds = 30;
   batchGenForm.ratio = '16:9';
   batchGenForm.points = null;
+  // 参考图不跨次保留：每回打开都是干净的一份，避免上次的图悄悄跟去另一批提示词
+  batchGenFiles.value = [];
   batchGenResult.value = null;
   batchGenDlg.value = true;
   await loadTokenOptions();
@@ -1885,7 +1945,14 @@ async function submitBatchGen() {
   const seconds = batchGenForm.seconds;
   const ratio = batchGenForm.ratio;
   const mode = seconds === 15 ? 'expert' : batchGenForm.mode;
+  // ★ 参考图：批量场景下这组图随每条提示词一起提交。后端 batch 接口会
+  //   把它透传给每条 submitGenerationTask，validateReferenceImages 再做格式校验。
+  //   没有参考图时**不传** images 字段 —— 让 submitGenerationTask 走「无参考图」
+  //   路径（has_reference_images=0），不要让它收到空数组去走参考图校验、又在那里
+  //   退化成一个奇怪的"上传了 0 张"的提交。
+  const images = batchGenFiles.value.length ? await batchGenImages() : null;
   const body = { items: lines.map((prompt) => ({ prompt, mode, seconds, ratio })) };
+  if (images) body.images = images;
   if (batchGenForm.tokenMode === 'select') body.tokenId = batchGenForm.tokenId;
   else body.token = batchGenForm.tokenRaw.trim();
   if (batchGenForm.points != null) body.points = batchGenForm.points;
@@ -2241,6 +2308,36 @@ async function openTestGenerate(row) {
 
 /** 弹窗里选的参考图（el-upload 的 file-list；.raw 才是 File 对象）。 */
 const testGenFiles = ref([]);
+/**
+ * el-upload 实例。自定义了 #file 列项（展示名「图N」）之后，列项里的删除按钮
+ * 就得自己画，而删除动作要借组件暴露出来的 handleRemove
+ * （已核对 element-plus 2.14.6 的 expose 里有它）。
+ */
+const testGenUploadRef = ref();
+/**
+ * 批量弹窗的参考图 file-list + 实例引用。
+ *
+ * 不与 testGenFiles 共享：批量打开时是干净的一份，关闭/打开会清空，
+ * 避免上次的图悄悄跟去另一批提示词。
+ *
+ * 删除走与 testGen 同款策略（必须调 handleRemove，否则 v-model 状态脱节）。
+ */
+const batchGenFiles = ref([]);
+const batchGenUploadRef = ref();
+/**
+ * 移除弹窗里选中的参考图。
+ *
+ * 为什么调组件的 handleRemove 而不是自己 splice(testGenFiles)：
+ * v-model 那份数组由组件内部同步维护，外部直接改会和它内部状态脱节
+ * （uid 对不上、TransitionGroup 的 key 混乱），表现是删了 A 却少了 B。
+ */
+function removeTestGenFile(file) {
+  testGenUploadRef.value?.handleRemove?.(file);
+}
+/** 同款策略：必须调 handleRemove，否则 v-model 数组与组件内部状态脱节。 */
+function removeBatchGenFile(file) {
+  batchGenUploadRef.value?.handleRemove?.(file);
+}
 /** base64 前缀要去掉 —— 网关要的是纯 base64（dataBase64），带 data:image/png;base64, 会解出脏字节。 */
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
@@ -2253,6 +2350,15 @@ function fileToBase64(file) {
 async function testGenImages() {
   const out = [];
   for (const item of testGenFiles.value) {
+    const file = item.raw || item;
+    out.push({ dataBase64: await fileToBase64(file), name: file.name || 'reference.png' });
+  }
+  return out;
+}
+/** 同款，批量弹窗用：把 batchGenFiles 转成 [{ dataBase64, name }] 给后端 batch 接口。 */
+async function batchGenImages() {
+  const out = [];
+  for (const item of batchGenFiles.value) {
     const file = item.raw || item;
     out.push({ dataBase64: await fileToBase64(file), name: file.name || 'reference.png' });
   }

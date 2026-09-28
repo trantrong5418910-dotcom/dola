@@ -305,7 +305,7 @@
     :root[data-theme="dark"] .ref-pick{background:#131c29;border-color:#2a374a}
     :root[data-theme="dark"] .ref-pick.on{background:#16233a;border-color:#416fe0}
     :root[data-theme="dark"] .ref-pick .ref-name{color:#9aa9bd}
-    :root[data-theme="dark"] .ref-pick img,:root[data-theme="dark"] .ref-thumb{background:#0f1725}
+    :root[data-theme="dark"] .ref-pick img,:root[data-theme="dark"] .ref-thumb,:root[data-theme="dark"] .ref-panel-thumb{background:#0f1725}
     :root[data-theme="dark"] .file-list li.ref-item{background:#131c29;border-color:#2a374a}
     :root[data-theme="dark"] .file-list li.ref-item .ref-item-name{color:#dbe4f0}
     :root[data-theme="dark"] .ref-batch{background:#131c29;border-color:#2a374a}
@@ -405,8 +405,11 @@
     .ref-head{display:flex;align-items:baseline;gap:8px;font-size:11px;font-weight:600;color:var(--ink)}
     .ref-head .hint{font-weight:400}
     .ref-grid{display:flex;flex-wrap:wrap;gap:8px;margin-top:9px}
-    .ref-thumb{width:76px;height:76px;padding:0;border:1px solid var(--line);border-radius:8px;background:var(--soft);overflow:hidden;display:block;cursor:zoom-in}
-    .ref-thumb img{width:100%;height:100%;object-fit:contain;display:block}
+    /* ⚠️ 类名必须和上面的工作台行缩略图`.ref-thumb`(56px) 区分开：
+       两者曾是同名 `.ref-thumb`，同权重后者胜 → 工作台行缩略图被撑到 76px，
+       压住「图N」与体积文字（2026-09-29 飞哥反馈）。 */
+    .ref-panel-thumb{width:76px;height:76px;padding:0;border:1px solid var(--line);border-radius:8px;background:var(--soft);overflow:hidden;display:block;cursor:zoom-in}
+    .ref-panel-thumb img{width:100%;height:100%;object-fit:contain;display:block}
     .ref-missing{margin-top:9px;font-size:11px;color:var(--muted)}
     .upstream-note{font-size:10px}.raw{margin-top:11px;padding-top:10px}.raw summary{font-size:11px}
     .list-head{padding:0 0 12px}.list-head h2{font-size:15px}.jobs-tools{margin-bottom:10px}.jobs th,.jobs td{padding:9px 10px;font-size:11px}

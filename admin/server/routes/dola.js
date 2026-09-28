@@ -656,6 +656,13 @@ router.post('/generation-tasks/batch', requirePerm('dola:create'), async (req, r
     return res.status(400).json({ ok: false, message: 'points 必须是正整数' });
   }
 
+  // ★ 批量场景下的「共享参考图」：管理端批量弹窗里一次选图、随每条提示词一起提交。
+  //   与 v1 单条接口的 `images` 字段同形（[{ dataBase64, name }, …]）。
+  //   仅作输入校验（格式/大小/数量），落盘与对象存储上传由 submitGenerationTask → validateReferenceImages 内部走。
+  //   不传或空数组 ⇒ 不带图（has_reference_images=0），与单条接口语义一致。
+  const rawImages = req.body?.images;
+  const sharedImages = Array.isArray(rawImages) ? rawImages : [];
+
   const results = [];
   for (const item of items) {
     const prompt = String(item?.prompt || '').trim();
@@ -670,7 +677,8 @@ router.post('/generation-tasks/batch', requirePerm('dola:create'), async (req, r
         mode: item?.mode,
         seconds: item?.seconds,
         ratio: item?.ratio,
-        images: [],
+        // 复用同一个共享图片数组给每条任务 —— 走与 v1 单条接口同一条 validateReferenceImages 链路
+        images: sharedImages,
         accountId: item?.accountId ?? null,
         strictAccount: item?.strictAccount === true,
         points,

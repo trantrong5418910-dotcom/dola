@@ -19,7 +19,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   PROMPT_WRAP_KEYS, PROMPT_WRAP_MAX_LENGTH,
-  composePrompt, upstreamPrompt, promptWrapEnabled,
+  composePrompt, upstreamPrompt, promptWrapEnabled, replaceDurationMentions,
 } from '../server/dola/prompt-wrap.js';
 // ★ 故意引用**真**分类器，而不是自己写个 includes 复刻一遍：
 //   复刻版只证明"我以为的判定是这样"，真分类器才证明"线上跑的那份判定没被破坏"。
@@ -281,3 +281,148 @@ test('空提示词也不炸：包装后至少不产生"只有包装段"的怪文
   assert.equal(upstreamPrompt(null, { readSetting: reader({}) }).text, '');
   assert.equal(upstreamPrompt(undefined, { readSetting: reader({}) }).text, '');
 });
+
+// ─────────────────────── ⑧ ★ 时长描述改写（2026-09-29 飞哥三次收紧口径）───────────────────────
+//
+// ① 「提交上去的文案不要出现 30s 的字样」
+// ② 「所有提交的文案里都自动去除关于时长的描述」
+// ③ 「将 xx秒—xx秒 按顺序替换成镜头一、镜头二」+「全部统一换成镜头N」
+//
+// ⇒ 最终口径是**改写**而不是删除：时长描述在分镜稿里本来就承担「这一段是哪一镜」的
+//   分段作用，直接删字会把镜头结构抹平。所以按出现顺序改写成「镜头一」「镜头二」…
+//
+// ⚠️ 这些测试的另一半价值是**误伤面**：宽高比、时钟戳、中文数字叙事（三十万彩礼、
+//    闭目半秒）必须一个字都不动 —— 那些误伤改坏的是剧本正文，比"时长没清干净"严重得多。
+test('replaceDurationMentions：各档位/各写法的时长都改写成「镜头N」，且编号连续', () => {
+  const cases = [
+    ['…眼神不断斜瞟林晚。 30s', '…眼神不断斜瞟林晚。 镜头一'],
+    ['橘猫翻滚。总时长 30 秒', '橘猫翻滚。镜头一'],
+    ['橘猫翻滚。时长：30秒', '橘猫翻滚。镜头一'],
+    ['橘猫翻滚。时长：30', '橘猫翻滚。镜头一'],        // 没单位的元数据写法也要覆盖
+    ['橘猫翻滚。duration 30sec', '橘猫翻滚。镜头一'],
+    ['片长 15 秒，横屏', '镜头一，横屏'],              // 不再只清 30 这一档
+    ['3 秒后她缓缓抬起头', '镜头一她缓缓抬起头'],       // 「后」要一起吃掉，否则留下半截话
+    ['请控制在 20 秒左右，不要太长', '请镜头一，不要太长'],
+    ['A  30s  B', 'A 镜头一 B'],                       // 删字留下的多余空格要合并
+  ];
+  for (const [input, expected] of cases) {
+    assert.equal(replaceDurationMentions(input), expected, `输入 ${JSON.stringify(input)}`);
+  }
+
+  // 一整条分镜轨：编号必须连续
+  assert.equal(
+    replaceDurationMentions('30s 林晚攥紧拳头\n30s 王桂兰拍桌\n10秒—20秒 张富贵翘腿\n30s 林晚反问'),
+    '镜头一 林晚攥紧拳头\n镜头二 王桂兰拍桌\n镜头三 张富贵翘腿\n镜头四 林晚反问',
+  );
+  // 超过 10 镜也要正常（中文数字两位数）
+  const many = Array.from({ length: 12 }, () => '30s 一段画面').join('\n');
+  assert.ok(replaceDurationMentions(many).includes('镜头十二'), '第 12 镜应写成「镜头十二」');
+});
+
+test('★ 飞哥点名的形态：时间码 / 区间，且一个区间只吃一个编号（不能串位）', () => {
+  const cases = [
+    ['0:10 林晚攥紧拳头', '镜头一 林晚攥紧拳头'],
+    ['00:10 林晚攥紧拳头', '镜头一 林晚攥紧拳头'],
+    ['00-10 林晚攥紧拳头', '镜头一 林晚攥紧拳头'],       // 行首纯数字区间
+    ['10秒—20秒 林晚攥紧拳头', '镜头一 林晚攥紧拳头'],   // 飞哥原话里的形态
+    ['10秒-20秒 王桂兰拍桌', '镜头一 王桂兰拍桌'],
+    ['10—20秒 张富贵翘腿', '镜头一 张富贵翘腿'],
+    // ⚠️ 带冒号的区间必须整体吃掉，否则会被拆成「镜头一-镜头二」两个标签、编号直接串位
+    ['0:00-0:10 开场宴会厅全景', '镜头一 开场宴会厅全景'],
+  ];
+  for (const [input, expected] of cases) {
+    assert.equal(replaceDurationMentions(input), expected, `输入 ${JSON.stringify(input)}`);
+  }
+});
+
+test('★★ 误伤面：宽高比 / 时钟戳 / 分辨率区间 / 中文数字叙事，一个字都不许动', () => {
+  const mustKeep = [
+    '画面比例 16:9，写实风格',                    // 宽高比（第二段 1 位，天然不匹配）
+    '9:16 竖屏，画幅 21:9 上下留黑',               // ⚠️ 9:16 第二段是 2 位 → 靠白名单挡
+    '比例 16:10 的横幅构图',                      // ⚠️ 16:10 同样靠白名单挡
+    '缓慢推进收尾 23:47:31',                      // 三段时钟戳，不是时间码
+    '拍摄时间 00:15:02',
+    '三十万彩礼，是给你弟买房的！',                 // 中文数字 + 无单位
+    '@image1胸口深深起伏，闭目半秒后骤然睁开',      // 「半」不该被当成数字
+    '八年，我每个月都往家里打钱',
+    '视频 id 是 vid30s01',                        // 标识符（前界是字母）
+    '长度 1080 像素',                             // 标签 + 数字，但没有时长单位
+    '第 1080 帧',                                 // 帧不是时长单位
+    '今天十五号，天气不错',
+    '【16:9横屏】【4K】【24帧】',
+    '10-20人 的群演站在桌旁',                      // ⚠️ 不在行首的数字区间，不许动
+    '这是 1080-1920 的分辨率区间',
+    '严格遵循提示词，直接执行，不要进行任何修改和自动联想。',
+  ];
+  for (const text of mustKeep) {
+    assert.equal(replaceDurationMentions(text), text, `不该动：${JSON.stringify(text)}`);
+  }
+});
+
+test('★ 没命中时逐字节返回原文（不许顺手改排版）', () => {
+  const clean = '第一行   有三个空格\n\n第二行末尾有空格   \n';
+  assert.equal(replaceDurationMentions(clean), clean);
+  assert.equal(replaceDurationMentions(''), '');
+  assert.equal(replaceDurationMentions(null), '');
+});
+
+test('★ 改写先于包装、且与三层开关无关：包装关着（默认）也必须生效', () => {
+  const dirty = '一只橘猫在窗台上打哈欠，阳光洒进来 30s';
+  const off = upstreamPrompt(dirty, { readSetting: reader({}) });
+  assert.equal(off.applied, false, '包装默认关着');
+  assert.equal(off.reason, 'disabled');
+  assert.ok(!/30\s*(?:秒钟?|seconds?|secs?|s)/i.test(off.text), `发出去的文本仍有 30s：${off.text}`);
+  assert.ok(off.text.includes('镜头一'), `应当改写成镜头一：${off.text}`);
+
+  // 运营把时长写进了包装话术里 → 那也算"提交上去的文案"，同样要改
+  const on = upstreamPrompt(dirty, {
+    readSetting: reader({
+      ...ON,
+      [PROMPT_WRAP_KEYS.prefix]: '请生成一段 30s 的竖屏短视频',
+      [PROMPT_WRAP_KEYS.suffix]: '请控制在 30 秒以内',
+    }),
+  });
+  assert.equal(on.applied, true);
+  assert.ok(!/\d{1,4}\s*(?:秒钟?|秒|secs?|s)/i.test(on.text), `包装段里的时长也该改：${on.text}`);
+  // ⚠️ 编号必须跟着**最终文本顺序**走（前缀 → 正文 → 后缀），不能出现
+  //    「镜头二 … 镜头一 … 镜头三」这种没有重号、顺序却乱掉的结果。
+  //    早先"先改写原文、再改写拼装结果"的两段式写法就会踩这个坑，这条断言把它钉死。
+  assert.equal(
+    on.text,
+    '请生成一段 镜头一 的竖屏短视频\n一只橘猫在窗台上打哈欠，阳光洒进来 镜头二\n请镜头三',
+    `编号顺序不对：${JSON.stringify(on.text)}`,
+  );
+  assert.equal((on.text.match(/镜头一/g) || []).length, 1, '不能出现两个「镜头一」');
+});
+
+test('★★ 改写后回显判定的口径：轮询必须传"实际发出去的那份"，不能传 row.prompt', () => {
+  const dirty = '一只橘猫在窗台上打哈欠，阳光洒进来 30s';
+  const sent = upstreamPrompt(dirty, { readSetting: reader({}) }).text;
+  assert.ok(!sent.includes('30s'), '发出去的文本里不该再有 30s');
+
+  // ✅ 正确口径 —— 就是 generator.js 的 submittedPromptText(row.prompt)：
+  //    提交用什么、轮询就拿什么，prompt_echo 照常命中。
+  assert.equal(classifyChainText(sent, { prompt: sent }).rule, 'prompt_echo',
+    '提交与轮询同口径时，回显判定必须仍然成立');
+
+  // ⛔ 错误口径 —— 轮询若还拿库里的原文 dirty，includes 失败 → 判成 none。
+  //    这正是"改了提交侧却忘了轮询侧"会踩的坑：不报错、不告警，
+  //    只是协议漂移检测永远不再命中，等于那套监控白装。
+  //    这条断言把 generator.js「必须用 submittedPromptText」这个契约钉死。
+  assert.notEqual(classifyChainText(sent, { prompt: dirty }).rule, 'prompt_echo',
+    '两边口径不一致时必须能被这条测试抓住');
+});
+
+test('★ 幂等：同一份文本过两遍等于过一遍（提交/轮询各自调用也不会漂移）', () => {
+  const once = replaceDurationMentions('镜头 30s 慢慢推进，控制 30 秒以内\n0:10 第二镜');
+  assert.equal(replaceDurationMentions(once), once);
+  // upstreamPrompt 的值也不能再喂回给它自己（它带包装、不幂等）—— 这里只钉纯函数那一层。
+  const twice = upstreamPrompt(once, { readSetting: reader({}) }).text;
+  assert.equal(twice, once);
+});
+
+// ⚠️ 上线前还额外做过一次"真实文案回归"（不在本文件里，因为要连生产库）：
+//    把线上 `dola_videos.prompt` 全 18 条原文喂给本函数做逐字 diff → **改动 0 条**。
+//    脚本：/tmp/export-prompts.py（导出）+ /tmp/diff-live-prompts.mjs（比对）。
+
+

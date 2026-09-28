@@ -1947,6 +1947,26 @@ export const SIGNATURE_REJECT_CODES = new Set([710022002]);
 
 // ---------------------------------------------------------------- 轮询
 
+/**
+ * 「这次任务**实际发给上游**的那份文本」—— 提交与轮询两边必须共用它。
+ *
+ * ⚠️ 为什么不能一边用 `upstreamPrompt(row.prompt).text`、另一边用 `row.prompt`：
+ *    `chain-text-rules` 的 `prompt_echo` 是靠 `上游原文.includes(这份文本)` 判
+ *    「上游只是把我的话原样回显了、并没有真生成」。两边口径一旦不同
+ *    （提交时清洗/包装过、轮询却拿库里原文），回显判定就会**静默失效** ——
+ *    不报错、不告警，只是协议漂移检测永远不再命中，等于那套监控白装。
+ *    prompt-wrap.js 的文件头专门写过这条约束，这里把它落地成唯一入口。
+ *
+ * ⚠️ 它**不是** `row.prompt`：包装（前缀/中缀/后缀）与时长字样清洗都只作用于
+ *    「发给上游的那一刻」；库里存的、`/v1` 回给调用方的始终是用户原文。
+ *
+ * 调用 `upstreamPrompt` 会读一次设置。它**不是幂等的**（再包一次会套两层），
+ * 所以任何情况下都只能传 `row.prompt` 原文进来，别把它的返回值再喂回来。
+ */
+function submittedPromptText(rawPrompt) {
+  return upstreamPrompt(rawPrompt).text;
+}
+
 /** 从消息链原文里扒带水印直链 + 失败/额度线索，并给这一轮的原文分类 */
 function analyzeChain(raw, { prompt = '', clarifying = '', refused = '' } = {}) {
   const text = String(raw || '').replace(/\\\//g, '/');
@@ -2112,7 +2132,7 @@ async function run(id, { maxMin }) {
         //   `row.prompt`（库里存的、以及 /v1 返回给调用方的）始终是用户原文。
         //   三条提交通道（browser / scheme-a / pure-http）都走这一行，所以只在这里
         //   包一次就够；在 submitViaBrowser 内部包会漏掉另外两条通道。
-        prompt: upstreamPrompt(row.prompt).text,
+        prompt: submittedPromptText(row.prompt),
         seconds: duration.seconds,
         forceSeconds: duration.forceSeconds ?? duration.seconds,
         targetModel: duration.targetModel,
@@ -2345,7 +2365,8 @@ async function run(id, { maxMin }) {
     }
 
     await pollSubmittedVideo(id, { acc, accProxy, ck, duration, conversationId: sub.conversationId, maxMin,
-      prompt: row.prompt,
+      // ⚠️ 必须是「实际发给上游的那份」而不是 row.prompt —— 否则 prompt_echo 静默失效（见函数注释）。
+      prompt: submittedPromptText(row.prompt),
       deadline: Date.parse(getSubmission(db, id)?.deadline_at || '') || Date.now() + maxMin * 60_000 });
   } finally {
     if (globalAcquired) release();
@@ -2596,7 +2617,7 @@ async function resumeSubmittedVideo(id) {
     setStage(id, 'generating', '服务重启：继续查询原上游任务（不重新提交）');
     await pollSubmittedVideo(id, { acc, accProxy: requireGenerationProxy(acc.proxy), ck: parseCookies(acc.cookie),
       duration: normalizeVideoDuration({ seconds: row.seconds, forceSeconds: row.force_seconds }),
-      prompt: row.prompt,
+      prompt: submittedPromptText(row.prompt),
       conversationId: receipt.conversation_id, deadline: Date.parse(receipt.deadline_at),
       maxMin: (Date.parse(receipt.deadline_at) - Date.parse(receipt.sent_at)) / 60000 });
   } finally {

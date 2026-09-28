@@ -45,6 +45,241 @@ export const PROMPT_WRAP_MAX_LENGTH = 12000;
 const JOINER = '\n';
 
 /**
+ * 提交前要改写的「时长描述」。
+ *
+ * ── 为什么要有这一步
+ * 上游 dola 只要在**提交文案里**读到时长（「30 秒」「15s」「0:10」…），就会在会话里回一句
+ * `… exceeds the current maximum supported duration of 15 seconds…`。
+ * 那是它的**降档话术模板**，与这次到底出多长**无关** —— skill `dola-30s-video-2-credits`
+ * 里有实测：服务端口头说「我将按最接近的支持时长 15 秒生成」，成片 mvhd 照样是
+ * 30.080 秒。但这句回执会污染会话，也让运营误以为请求被降档。
+ *
+ * ── 口径演进（2026-09-29 飞哥三次收紧，最后落在"改写"而不是"删除"）
+ * ① 「提交上去的文案不要出现 30s 的字样」       → 只清 30 这一档；
+ * ② 「所有提交的文案里都自动去除关于时长的描述」  → 不限档位，任意数字 / 任意单位；
+ * ③ 「将 xx秒—xx秒 按顺序替换成镜头一、镜头二」+「全部统一换成镜头N」
+ *    → **不再删字，而是把时长描述按出现顺序改写成「镜头一」「镜头二」…**
+ *      为什么改成"改写"：时长描述在分镜稿里本来就承担「这一段是哪一镜」的分段作用，
+ *      直接删字会把镜头结构一起抹平，上游收到的会是一整段没有分段的长文。
+ *
+ * ── 改写（而不是删除）带来的两个必须守住的约束
+ * ⚠️ **幂等**：`镜头一` 里没有「数字 + 单位」，再跑一次不会二次编号。
+ * ⚠️ **编号接续已有最大号**（见 maxExistingShotIndex）：包装开启时 `upstreamPrompt`
+ *    会调用本函数两次（一次对原文、一次对拼装结果），第二次不会从「镜头一」重新数，
+ *    所以不会出现"一份文案里两个镜头一"。
+ */
+/** 阿拉伯数字（含小数）。 */
+const DUR_AR = String.raw`\d{1,4}(?:\.\d+)?`;
+/**
+ * 中文数字。
+ * ⚠️ 刻意**不含「半」**：线上真实文案里有「闭目半秒后骤然睁开」，
+ *    那是画面描述，不是时长规格（`半` 也不该被当成数字）。
+ */
+const DUR_CN = String.raw`[零〇一二三四五六七八九十百两]+`;
+const DUR_NUM = String.raw`(?:${DUR_AR}|${DUR_CN})`;
+/**
+ * 时长单位。**长的必须写前面**，否则 `s` 会抢先吃掉 `seconds` / `分钟` 的开头。
+ * ⚠️ 刻意**不收裸的「分」**：「十分」「部分」「分手」里都有它，收了就是大面积误伤。
+ */
+const DUR_UNIT = String.raw`(?:秒钟|秒|分钟|小时|seconds?|secs?|minutes?|mins?|hours?|hrs?|s)`;
+/** 区间连接符：`10秒—20秒` / `5-10s` / `3~5 秒` / `4 到 15 秒`。 */
+const DUR_RANGE_SEP = String.raw`(?:[-–—~～]|到|至|to)`;
+const DUR_GAP = String.raw`[ \t]*`;
+
+/**
+ * 一段「时长」。三种写法：
+ *   · `30秒` / `30s`               —— 单个
+ *   · `10秒—20秒`（单位在两边）      —— 区间
+ *   · `10—20秒`（单位只在右边）      —— 区间
+ *
+ * ⚠️ 分支顺序必须**长的在前**：反过来先命中 `10秒`，就会把 `—20秒` 剩在原地，
+ *    结果变成「镜头一—镜头二」两个标签，编号直接串位。
+ */
+const DUR_SPAN = String.raw`(?:`
+  + String.raw`${DUR_NUM}${DUR_GAP}${DUR_UNIT}${DUR_GAP}${DUR_RANGE_SEP}${DUR_GAP}${DUR_NUM}${DUR_GAP}${DUR_UNIT}?`
+  + String.raw`|${DUR_NUM}${DUR_GAP}${DUR_RANGE_SEP}${DUR_GAP}${DUR_NUM}${DUR_GAP}${DUR_UNIT}`
+  + String.raw`|${DUR_NUM}${DUR_GAP}${DUR_UNIT}`
+  + String.raw`)`;
+/** 数字前的修饰词。一起改写成标签，避免留下「第」「大约」这种半截话。 */
+const DUR_LEAD = String.raw`(?:(?:第|大约|大概|约|将近|接近|超过|不到|至少|最多|最长|平均|为|是|控制在|限制在|不超过)${DUR_GAP})?`;
+/** 数字后的收尾词。同理：`3 秒后` 要整体换掉，只换 `3 秒` 会留下一个「后」。 */
+const DUR_TAIL = String.raw`(?:之后|以后|之前|之内|之间|以内|后|前|内|左右|上下|处|许|时|一次)?`;
+/** 显式时长标签。带标签时标签也一起换掉，否则会留下「时长：镜头一」这种半截话。 */
+const DUR_LABELS = String.raw`(?:时长|片长|总时长|总长|长度|秒数|length|duration)`;
+/**
+ * 没有单位时，标签后面必须紧跟分隔符或行尾。
+ * 不加这一条，`长度 1080 像素` 会被当成时长改写掉 —— 那种误伤查起来极其困难。
+ */
+const DUR_LABEL_BARE_TAIL = String.raw`(?=[，,、；;。．.!！?？]|${DUR_GAP}$)`;
+
+/**
+ * 带显式时长标签的写法：`时长：30 秒` / `片长 15 秒` / `duration 30sec` / `时长：30`。
+ * `时长：30` 这种没有单位的元数据写法靠第二个分支覆盖。
+ */
+const DURATION_LABELED_PATTERN = new RegExp(
+  String.raw`(?<![A-Za-z0-9])${DUR_LABELS}${DUR_GAP}[:：=]?${DUR_GAP}`
+  + String.raw`(?:${DUR_LEAD}${DUR_SPAN}|${DUR_LEAD}${DUR_NUM}${DUR_LABEL_BARE_TAIL})`,
+  'gim',
+);
+
+/** 通用的时长描述（`30s` / `10秒—20秒`）。 */
+const DURATION_PATTERN = new RegExp(
+  String.raw`(?<![A-Za-z0-9])${DUR_LEAD}${DUR_SPAN}${DUR_TAIL}(?![A-Za-z0-9])`,
+  'gi',
+);
+
+/**
+ * 时间码区间：`0:00-0:10` / `00:10~00:20` / `1:20 到 1:30`。
+ * ⚠️ 必须排在单个时间码**前面**：否则会被拆成「镜头一-镜头二」两个标签，编号直接串位。
+ */
+const TIMECODE_SPAN_PATTERN = /(?<![\d.:])\d{1,3}:\d{2}[ \t]*[-–—~～][ \t]*\d{1,3}:\d{2}(?![\d:])/g;
+/**
+ * 时间码：`0:10` / `00:10` / `1:20`。
+ *
+ * ⚠️ 必须和**宽高比**区分开，两者形状几乎一样：
+ *    · 宽高比 `16:9` / `4:3` / `21:9` 的第二段是**1 位**数字 → 本模式要求 2 位，天然挡住；
+ *    · 但 `9:16` / `16:10` 这种第二段也是 2 位，挡不住 → 再加白名单 + 上下文词两层兜底。
+ * ⚠️ `23:47:31` 这类三段时钟戳也要挡住：要求前后都不再挨着 `:` 或数字。
+ */
+const TIMECODE_PATTERN = /(?<![\d.:])\d{1,3}:\d{2}(?![\d:])/g;
+/** 白名单：这些数字组合是宽高比，不是时间码。只列"第二段是 2 位"的那些（其余本来就匹配不到）。 */
+const ASPECT_RATIO_LITERALS = new Set([
+  '9:16', '16:10', '10:16', '9:10', '9:14', '25:16', '1:16', '21:16',
+]);
+/** 紧挨在左边出现这些词 → 一定是在说画幅，不是时间码。 */
+const ASPECT_CONTEXT = /(?:比例|宽高比|画幅|幅面|尺寸|aspect|ratio)[ \t]*[:：]?[ \t]*$/i;
+
+/**
+ * 行首的纯数字区间 `00-10`（不带单位），当作镜头标记改写。
+ *
+ * ⚠️ **只认行首**：不带单位时，`10-20` 和普通数字区间（`10-20人`）在形状上完全一样。
+ *    所以同时上三条锁：必须在行首、两段各 ≤2 位、后面紧跟空白或分隔符或行尾。
+ *    飞哥点名要处理的 `00-10` 三条全中；`10-20人` 后面紧跟的是汉字，不会被误伤；
+ *    `1080-1920` 位数超了，也不会被误伤。
+ */
+const LINE_HEAD_RANGE_PATTERN = new RegExp(
+  String.raw`^[ \t]*\d{1,2}${DUR_GAP}[-–—~～]${DUR_GAP}\d{1,2}(?=[ \t]|[｜|:：、，,]|$)`,
+  'gm',
+);
+
+/** 中文数字表（1~99 够用；镜头数不会上百）。 */
+const CN_DIGITS = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九'];
+
+function cnOrdinal(n) {
+  if (!Number.isInteger(n) || n <= 0) return String(n);
+  if (n < 10) return CN_DIGITS[n];
+  if (n === 10) return '十';
+  if (n < 20) return `十${CN_DIGITS[n % 10]}`;
+  if (n < 100) {
+    const tens = Math.floor(n / 10);
+    const ones = n % 10;
+    return `${CN_DIGITS[tens]}十${ones ? CN_DIGITS[ones] : ''}`;
+  }
+  return String(n);
+}
+
+/** 中文数字 → 阿拉伯数字（只支持 1~99，够镜头号用）。认不出来返回 NaN。 */
+const CN_VALUE = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+function cnToNumber(text) {
+  const s = String(text);
+  if (!/[十百]/.test(s)) {
+    let n = 0;
+    for (const ch of s) {
+      if (!(ch in CN_VALUE)) return NaN;
+      n = n * 10 + CN_VALUE[ch];
+    }
+    return n;
+  }
+  const at = s.indexOf('十');
+  const high = s.slice(0, at);
+  const low = s.slice(at + 1);
+  const h = high === '' ? 1 : CN_VALUE[high];
+  const l = low === '' ? 0 : CN_VALUE[low];
+  if (!Number.isFinite(h) || !Number.isFinite(l)) return NaN;
+  return h * 10 + l;
+}
+
+/** 文本里已经存在的「镜头N」（中文数字或阿拉伯数字都认）。 */
+const EXISTING_SHOT_LABEL = /镜头([一二三四五六七八九十百零〇两]+|\d+)/g;
+
+/**
+ * 找出文本里**已经存在的最大镜头号**，让新编号从它往后接。
+ *
+ * ⚠️ 不加这一步会撞号：包装开启时 `upstreamPrompt` 会调用本函数两次
+ *    （原文一次、拼装结果一次）。如果运营把「控制 30 秒以内」写进了后缀，
+ *    第二次调用会从 1 重新数 —— 结果一份文案里出现**两个「镜头一」**。
+ *    接续已有最大号之后：原文那处是镜头一，后缀那处自动变镜头二。
+ * ⚠️ 顺带解决另一个场景：分镜稿本来就用「镜头一/镜头二」分段、末尾又挂了个 `30s`，
+ *    新标签会接着 三 往后数，而不是插一个重复的「镜头一」进去。
+ */
+function maxExistingShotIndex(text) {
+  let max = 0;
+  for (const m of String(text).matchAll(EXISTING_SHOT_LABEL)) {
+    const raw = m[1];
+    const n = /^\d+$/.test(raw) ? Number(raw) : cnToNumber(raw);
+    if (Number.isFinite(n) && n > max) max = n;
+  }
+  return max;
+}
+
+/**
+ * 把文案里的时长描述按**出现顺序**改写成「镜头一」「镜头二」…
+ *
+ * **幂等**；**没命中时逐字节返回原文** —— 后半条很重要：只要命中过就做一次
+ * 「合并多余空格 / 去行尾空白」的收尾，那会顺手改动别处的排版；
+ * 没命中就一个字都别碰，避免给"本来就没问题"的文案引入差异。
+ *
+ * ⚠️ 五个模式必须从"最具体"到"最泛"依次跑，且**共用一个计数器**：
+ *    1. 带标签的（`时长：30 秒`）—— 不先跑，通用模式会先吃掉数字，留下「时长：镜头一」；
+ *    2. 时间码区间（`0:00-0:10`）—— 不先跑会被拆成「镜头一-镜头二」两个标签；
+ *    3. 时间码（`0:10`）—— 它没有"数字 + 秒单位"的形状，通用模式根本抓不到；
+ *    4. 行首纯数字区间（`00-10`）—— 同理；
+ *    5. 通用的（`30s` / `10秒—20秒`）。
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function replaceDurationMentions(text) {
+  const raw = String(text ?? '');
+  if (!raw) return raw;
+
+  let seq = maxExistingShotIndex(raw);
+  const nextLabel = () => `镜头${cnOrdinal(++seq)}`;
+
+  const out = raw
+    .replace(DURATION_LABELED_PATTERN, nextLabel)
+    .replace(TIMECODE_SPAN_PATTERN, nextLabel)
+    .replace(TIMECODE_PATTERN, (match, offset, whole) => {
+      if (ASPECT_RATIO_LITERALS.has(match)) return match;
+      if (ASPECT_CONTEXT.test(whole.slice(Math.max(0, offset - 10), offset))) return match;
+      return nextLabel();
+    })
+    .replace(LINE_HEAD_RANGE_PATTERN, nextLabel)
+    .replace(DURATION_PATTERN, nextLabel);
+
+  if (out === raw) return raw;               // 没命中 → 逐字节返回原文
+
+  const tidied = out
+    .split('\n')
+    .map((line) => line
+      .replace(/[ \t]{2,}/g, ' ')                        // 合并多余空格
+      .replace(/^[ \t]+|[ \t]+$/g, '')                   // 行首/行尾残留空白
+      .replace(/[，、,；;]+(?=\s*(?:[。！？!?…~～]|$))/g, '') // 「，。」这种逗号残缺
+      .replace(/([。！？!?…～~])\1+/g, '$1'))              // 「。。」这种叠标点
+    .join('\n')
+    .trim();
+
+  return tidied || raw;
+}
+
+/**
+ * @deprecated 旧名字。语义已经从「剥掉」变成「改写成镜头序号」，别再按"删除"理解。
+ * 保留导出只是不让外部引用炸掉。
+ */
+export const stripDurationLabels = replaceDurationMentions;
+
+
+/**
  * 纯函数：按「前缀 → 用户提示词 → 中缀 → 后缀」拼装。
  * 空段直接跳过（不产生多余空行）。
  */
@@ -90,19 +325,36 @@ export function upstreamPrompt(prompt, { readSetting = getSetting, scope = 'v1' 
   // 属于运营决策，不该在升级后"自动生效"。
   const view = promptWrapView({ readSetting, scope });
 
+  /**
+   * ★ 时长描述改写对**每一条返回路径**都生效。
+   *
+   * 它是"内容净化"，不是"运营话术"，所以与三层开关**无关** ——
+   * 开关关着（默认）时也必须生效，否则「包装没开」就成了这道净化的后门。
+   * 没命中时逐字节返回原文（见 replaceDurationMentions），不会给正常文案引入差异。
+   */
   if (!view.effective_enabled) {
+    const text = replaceDurationMentions(original);
     // 保留原有 reason 词表（disabled / empty），只新增一个"被范围挡住"的分支。
     // `switch` 一起回传，让调用方/状态接口能给出"为什么没生效"而不是一个干瘪的 false。
-    if (!view.enabled) return { text: original, applied: false, reason: 'disabled', switch: view };
-    if (!view.scope_enabled) return { text: original, applied: false, reason: 'scope_off', switch: view };
-    return { text: original, applied: false, reason: 'empty', switch: view };
+    if (!view.enabled) return { text, applied: false, reason: 'disabled', switch: view };
+    if (!view.scope_enabled) return { text, applied: false, reason: 'scope_off', switch: view };
+    return { text, applied: false, reason: 'empty', switch: view };
   }
 
-  const text = composePrompt(original, parts);
+  /**
+   * ⚠️ **拼好之后只改一次**，不要"先改写原文、再改写拼装结果"。
+   *
+   * 两段式写法（本函数早先的版本）会踩一个顺序坑：正文先改写 → 拿到「镜头一」，
+   * 第二次改写时计数器已经从 1 起跳，前缀里的时长只能领到更大的号；
+   * 可拼完之后前缀是排在正文**前面**的 —— 读起来就是「镜头二 … 镜头一 … 镜头三」，
+   * 明明没有重号，顺序却是乱的。
+   * 一次改写 + `maxExistingShotIndex` 接续，编号自然跟着最终文本顺序走。
+   */
+  const text = replaceDurationMentions(composePrompt(original, parts));
   if (text.length > PROMPT_WRAP_MAX_LENGTH) {
     // 明确放弃并留痕，绝不静默截断（见 PROMPT_WRAP_MAX_LENGTH 的说明）。
     console.warn(`[prompt-wrap] 包装后长度 ${text.length} 超过上限 ${PROMPT_WRAP_MAX_LENGTH}，本次未包装`);
-    return { text: original, applied: false, reason: 'too_long', switch: view };
+    return { text: replaceDurationMentions(original), applied: false, reason: 'too_long', switch: view };
   }
   return { text, applied: true, reason: 'applied', switch: view };
 }

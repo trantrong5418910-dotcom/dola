@@ -77,6 +77,20 @@ test('voided：上游明确报生成失败', () => {
   }
 });
 
+test('★ voided 也要带 upstreamError（否则终态只剩一句通用文案，操作者看不出原因）', () => {
+  // 生产任务 #212 的终态就是这个问题：`上游明确报「生成失败」；上游额度是否退还以实际回执为准`
+  // —— 看不出上游到底匹配了哪句话，也就分不清是内容违规、肖像保护还是真·上游故障。
+  // 消费方（generator.js 的 `why`）优先用 upstreamError 拼说明，所以每条终态规则都得带。
+  for (const text of ['视频生成失败', '生成失败', '未通过审核', '内容违规']) {
+    const r = classifyChainText(text, { prompt: PROMPT });
+    assert.equal(r.upstreamError, text, `「${text}」的 upstreamError 应等于命中原话`);
+  }
+  // 匹配到的是**片段**时，带出的就是那个片段（不是整句）—— 与 evidence 口径一致
+  const partial = classifyChainText('本次生成失败，请重试', { prompt: PROMPT });
+  assert.equal(partial.upstreamError, '生成失败');
+  assert.match(partial.evidence, /生成失败/);
+});
+
 test('★ voided：肖像保护软拒绝（生产任务 #188 原话，逐字）', () => {
   // 真实样本：账号 #436 / 30 秒 + 参考图 / 会话 38417956948437265。
   // 上游没建视频任务、只回了这句话（chain 里 ai_create_show_mode=text、content_type=9999），

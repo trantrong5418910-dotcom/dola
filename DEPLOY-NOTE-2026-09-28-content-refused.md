@@ -103,14 +103,81 @@ journal 里**已无任何 `uncertain`**，只剩 #212 的合法 `acknowledged`�
 
 ---
 
-## 5. ⚠️ 遗留：本地已改、线上未上（**故意不单独发布**）
+## 5. 第二批：兜底错误处理器 + 终态文案对称性（**已上线并验收**）
 
-`chain-text-rules.js` 现在比线上**多一行**（给文案路径补 `upstreamError`）+ 一处注释修正。
+### 5.1 三项内容
 
-**为什么不上**：#212 正在生成中。为一行"目前没人读的字段"再 reload 一次，
-是拿真实用户任务去赌下一条 `uncertain` —— 这正是 #211 的教训。
-**建议随下一批一起上**（已确认无在途作业时）。
+| # | 文件 | 改动 |
+|---|---|---|
+| A | `admin/server/dola/chain-text-rules.js` | 给**文案兜底路径**补 `upstreamError`（`content_refused` + `voided` 两处）+ 修正过期注释 |
+| B | `admin/server/error-middleware.js`（新增）+ `admin/server/index.js` | 修「框架已分好类的 4xx 被抹成 500」+ 停止把原始请求体写进日志 |
 
-另有**独立**的一项待你拍板：`admin/server/index.js:210-223` 的兜底错误处理器
-把框架已分好类的 4xx 抹平成 **500**（畸形 JSON 100/100 返回 500，且把原始请求体写进日志）。
-修法见 `LOADTEST-并发压测-2026-09-28.md` §4。
+**A 的 `voided` 那处是发布前顺手补的**（同一类不对称、同一文件、1 行）：
+生产任务 **#212** 的终态是 `上游明确报「生成失败」；上游额度是否退还以实际回执为准` ——
+操作者看不出上游到底匹配了哪句话，分不清是内容违规、肖像保护还是真·上游故障。
+补上之后终态会变成 `上游明确拒绝（回执：「…」）；已退款并放行账号`。
+
+### 5.2 B 项的改动说明（顺手把它变成**可单测**的）
+
+`index.js` 里那段兜底错误处理**一 import 就 listen**，没法单测 ⇒ 抽成 `error-middleware.js`，
+契约写进 `admin/test/error-middleware.mjs`。**行为上只动了两处**，其余（含 5xx 与
+`google-login` 特例）一个字没改：
+
+1. 通用分支先认 `err.status || err.statusCode` 的 4xx（旧代码一律 500）；
+2. 客户端错误**只记一行元信息**，不再打印 `err.body`（原始请求体）/堆栈。
+
+⚠️ **不能把 `err.message` 当"安全字段"回显**：Node 的 JSON 解析报错会**把请求体片段写进 message**
+（实测 `Unexpected token 'S', "SECRET_MAR"... is not valid JSON`），回显等于换个地方泄漏同一段内容
+⇒ 解析失败一律回固定文案。这条在测试里有**前提证据**钉着。
+
+**爆炸半径先量过**：全仓库 grep `next(err` ⇒ 除这个中间件自己**没有任何路由调用它**，
+所有带 `status` 的错误都在路由内部自己 catch ⇒ 兜底层只承接框架生成的错误。
+
+### 5.3 发布记录
+
+- 以线上为底做**逐行差异确认**：`index.js` 与 `chain-text-rules.js` 的 diff **只有本次改动**，无夹带；
+- 备份 `*.bak-20260928-2317-errormw`；
+- 门禁（reload 前实测）：在途作业 **0**、未结算 journal **0**；
+- 上传后**双向 sha256 逐字节一致**：
+  ```
+  index.js            9318ec96a6503e9ea8382589cdca55a4aab244700265c125b56f5581abd67c0a
+  error-middleware.js 2d28a0fccd8548129974fabc67b9503d2db1320f73783b14f6e84f22fd6065b9
+  chain-text-rules.js 10daf988dccc919ab75e4b9c54ac7d762b0c38d12b00a7b3d1ee91a36014238e
+  ```
+- `/usr/local/node22/bin/pm2 reload dola-admin`（⚠️ 非交互 ssh 里 `pm2` 不在 PATH，必须用绝对路径）
+  → restarts 68 → **70**，`/v1/healthz` = `ok` 200、`/api/health` = 200；
+- 启动日志**没有**「已核对 N 个中断任务」⇒ 本次 reload 没有制造新的 `uncertain`。
+
+### 5.4 上线后验收（实跑，非推断）
+
+| 项 | 结果 |
+|---|---|
+| 畸形 JSON ×100 | **400 ×100**（旧版是 500 ×100） |
+| 响应体是否回显请求体片段 | ✅ 未泄漏（`请求体不是合法的 JSON`） |
+| 合法 JSON + 坏令牌 ×5 | **401 ×5**（业务分支未受影响） |
+| `google-login` 畸形 JSON | 400 + 它自己的固定文案（特例未退化） |
+| `error.log` 增量 | 106 个请求只涨 **102 行**（旧版 19 行/请求，100 个请求就灌 1938 行） |
+| 日志里是否出现请求体 | **0 处** |
+| reload 后 journal 未结算 / 在途 | **0 / 0** |
+
+新增日志长这样（一行，带方法+路径+类型）：
+```
+[error] 400 POST /v1/videos entity.parse.failed（客户端错误，已省略请求体与堆栈）
+```
+
+### 5.5 本地证明（改前就能证明，不拿生产当试验场）
+
+```bash
+cd admin && node --test test/error-middleware.mjs   # 11 项，含前提证据
+cd admin && node --test test/chain-text-rules.mjs   # 59 项
+```
+
+---
+
+## 6. 本次未做（明确边界）
+
+- 压测剩下三层：429 队列满路径（需临时降 `dola_gen_queue_limit`）、浏览器闸门
+  `acquire()/release()` + 同账号 FIFO、真并发提交（会真打上游、扣积分、有 `uncertain` 风险）。
+- 线上 `dola-chain.json` 里那份陈旧探针数据（`cmd=3100 / 712017001 数据不存在`）没清 ——
+  它今天误导过排查一次，建议清掉。
+- 工作区 647 个未跟踪文件（约 51MB，含 `.recon/` 厂商混淆 JS、备份、模型）未处理。

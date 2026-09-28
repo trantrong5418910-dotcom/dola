@@ -347,7 +347,13 @@ export function classifyChainText(raw, { prompt = '', hasVideo = false, clarifyi
   if (!text.trim()) return { rule: 'none', evidence: '上游原文为空', classifiable: true };
 
   const voided = VOIDED_PATTERN.exec(text);
-  if (voided) return { rule: 'voided', evidence: `命中「${voided[0]}」`, classifiable: true };
+  if (voided) {
+    // upstreamError 一并带出，理由同下面 quota_exhausted / duration_inquiry：
+    // 调用方（generator.js 的 `why`）**优先用 upstreamError 拼终态说明**，
+    // 没有它就只能回一句通用的「上游明确报「生成失败」」—— 操作者看不到上游到底说了哪句话，
+    // 分不清是内容违规、肖像保护还是真·上游故障（生产任务 #212 就是这样落进通用文案的）。
+    return { rule: 'voided', evidence: `命中「${voided[0]}」`, upstreamError: voided[0], classifiable: true };
+  }
 
   // 内容生成限制的**文案兜底**（结构化字段没命中时才走到这里）。理由见 CONTENT_REFUSED_PATTERN。
   // 放在 voided 之后、duration_inquiry 之前：三者语义上互斥，这个位置只是让"最硬的拒绝"先出。

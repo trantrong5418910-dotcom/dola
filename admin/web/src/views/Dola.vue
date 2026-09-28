@@ -802,6 +802,21 @@
         <el-form-item label="提示词">
           <el-input v-model="testGenForm.prompt" type="textarea" :rows="3" placeholder="可选，默认「测试生成（账号…, N 秒）」" />
         </el-form-item>
+        <el-form-item label="参考图片">
+          <el-upload
+            v-model:file-list="testGenFiles"
+            :auto-upload="false"
+            :limit="9"
+            multiple
+            accept="image/png,image/jpeg"
+            :on-exceed="() => ElMessage.warning('参考图片最多 9 张')"
+          >
+            <el-button>选择图片</el-button>
+            <template #tip>
+              <div class="el-upload__tip">可选；最多 9 张，png/jpg，合计 20MB 以内。随任务一起提交给该账号，用于验证「带参考图能不能出片」。</div>
+            </template>
+          </el-upload>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="testGenDlg = false">取消</el-button>
@@ -2129,9 +2144,30 @@ async function openTestGenerate(row) {
   testGenForm.cooldownUntil = row.cooldown_until || null;
   testGenForm.quotaRemaining = row.quota_remaining ?? null;
   testGenForm.loginState = row.login_state || '';
+  testGenFiles.value = [];   // 参考图不跨次保留：每回打开都是干净的一份，避免上次的图悄悄跟去另一个号
   testGenDlg.value = true;
   await loadTokenOptions();
   testGenForm.tokenId = tokenOptions.value?.[0]?.id ?? null;
+}
+
+/** 弹窗里选的参考图（el-upload 的 file-list；.raw 才是 File 对象）。 */
+const testGenFiles = ref([]);
+/** base64 前缀要去掉 —— 网关要的是纯 base64（dataBase64），带 data:image/png;base64, 会解出脏字节。 */
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).replace(/^data:[^,]*,/, ''));
+    reader.onerror = () => reject(new Error(`读取「${file.name}」失败`));
+    reader.readAsDataURL(file);
+  });
+}
+async function testGenImages() {
+  const out = [];
+  for (const item of testGenFiles.value) {
+    const file = item.raw || item;
+    out.push({ dataBase64: await fileToBase64(file), name: file.name || 'reference.png' });
+  }
+  return out;
 }
 async function doTestGenerate() {
   if (!testGenForm.tokenId) return ElMessage.warning('先选择用户令牌（测试生成走网关链路扣积分）');
@@ -2142,19 +2178,22 @@ async function doTestGenerate() {
   const soft = testGenIssues.value.length
     ? `\n\n⚠️ 未确认项：\n· ${testGenIssues.value.join('\n· ')}`
     : '';
+  const images = await testGenImages();
   try {
     await ElMessageBox.confirm(
       `在账号「${testGenForm.label}」上提交一条 ${testGenForm.seconds} 秒测试生成？`
-      + `将消耗该账号的真实额度和令牌积分，且**这次不会自动换号**（锁定该账号）。${soft}`,
+      + `将消耗该账号的真实额度和令牌积分，且**这次不会自动换号**（锁定该账号）。${soft}`
+      + (images.length ? `\n\n随任务上传参考图 ${images.length} 张。` : ''),
       '测试生成（锁定单账号）', { type: 'warning', dangerouslyUseHTMLString: false });
   } catch { return; }
   testGenBusy.value = true;
   try {
     const r = await api.post(`/api/dola/accounts/${testGenForm.id}/test-generate`, {
       tokenId: testGenForm.tokenId, seconds: testGenForm.seconds, prompt: testGenForm.prompt,
+      images,
     });
     testGenDlg.value = false;
-    ElMessage.success(`已提交测试任务 #${r.taskId}`);
+    ElMessage.success(`已提交测试任务 #${r.taskId}${images.length ? `（带 ${images.length} 张参考图）` : ''}`);
     loadGeneration();
   } finally { testGenBusy.value = false; }
 }

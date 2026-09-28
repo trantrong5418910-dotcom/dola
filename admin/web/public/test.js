@@ -110,6 +110,13 @@
 
   const state = {
     token: '', status: null, models: [], files: [], jobs: [],
+    /**
+     * 批量创建专用的参考图（与主工作台 state.files **互相独立**）。
+     * 为什么不共用一份：批量弹窗是「这一批用同一组图」的独立语境，
+     * 主工作台的图是给单条任务准备的 —— 共用会让用户为了批量而误改单条的图，
+     * 反过来也一样。上限同样是 9 张（上游单次上限，见 server/dola/reference-images.js 的 IMAGE_MAX_COUNT）。
+     */
+    batchFiles: [],
     pollTimer: null, objectUrl: '', epoch: 0, tab: 'run', autoStart: true, loaded: {},
     materials: [],
     /**
@@ -425,6 +432,14 @@
    *    在未连接/令牌失效时也变成可点（点了必然报「请先输入令牌」）。
    *    受管按钮一律交回 syncButtons() 按当前状态重算；行内按钮不在受管集合里，
    *    单独解禁。
+   *
+   * ⚠️⚠️ 因此给某个弹窗按钮套 withBusy 前先问一句：「syncButtons() 管它吗？」
+   *    不管的话，**必须**在 HTML 上给它加 data-act（随便什么值，只当标记用），
+   *    否则第一次用完就永久禁用 —— 用户第二次点「加入参考图」「存为素材」
+   *    会毫无反应（2026-09-29 验证批量参考图时实测踩到：图库选择器只能用一次）。
+   *    目前由 syncButtons 管的：pullModels/create/batchCreate/refreshJobs/
+   *    refreshCurrent/clearCurrent/startQueued/clearJobs/redeemBtn/ping +
+   *    syncUnwatermarkedButton(previewUnwatermarked)。
    */
   async function withBusy(button, text, fn) {
     if (!button || button.dataset.busy === '1') return undefined;
@@ -707,6 +722,28 @@
     });
   }
 
+  /** 与 renderFiles 同款，只是作用于批量弹窗自己的 batchFiles / batchFileList。 */
+  function renderBatchFiles() {
+    if (state.batchFiles.length > 9) state.batchFiles = state.batchFiles.slice(0, 9);
+    const list = $('batchFileList');
+    list.replaceChildren();
+    state.batchFiles.forEach((file, index) => {
+      const item = document.createElement('li');
+      const name = document.createElement('span');
+      name.textContent = `${file.name} · ${(file.size / 1024).toFixed(0)} KB`;
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.textContent = '移除';
+      remove.setAttribute('aria-label', `移除 ${file.name}`);
+      remove.addEventListener('click', () => {
+        state.batchFiles.splice(index, 1);
+        renderBatchFiles();
+      });
+      item.append(name, remove);
+      list.append(item);
+    });
+  }
+
   // ─────────────────────────────────────────────── 参考图来源②：服务端参考图库
   /**
    * 除了本机选文件，参考图还能来自**服务端的参考图库**。
@@ -718,7 +755,19 @@
    * 取回后**还原成 File** 再进 state.files：提交走的是 /v1/videos 的 multipart
    * （input_reference 文件字段），服务端不接受「图库 id」。这样提交路径一行都不用改。
    */
-  const libPick = { rows: [], total: 0, page: 1, pageSize: 24, keyword: '', selected: new Map() };
+  const libPick = {
+    rows: [], total: 0, page: 1, pageSize: 24, keyword: '', selected: new Map(),
+    /**
+     * 勾选结果落到哪一份参考图列表：'main' = 主工作台 state.files，
+     * 'batch' = 批量弹窗 state.batchFiles。由打开它的按钮决定（见两处 click 绑定）。
+     * 不做成参数一路传下去，是因为 confirmLibPick 是独立的 click 处理器，拿不到上下文。
+     */
+    target: 'main',
+  };
+  /** 图库上限按「目标列表里已有的 + 本次勾的」一起算，避免加入时才被服务端拒绝。 */
+  function libPickTargetFiles() {
+    return libPick.target === 'batch' ? state.batchFiles : state.files;
+  }
 
   function renderLibPickSelected() {
     const box = $('libPickSelected');
@@ -768,8 +817,8 @@
         if (libPick.selected.has(row.id)) {
           libPick.selected.delete(row.id);
         } else {
-          // 上限按「已在 state.files 里的 + 本次勾的」一起算，避免加入时才被服务端拒绝
-          if (state.files.length + libPick.selected.size >= 9) {
+          // 上限按「目标列表里已有的 + 本次勾的」一起算 —— 批量弹窗打开时看 batchFiles，不是主工作台的 files
+          if (libPickTargetFiles().length + libPick.selected.size >= 9) {
             cb.checked = false;
             setError('参考图片最多 9 张，超出的未加入。');
             return;
@@ -811,12 +860,20 @@
     }
   }
 
-  async function openLibPick() {
+  async function openLibPick(target = 'main') {
+    libPick.target = target;
+    // @ 触发的位置只对本次 mention 会话有效；走普通入口时必须清掉，
+    // 否则残留的位置会把标记插到无关的旧光标处。
+    if (target !== 'mention') mentionCaret = -1;
     libPick.selected = new Map();
     libPick.keyword = '';
     libPick.page = 1;
     $('libPickSearch').value = '';
-    $('libPickNote').textContent = `图库里的图存在服务端（不是这台浏览器），分镜页出的图会自动收进去。当前已选 ${state.files.length} 张本机参考图，合计上限 9 张。`;
+    $('libPickNote').textContent = libPick.target === 'batch'
+      ? `图库里的图存在服务端（不是这台浏览器）。勾选的图会加进「批量创建」的参考图，本批每条任务都带同一组。当前已选 ${state.batchFiles.length} 张，合计上限 9 张。`
+      : libPick.target === 'mention'
+        ? `勾选的图会加入下方参考图列表（与「从参考图库选」同一份、自动去重），并在提示词里插入 @[图片名] 标记。标记只在本地展示，提交时会被剥掉、不会发给上游。当前 ${state.files.length} 张，合计上限 9 张。`
+        : `图库里的图存在服务端（不是这台浏览器），分镜页出的图会自动收进去。当前已选 ${state.files.length} 张本机参考图，合计上限 9 张。`;
     renderLibPickSelected();
     openDialog('libPickDlg');
     await loadLibPick(1);
@@ -827,6 +884,9 @@
     const picks = [...libPick.selected.values()];
     if (!picks.length) { $('libPickError').textContent = '还没有勾选任何图。'; return; }
     $('libPickError').textContent = '';
+    // 落点由打开选择器的按钮决定：主工作台的 files，或批量弹窗的 batchFiles。
+    const targetFiles = libPickTargetFiles();
+    const isBatch = libPick.target === 'batch';
     let added = 0;
     const problems = [];
     for (const row of picks) {
@@ -835,19 +895,38 @@
         const ext = row.mime === 'image/jpeg' ? 'jpg' : 'png';
         const name = `${(row.name || `ref-${row.id}`).replace(/[^\w\u4e00-\u9fa5.-]+/g, '_').slice(0, 60)}.${ext}`;
         const file = new File([blob], name, { type: row.mime || 'image/png' });
-        if (state.files.some((f) => f.name === file.name && f.size === file.size)) continue;
-        if (state.files.length >= 9) { problems.push(`已满 9 张，${name} 未加入`); break; }
-        state.files.push(file);
+        if (targetFiles.some((f) => f.name === file.name && f.size === file.size)) continue;
+        if (targetFiles.length >= 9) { problems.push(`已满 9 张，${name} 未加入`); break; }
+        targetFiles.push(file);
         added += 1;
       } catch (error) {
         problems.push(`${row.name || `#${row.id}`}：${error.message}`);
       }
     }
-    renderFiles();
-    renderCapability();
+    if (isBatch) renderBatchFiles();
+    else {
+      renderFiles();
+      if (libPick.target === 'mention') {
+        renderCapability();
+        // @ 引用：把触发选择器的那个裸 @ 换成 @[名称]。重复选同一张（去重跳过、没真加）
+        // 也要插标记 —— 用户看到标记才知道「这图已经在列表里了」，不然像没点上。
+        if (mentionCaret >= 0) {
+          const area = $('prompt');
+          const text = area.value;
+          const insert = picks.map((row) => `@[${mentionLabel(row.name)}]`).join(' ');
+          area.value = text.slice(0, mentionCaret) + insert + text.slice(mentionCaret + 1);
+          const caret = mentionCaret + insert.length;
+          area.focus();
+          area.setSelectionRange(caret, caret);
+          mentionCaret = -1;
+        }
+      } else {
+        renderCapability();
+      }
+    }
     closeDialog('libPickDlg');
     if (problems.length) setError(`从图库加入 ${added} 张，${problems.length} 张失败：${problems.join('；')}`);
-    else showConnection(`已从参考图库加入 ${added} 张`, 'good');
+    else showConnection(`已从参考图库加入 ${added} 张${isBatch ? '（批量创建用）' : libPick.target === 'mention' ? '（@ 引用）' : ''}`, 'good');
   }
 
   // ─────────────────────────────────────────────────────────── 当前任务面板
@@ -1533,20 +1612,53 @@
 
   // ─────────────────────────────────────────────────────────── 写：加入任务
 
+  /**
+   * 提示词里的 @引用标记：用户在输入框打 @ 可以直接从图库挑图，选中后
+   * 往提示词里插一个 `@[名称]` 占位 —— 图本体当场就进了 state.files（与
+   * 「从参考图库选」同一份列表、同一套去重），标记只是给人看的。
+   *
+   * ★ 标记**绝不能**发给上游：上游只该收到干净的提示词，一串 `@[92664ea5…]`
+   *   对模型是纯噪声。所以提交前统一 stripMentions —— 只要有 @[…] 形态就剥掉，
+   *   不依赖「当时选了哪张」的记录（用户可能手改过标记，靠记录还原必挂）。
+   */
+  const MENTION_RE = /@\[[^\]\n]{1,80}\]/g;
+  function stripMentions(text) {
+    return String(text || '').replace(MENTION_RE, ' ').replace(/\s{2,}/g, ' ').trim();
+  }
+  /** 图库名可能是 64 位哈希，标记里塞全名会把输入框撑爆 —— 展示层截断，剥除按形态不按内容。 */
+  function mentionLabel(name) {
+    const n = String(name || '').trim();
+    return n.length > 16 ? `${n.slice(0, 16)}…` : n;
+  }
+  /** 触发 @ 选择器时记下 @ 的位置：confirmLibPick 要把标记插回这里（把裸 @ 换成 @[名称]）。 */
+  let mentionCaret = -1;
+
   async function createTask() {
     const epoch = state.epoch;
-    const prompt = $('prompt').value.trim();
-    if (!prompt) { setError('请填写提示词'); return; }
+    const prompt = stripMentions($('prompt').value);
+    if (!prompt) { setError('请填写提示词（只有 @ 引用标记、没有正文时，标记会被剥掉，等于没有提示词）'); return; }
     if (state.files.length > 9) { setError('参考图片最多 9 张'); return; }
     const seconds = Number($('seconds').value);
     const model = $('model').value;
     const autoStart = $('autoStart').checked;
     const cost = Number(state.status?.points_per_task || 1);
     const balance = Number(state.status?.token?.points || 0);
-    const text = autoStart
-      ? `将创建一条真实 ${seconds} 秒任务，扣 ${cost} 积分（令牌余额 ${balance}），并立即提交上游。任务会消耗上游账号额度。确认提交？`
-      : `将创建一条 ${seconds} 秒任务并冻结 ${cost} 积分（令牌余额 ${balance}），暂不提交上游。之后可在「任务列表」里手动提交。确认？`;
-    if (!window.confirm(text)) return;
+    // ★ 用页面内确认框，不用 window.confirm：原生弹窗被浏览器静默拦掉时直接返回 false，
+    //   按钮就成了"点了没反应、还不报错" —— 2026-09-28「加入任务」就是这个事故
+    //   （约 10 次点击全部静默失败，任务没建、积分没动、界面零提示）。详见 askConfirm 注释。
+    const okToCreate = await askConfirm({
+      title: autoStart ? '确认创建并立即提交上游' : '确认创建任务',
+      body: [
+        `时长：${seconds} 秒`,
+        `积分：${autoStart ? '扣' : '冻结'} ${cost} 积分（令牌余额 ${balance}）`,
+        autoStart
+          ? '创建后立即提交上游，会消耗上游账号额度。'
+          : '暂不提交上游，之后可在「任务列表」里手动提交。',
+        state.files.length ? `参考图：${state.files.length} 张，会随任务一起提交。` : '',
+      ].filter(Boolean).join('\n'),
+      confirmText: autoStart ? '确认并提交上游' : '确认创建',
+    });
+    if (!okToCreate) return;
     state.autoStart = autoStart;
     clearError();
 
@@ -1623,7 +1735,11 @@
     const epoch = state.epoch;
     const ids = state.jobs.filter(canStart).map((item) => item.id).filter(Boolean);
     if (!ids.length) { setError('当前没有「排队中」的任务可以提交。失败/已取消是终态，需要重新建一条。'); return; }
-    if (!window.confirm(`把 ${ids.length} 条排队中的任务一次性提交上游？这些任务的积分在创建时已冻结。`)) return;
+    if (!(await askConfirm({
+      title: '批量提交上游',
+      body: `把 ${ids.length} 条排队中的任务一次性提交上游？\n这些任务的积分在创建时已冻结。`,
+      confirmText: `提交这 ${ids.length} 条`,
+    }))) return;
     await withBusy($('startQueued'), '提交中…', async () => {
       try {
         const result = await requestJson('/v1/videos/start', { method: 'POST', body: { ids }, timeoutMs: 120000 });
@@ -1648,7 +1764,9 @@
 
   /** 单条取消。POST 与 DELETE 在服务端是同一个 handler，这里用 POST。 */
   async function cancelJob(id, { confirmText } = {}) {
-    if (confirmText && !window.confirm(confirmText)) return null;
+    if (confirmText && !(await askConfirm({
+      title: '取消任务', body: confirmText, confirmText: '取消任务', danger: true,
+    }))) return null;
     const epoch = state.epoch;
     const result = await requestJson(`/v1/videos/${encodeURIComponent(id)}/cancel`, {
       method: 'POST', body: {}, timeoutMs: 120000,
@@ -1669,7 +1787,9 @@
   /** 清除单条：DELETE /v1/videos/{id}。服务端 = 取消 + cleared_at 软删除，
    *  刷新列表也不会再出现（计费凭据仍在服务端，按 id 可查）。 */
   async function clearJob(id, { confirmText } = {}) {
-    if (confirmText && !window.confirm(confirmText)) return null;
+    if (confirmText && !(await askConfirm({
+      title: '清除任务', body: confirmText, confirmText: '清除', danger: true,
+    }))) return null;
     const epoch = state.epoch;
     const result = await requestJson(`/v1/videos/${encodeURIComponent(id)}`, {
       method: 'DELETE', timeoutMs: 120000,
@@ -1693,7 +1813,12 @@
 
   /** 清空：DELETE /v1/videos {all:true} —— 「清空任务记录」。 */
   async function clearAllJobs() {
-    if (!window.confirm('清空当前令牌下全部任务记录？排队中的会取消并退款；已在生成的不退款。\n（清除 = 取消 + 从列表隐藏；计费/退款凭据仍保留在服务端，按 id 可查。）')) return;
+    if (!(await askConfirm({
+      title: '清空任务记录',
+      body: '清空当前令牌下全部任务记录？\n排队中的会取消并退款；已在生成的不退款。\n（清除 = 取消 + 从列表隐藏；计费/退款凭据仍保留在服务端，按 id 可查。）',
+      confirmText: '全部清空',
+      danger: true,
+    }))) return;
     const epoch = state.epoch;
     await withBusy($('clearJobs'), '清空中…', async () => {
       try {
@@ -1745,6 +1870,61 @@
     if (!dlg || !dlg.open) return;
     if (typeof dlg.close === 'function') dlg.close();
     else dlg.removeAttribute('open');
+  }
+
+  /**
+   * 页面内确认框 —— **替代 window.confirm**，返回 Promise<boolean>。
+   *
+   * ★ 为什么必须换掉原生弹窗（2026-09-28 真实事故）：
+   *   浏览器会把 `window.confirm` **静默拦掉**，两种常见情形 ——
+   *     ① 用户在某次弹窗里勾过「不再弹出对话框」（按站点持久保存，之后每次都静默返回 false）；
+   *     ② 页面被嵌进没给 `allow-modals` 的沙箱 iframe。
+   *   拦掉时它**直接返回 false**，于是调用方的 `if (!confirm(...)) return;` 静默退出：
+   *   不建任务、不报错、不提示 —— 用户看到的就是「点了按钮什么都没发生」。
+   *   工作台「加入任务」按钮就是这样被堵死的（约 10 次尝试全部静默失败）。
+   *   `<dialog>` 是纯 DOM，不受这两条限制。
+   *
+   * @param {{title?:string, body?:string, confirmText?:string, danger?:boolean}} [opts]
+   *   body 里的 `\n` 会拆成多段 —— 原生弹窗做不到这点，而「扣多少积分 / 余额多少」
+   *   正是最该分行摆清楚的内容。danger=true 时确认按钮走红色（用于删除/清空类操作）。
+   * @returns {Promise<boolean>} 确认 true；取消 / ESC / 关闭 false。
+   */
+  function askConfirm({ title = '请确认', body = '', confirmText = '确认', danger = false } = {}) {
+    return new Promise((resolve) => {
+      const dlg = openDialog('confirmDlg');
+      // 兜底：万一弹窗 DOM 不在（旧版本页面/被裁剪），退回原生，至少不会卡死流程。
+      if (!dlg) { resolve(window.confirm(String(body).replace(/\n/g, ' '))); return; }
+      $('confirmTitle').textContent = title;
+      const box = $('confirmBody');
+      box.replaceChildren();
+      for (const line of String(body).split('\n')) {
+        const p = document.createElement('p');
+        p.textContent = line || '\u00a0';   // 空行用不换行空格撑住高度，别塌掉
+        box.appendChild(p);
+      }
+      const ok = $('confirmOk');
+      const cancel = $('confirmCancel');
+      ok.textContent = confirmText;
+      ok.classList.toggle('danger', Boolean(danger));
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        ok.removeEventListener('click', onOk);
+        cancel.removeEventListener('click', onCancel);
+        dlg.removeEventListener('close', onClose);
+        closeDialog('confirmDlg');
+        resolve(value);
+      };
+      const onOk = () => finish(true);
+      const onCancel = () => finish(false);
+      // ESC、右上角关闭、以及任何 data-dlg-close 都走 'close' 事件 ⇒ 一律当"取消"。
+      // ⚠️ 少了这一行，用户按 ESC 会让 Promise 永远不 resolve，按钮从此点不动。
+      const onClose = () => finish(false);
+      ok.addEventListener('click', onOk);
+      cancel.addEventListener('click', onCancel);
+      dlg.addEventListener('close', onClose);
+    });
   }
 
   // ─────────────────────────────────────────────────────────── 无水印预览
@@ -1978,11 +2158,26 @@
     const autoStart = $('batchAutoStart').checked;
     const cost = Number(state.status?.points_per_task || 1);
     const balance = Number(state.status?.token?.points || 0);
-    const confirmed = window.confirm(
-      `将逐条创建 ${prompts.length} 条真实 ${seconds} 秒任务，每条扣 ${cost} 积分（共 ${prompts.length * cost}，当前余额 ${balance}）。\n`
-      + `${autoStart ? '每条创建后会立即提交上游，会消耗上游账号额度。' : '先只冻结积分，状态停在「排队中」。'}\n`
-      + '单条失败不会中断后续提交。确认开始？',
-    );
+    // 同样走页面内确认框（理由同 createTask：原生弹窗会被静默拦掉 ⇒ 点了没反应）。
+    const confirmed = await askConfirm({
+      title: autoStart ? '批量创建并立即提交上游' : '批量创建任务',
+      body: [
+        `将逐条创建 ${prompts.length} 条真实 ${seconds} 秒任务。`,
+        `积分：${autoStart ? '扣' : '冻结'} ${prompts.length} × ${cost} = ${prompts.length * cost} 积分（当前余额 ${balance}）`,
+        autoStart
+          ? '每条创建后会立即提交上游，会消耗上游账号额度。'
+          : '先只冻结积分，状态停在「排队中」。',
+        state.batchFiles.length
+          ? `参考图：${state.batchFiles.length} 张（每条任务都带同一组）。`
+          : '',
+        '单条失败不会中断后续提交。',
+        // 余额不够时后半段会 402 失败，而前面已经扣掉的部分不会自动回滚 —— 真实后果，先说清。
+        prompts.length * cost > balance
+          ? `⚠️ 余额不足：大约第 ${Math.floor(balance / cost) + 1} 条开始会失败，前面已扣的积分不会自动退回。`
+          : '',
+      ].filter(Boolean).join('\n'),
+      confirmText: autoStart ? '确认并开始提交' : '确认并创建',
+    });
     if (!confirmed) return;
 
     const epoch = state.epoch;
@@ -2006,12 +2201,26 @@
         list.append(item);
         list.scrollTop = list.scrollHeight;
         try {
-          const job = await requestJson('/v1/videos', {
-            method: 'POST',
-            body: {
+          // 带参考图时必须走 multipart（input_reference 文件字段），服务端不接受图库 id/URL ——
+          // 与单条 createTask 同一条约定；批量是「每条都带同一组图」。
+          let batchBody;
+          if (state.batchFiles.length) {
+            batchBody = new FormData();
+            batchBody.append('model', modelForDuration(seconds) || $('model').value);
+            batchBody.append('prompt', prompts[i]);
+            batchBody.append('seconds', String(seconds));
+            batchBody.append('size', ratio);
+            batchBody.append('auto_start', String(autoStart));
+            for (const file of state.batchFiles) batchBody.append('input_reference', file, file.name);
+          } else {
+            batchBody = {
               model: modelForDuration(seconds) || $('model').value,
               prompt: prompts[i], seconds, size: ratio, auto_start: autoStart,
-            },
+            };
+          }
+          const job = await requestJson('/v1/videos', {
+            method: 'POST',
+            body: batchBody,
             timeoutMs: 150000,
           });
           if (!job?.id) throw new Error('接口已返回，但响应中没有任务 id');
@@ -2179,8 +2388,16 @@
     if ($('rememberToken').checked && state.status) persistToken(state.token);
     else if (!$('rememberToken').checked) persistToken('');
   });
-  $('logoutBtn').addEventListener('click', () => {
-    if (!window.confirm('退出当前令牌？\n\n这只清除本页（以及本机记住的令牌）；服务端的任务、积分和扣费记录都不受影响，用同一把令牌重新登录即可看到。')) return;
+  $('logoutBtn').addEventListener('click', async () => {
+    const ok = await askConfirm({
+      title: '退出当前令牌',
+      body: [
+        '这只清除本页（以及本机记住的令牌）。',
+        '服务端的任务、积分和扣费记录都不受影响 —— 用同一把令牌重新登录即可看到。',
+      ].join('\n'),
+      confirmText: '退出',
+    });
+    if (!ok) return;
     logout();
   });
   $('redeemBtn').addEventListener('click', () => {
@@ -2196,6 +2413,7 @@
     $('batchBar').style.width = '0%';
     fillBatchOptions();
     renderBatchCost();
+    renderBatchFiles();   // 上次没提交的图还留在 batchFiles 里，打开时回显出来（用户可能就是想接着用）
     openDialog('batchDlg');
     $('batchPrompts').focus();
   });
@@ -2211,7 +2429,34 @@
     openDialog('materialDlg');
   });
   $('pickFromLibrary').addEventListener('click', () => {
-    openLibPick().catch((error) => setError(error.message || '参考图库加载失败'));
+    // 落点标成主工作台：confirmLibPick 靠 libPick.target 决定把图加到哪一份列表
+    openLibPick('main').catch((error) => setError(error.message || '参考图库加载失败'));
+  });
+  // 批量弹窗里的「从参考图库选」：同一个选择器，落点换成 batchFiles
+  $('batchPickFromLibrary').addEventListener('click', () => {
+    openLibPick('batch').catch((error) => setError(error.message || '参考图库加载失败'));
+  });
+  // 批量弹窗的本机选文件：追加进 batchFiles（上限 9 张，与主工作台互相独立）
+  $('batchImages').addEventListener('change', () => {
+    for (const file of $('batchImages').files) {
+      if (state.batchFiles.length >= 9) { setError('参考图片最多 9 张，超出的未加入'); break; }
+      state.batchFiles.push(file);
+    }
+    $('batchImages').value = '';   // 清掉 input：同一张图删掉后还能再选回来
+    renderBatchFiles();
+    clearError();
+  });
+  // ★ 「@ 引用参考图」：在提示词里打 @ 直接弹出图库选择器。
+  //    触发条件收窄为「行首或空白符后的裸 @」—— 邮箱（a@b.com）这类中间的 @ 不该抢。
+  //    只监听 input（拿得到插入语义），不监听 keydown：粘贴/输入法/右键菜单都能触发。
+  $('prompt').addEventListener('input', () => {
+    const area = $('prompt');
+    const caret = area.selectionStart ?? -1;
+    if (caret < 1 || area.value[caret - 1] !== '@') return;
+    const before = caret >= 2 ? area.value[caret - 2] : '\n';
+    if (!/[\s\n]/.test(before)) return;   // 前一个字符不是空白 ⇒ 是词中间的 @，不触发
+    mentionCaret = caret - 1;
+    openLibPick('mention').catch((error) => setError(error.message || '参考图库加载失败'));
   });
   $('libPickSearchBtn').addEventListener('click', () => {
     libPick.keyword = $('libPickSearch').value.trim();
@@ -2227,7 +2472,7 @@
     withBusy($('libPickConfirm'), '加入中…', confirmLibPick)
       .catch((error) => setError(error.message || '加入参考图失败'));
   });
-  $('materialList').addEventListener('click', (event) => {
+  $('materialList').addEventListener('click', async (event) => {
     const button = event.target.closest('button[data-act]');
     if (!button) return;
     const id = button.dataset.id;
@@ -2236,7 +2481,16 @@
       return;
     }
     const material = state.materials.find((item) => item.id === id);
-    if (!window.confirm(`删除素材「${material?.title || '未命名'}」？只删本机这一份，服务端没有任何副本。`)) return;
+    const ok = await askConfirm({
+      title: '删除素材',
+      body: [
+        `删除素材「${material?.title || '未命名'}」？`,
+        '只删本机这一份，服务端没有任何副本 —— 删掉就找不回来了。',
+      ].join('\n'),
+      confirmText: '删除',
+      danger: true,
+    });
+    if (!ok) return;
     if (!saveMaterials(state.materials.filter((item) => item.id !== id))) return;
     renderMaterials();
   });
@@ -2345,7 +2599,15 @@
     const epoch = state.epoch;
     const run = async () => {
       if (act === 'start') {
-        if (!window.confirm(`把 #${id} 提交到上游？该任务的积分在创建时已冻结。`)) return;
+        const ok = await askConfirm({
+          title: `把 #${id} 提交到上游`,
+          body: [
+            '提交后开始消耗上游账号额度。',
+            '该任务的积分在创建时已冻结 —— 提交不会再扣一次。',
+          ].join('\n'),
+          confirmText: '提交上游',
+        });
+        if (!ok) return;
         await startJob(id);
       } else if (act === 'cancel') {
         await cancelJob(id, { confirmText: `确认取消 #${id}？已提交到上游的任务无法退款。` });
@@ -2968,7 +3230,18 @@
   }
   async function selectScript(id) {
     if (state.busy) return ssToast('当前操作尚未完成，请稍候');
-    if (state.dirty && !window.confirm('当前修改还没有保存，切换会丢失修改。继续吗？')) return;
+    if (state.dirty) {
+      const ok = await askConfirm({
+        title: '放弃未保存的修改',
+        body: [
+          '当前这份脚本还有没保存的修改。',
+          '切换后会丢失这些修改 —— 要先保存吗？',
+        ].join('\n'),
+        confirmText: '放弃修改并切换',
+        danger: true,
+      });
+      if (!ok) return;
+    }
     const data = await adminRequest(`/api/scripts/${id}`, { timeoutMs: 20000 });
     state.current = data.item;
     // 记住「上次在看哪个脚本」，刷新后好回到这里（出图历史挂在分镜上，没选中脚本就够不到）。
@@ -3047,7 +3320,16 @@
   }
   async function removeScript() {
     if (!state.current || state.busy) return;
-    if (!window.confirm('删除这份脚本及其分镜？')) return;
+    const ok = await askConfirm({
+      title: '删除脚本',
+      body: [
+        `删除「${state.current?.topic || '未命名脚本'}」及其全部分镜？`,
+        '出图历史挂在分镜上，会一起删掉。此操作不可撤销。',
+      ].join('\n'),
+      confirmText: '删除脚本',
+      danger: true,
+    });
+    if (!ok) return;
     state.busy = true;
     renderCurrent();
     await ssBusy($('ssDelete'), '删除中…', () => guard(async () => {

@@ -1777,10 +1777,16 @@ router.post('/accounts/batch-reset-quota', requirePerm('dola:update'), (req, res
 
 /**
  * POST /api/dola/accounts/:id/test-generate —— 单账号测试生成（对标 dola-pool「测试生成」）
- * body: { tokenId?, token?, prompt?, seconds? }
+ * body: { tokenId?, token?, prompt?, seconds?, images? }
  *
  * ⚠️ 会消耗真实额度和用户令牌积分。走网关链路（A 方案），任务强制绑定该账号
  * （strictAccount=true），不触发自动换号 —— 测的就是这个号本身。
+ *
+ * images（2026-09-29 新增）：参考图 base64 数组 [{ dataBase64, name }]，可选。
+ * 直接透传给网关链路 —— 张数/体积/格式校验都在 validateReferenceImages 里做
+ * （最多 9 张、合计 20MB），这里**不重复造一套规则**，避免两处口径不一致。
+ * 测「这个号」时常常就是要测「这个号出不出得来带参考图的片子」，缺了这字段
+ * 用户只能去工作台建一条不锁号的任务碰运气。
  */
 router.post('/accounts/:id/test-generate', requirePerm('dola:create'), async (req, res) => {
   const id = Number(req.params.id);
@@ -1799,15 +1805,17 @@ router.post('/accounts/:id/test-generate', requirePerm('dola:create'), async (re
   // 档位精简：非法/缺失一律落 30（主档位）。10/20 已下线，不再有 10 秒兜底。
   const seconds = SUPPORTED_VIDEO_SECONDS.includes(Number(req.body?.seconds)) ? Number(req.body.seconds) : 30;
   const prompt = String(req.body?.prompt || '').trim().slice(0, 500) || `测试生成（账号 ${acc.label || id}，${seconds} 秒）`;
+  const images = Array.isArray(req.body?.images) ? req.body.images : [];
   try {
     const r = await submitGenerationTask({
-      tokenValue, prompt, seconds, images: [],
+      tokenValue, prompt, seconds, images,
       accountId: id, strictAccount: true,
     });
-    audit(req, 'dola.test_generate', 'dola_account', id, `${acc.label} 测试生成 ${seconds}s，任务 ${r.taskId}`);
+    audit(req, 'dola.test_generate', 'dola_account', id,
+      `${acc.label} 测试生成 ${seconds}s，任务 ${r.taskId}${images.length ? `，参考图 ${images.length} 张` : ''}`);
     res.json({ ok: true, taskId: r.taskId, status: r.status });
   } catch (e) {
-    res.status(400).json({ ok: false, message: e.message || '提交失败', code: e.code || null });
+    res.status(e.status || 400).json({ ok: false, message: e.message || '提交失败', code: e.code || null });
   }
 });
 

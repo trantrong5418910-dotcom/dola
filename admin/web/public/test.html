@@ -89,6 +89,12 @@
     .dlg-body{padding:16px 18px 18px;max-height:min(72vh,660px);overflow:auto}
     .dlg-note{margin:0 0 12px;font-size:12px;color:#7b8798;line-height:1.6}
     .dlg-actions{display:flex;gap:9px;justify-content:flex-end;margin-top:16px}
+    /* 通用确认弹窗正文（#confirmDlg）。多行按 \n 拆成 <p>，比原生对话框能摆得更清楚 ——
+       尤其是「要扣多少积分 / 余额还剩多少」这两行，原生弹窗挤成一坨根本看不清。 */
+    .confirm-body{font-size:13px;line-height:1.75;color:#2f3d52}
+    .confirm-body p{margin:0 0 9px}
+    .confirm-body p:last-child{margin-bottom:0}
+    .confirm-body b{color:#172033}
     .batch-results{list-style:none;margin:12px 0 0;padding:0;display:grid;gap:6px;max-height:220px;overflow:auto}
     .batch-results li{display:flex;gap:9px;align-items:baseline;font-size:12px;line-height:1.5;border-bottom:1px solid #f0f3f8;padding-bottom:5px}
     .batch-results .ok{color:#226a3c}
@@ -172,6 +178,8 @@
     :root[data-theme="dark"] .dlg::backdrop{background:#050a13c4}
     :root[data-theme="dark"] .dlg-head{border-color:#2a374a}
     :root[data-theme="dark"] .dlg-note{color:#9aa9bd}
+    :root[data-theme="dark"] .confirm-body{color:#d5dfec}
+    :root[data-theme="dark"] .confirm-body b{color:#f2f7fd}
     :root[data-theme="dark"] .ss-hist{color:#9db8ff}
     :root[data-theme="dark"] .ss-hist.muted{color:#6d7a8c}
     :root[data-theme="dark"] .ih-batch{background:#131c29;border-color:#2a374a}
@@ -499,7 +507,7 @@
         <div class="field"><label for="images">参考图片 <span class="hint">可选，最多 9 张</span></label><div class="filebox"><input id="images" type="file" accept="image/*" multiple><ul id="fileList" class="file-list"></ul></div>
           <div class="mini-actions">
             <button id="pickFromLibrary" class="btn ghost small" type="button" title="从服务端参考图库选图（分镜出的图会自动收进那里）">从参考图库选</button>
-            <button id="saveMaterial" class="btn ghost small" type="button" title="把当前提示词、画幅与参考图存成本机素材（只存在这个浏览器里）">存为素材</button>
+            <button id="saveMaterial" class="btn ghost small" type="button" data-act="save-material" title="把当前提示词、画幅与参考图存成本机素材（只存在这个浏览器里）">存为素材</button>
             <button id="openMaterials" class="btn ghost small" type="button" title="打开本机素材库：选用 / 删除">素材库</button>
           </div>
         </div>
@@ -642,6 +650,24 @@
     </div>
   </main>
 
+  <!-- ── 弹窗：通用确认（**替代 window.confirm**）────────────────────────────
+       ★ 为什么不能用 window.confirm：原生弹窗会被浏览器**静默拦掉**，两种常见情形 ——
+         ① 用户在某次弹窗里勾过「不再弹出对话框」（按站点持久保存，之后**每次都静默返回 false**）；
+         ② 页面被嵌进没给 allow-modals 的沙箱 iframe。
+       拦掉时 confirm 直接返回 false —— 表现是「点了按钮，什么都没发生，也**不报错**」，
+       因为代码直接从 `if (!confirm(...)) return;` 出去了。
+       2026-09-28 工作台「加入任务」就是这个症状：约 10 次尝试全部静默失败、零提示，
+       用户只能看到「任务列表还是空的、余额也没变」。
+       <dialog> 是纯 DOM，不受那两条限制；顺带还能把「扣多少积分 / 余额多少」分行摆清楚，
+       原生对话框会把这些挤成一坨。 -->
+  <dialog id="confirmDlg" class="dlg" aria-labelledby="confirmTitle">
+    <div class="dlg-head"><strong id="confirmTitle">请确认</strong><span class="spacer"></span><button class="btn ghost small" data-dlg-close="confirmDlg" type="button">关闭</button></div>
+    <div class="dlg-body">
+      <div id="confirmBody" class="confirm-body"></div>
+      <div class="dlg-actions"><button id="confirmCancel" class="btn ghost" type="button">取消</button><button id="confirmOk" class="btn" type="button">确认</button></div>
+    </div>
+  </dialog>
+
   <!-- ── 弹窗：卡密兑换 / 批量创建 / 素材库 ──────────────────────────────── -->
   <dialog id="redeemDlg" class="dlg" aria-labelledby="redeemTitle">
     <div class="dlg-head"><strong id="redeemTitle">兑换积分</strong><span class="spacer"></span><button class="btn ghost small" data-dlg-close="redeemDlg" type="button">关闭</button></div>
@@ -662,6 +688,17 @@
       <div class="row">
         <div class="field"><label for="batchSeconds">时长</label><select id="batchSeconds" class="select"></select></div>
         <div class="field"><label for="batchRatio">画幅</label><select id="batchRatio" class="select"></select></div>
+      </div>
+      <div class="field">
+        <label for="batchImages">参考图片 <span class="hint">可选；本批每条任务都带同一组，最多 9 张</span></label>
+        <div class="filebox">
+          <input id="batchImages" type="file" accept="image/*" multiple>
+          <ul id="batchFileList" class="file-list"></ul>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button id="batchPickFromLibrary" class="btn ghost small" type="button" title="从服务端参考图库选图（与主工作台的参考图互相独立）">从参考图库选</button>
+          <span class="muted" style="font-size:11px;align-self:center">批量用的图与主工作台的参考图互相独立，互不覆盖</span>
+        </div>
       </div>
       <label class="checkbox-row" for="batchAutoStart">
         <input id="batchAutoStart" type="checkbox" checked>
@@ -708,7 +745,7 @@
       <div id="libPickBody"></div>
       <div class="ref-selected" id="libPickSelected"></div>
       <div id="libPickError" class="error-box"></div>
-      <div class="dlg-actions"><button class="btn ghost" data-dlg-close="libPickDlg" type="button">取消</button><button id="libPickConfirm" class="btn" type="button">加入参考图</button></div>
+      <div class="dlg-actions"><button class="btn ghost" data-dlg-close="libPickDlg" type="button">取消</button><button id="libPickConfirm" class="btn" type="button" data-act="lib-pick">加入参考图</button></div>
     </div>
   </dialog>
 

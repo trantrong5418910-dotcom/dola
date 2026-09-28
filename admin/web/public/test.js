@@ -1240,6 +1240,13 @@
     const cells = [];
     if (canStart(job)) cells.push(['start', '提交上游', 'primary', '把这个已冻结积分的排队任务提交到上游']);
     if (ACTIVE.has(job.status)) cells.push(['cancel', '取消', '', '取消任务。已提交到上游的不退款']);
+    // ★ 2026-09-29：失败任务给一条「重新提交」。失败是终态、不能原地重启，用户唯一的
+    //   出路是重填一遍表单 —— 而#214/#215/#217 那批失败任务每次都要重打提示词 + 重选 6 张图。
+    //   这个按钮把参数（含服务端暂存的参考图）回填进新建表单，用户改完再走正常确认框。
+    //   只对 failed 显示：成功的不需要重提，进行中的更不该让用户重复下单。
+    if (job.status === 'failed') {
+      cells.push(['resubmit', '重新提交', '', '把这条失败任务的提示词/时长/画幅和参考图回填到上方新建表单，可改参数后再提交（会新建一单）']);
+    }
     cells.push(['status', '获取状态', '', '读取这条任务的最新状态并切到「当前任务」']);
     cells.push(['clear', '清除', '', '取消这条任务并打软删除标记（列表里不再出现，计费/退款凭据保留在服务端）']);
     return cells;
@@ -1350,8 +1357,15 @@
       if (job.status === 'failed' || job.status === 'cancelled') {
         const note = document.createElement('span');
         note.className = 'hint';
-        note.title = '本服务只允许启动「排队中」的任务；失败/已取消是终态，需要重新建一条。';
-        note.textContent = '（终态不可重启）';
+        // 失败行现在另有「重新提交」按钮，提示要跟着改 —— 否则同一行上
+        // 「（终态不可重启）」和「重新提交」会互相打架，用户不知道该信哪个。
+        if (job.status === 'failed') {
+          note.title = '本服务只允许启动「排队中」的任务；失败是终态，不能原地重启。「重新提交」会带着这条任务的参数新建一单。';
+          note.textContent = '（终态不可重启，可重新提交）';
+        } else {
+          note.title = '本服务只允许启动「排队中」的任务；已取消是终态，需要重新建一条。';
+          note.textContent = '（终态不可重启）';
+        }
         ops.append(note);
       }
     }
@@ -1739,6 +1753,98 @@
     });
   }
 
+  // ────────────────────────────────────────────── 「重新提交」参数回填
+
+  /** 清空参考图区（含缩略图 object URL 回收与 @ 绑定清理）。回填前必须先走一遍。 */
+  function clearRefFilesForRefill() {
+    for (const file of state.files) dropThumb(file);
+    state.files = [];
+    mentionLinks.clear();
+    renderFiles();
+    renderCapability();
+  }
+
+  /**
+   * 把一条**终态失败**任务的参数回填到上方的新建表单（2026-09-29 工单）。
+   *
+   * 做与不做的分界，这是这个功能的核心设计：
+   *   · 提示词 / 时长 / 画幅 —— 从任务行**逐字**回填。落库的提示词已经是剥掉 @ 标记的
+   *     干净文本（见 stripMentions），原样写回 textarea 即可，不需要再解析一遍。
+   *   · 参考图 —— **不复用浏览器里的 File，也不重传**。图本来就暂存在服务端
+   *     `data/reference-uploads/<原taskId>/`，这里只把字节取回来做缩略图；提交时只报
+   *     「复用哪条任务的哪几张」，真正的拷贝发生在服务端（见 gateway.js 的
+   *     referenceSourceTaskId）。省掉的是把好几 MiB 再传一遍这件事。
+   *   · 令牌 —— 不回填。任务列表本来就是按当前连接的令牌查的，能点到这个按钮，
+   *     说明令牌已经在用了。
+   *
+   * ⚠️ 原图已被清理是**正常路径**（保留期 24 小时；成功/取消的任务即时回收）。这时要
+   *    明确提示「请重新上传」，绝不能悄悄建一条没有参考图的任务。
+   */
+  async function refillFromJob(id) {
+    const epoch = state.epoch;
+    const job = state.jobs.find((item) => String(item.id) === String(id));
+    if (!job) throw new Error(`本地列表里没有 #${id}，请先点「刷新列表」再试`);
+
+    clearRefFilesForRefill();
+    $('prompt').value = job.prompt || '';
+    if (job.seconds && [...$('seconds').options].some((o) => o.value === String(job.seconds))) {
+      $('seconds').value = String(job.seconds);
+    }
+    if (job.ratio && [...$('ratio').options].some((o) => o.value === String(job.ratio))) {
+      $('ratio').value = String(job.ratio);
+    }
+
+    // 接口本身失败（网络 / 令牌失效）要如实抛出 —— 不能伪装成「图已清理」，
+    // 否则用户白白去重选一遍图，其实只是链接不通。
+    const info = await requestJson(`/v1/videos/${encodeURIComponent(id)}/reference-images`);
+    if (epoch !== state.epoch) return null;
+    const items = Array.isArray(info?.items) ? info.items : [];
+    const recorded = Number(info?.recorded_count || 0);
+
+    if (!items.length) {
+      // 两种「没有图」要分开说：本来就没带图（不需要上传）/ 带过但已被清理（必须重传）。
+      const hadImages = Boolean(info?.cleared) || recorded > 0;
+      showConnection(
+        hadImages
+          ? `已回填 #${id} 的提示词/时长/画幅；⚠️ 原参考图已清理（暂存只保留 24 小时），请重新上传后再提交`
+          : `已回填 #${id} 的提示词/时长/画幅（这条任务本来就没有参考图）`,
+        hadImages ? '' : 'good',
+      );
+      renderTab('run');
+      $('prompt').focus();
+      return { reused: 0, cleared: hadImages };
+    }
+
+    const loaded = [];
+    for (const item of items) {
+      // 票据地址（10 分钟有效）带不上 Authorization，所以这里走裸 fetch。
+      const response = await fetch(item.url, { credentials: 'same-origin' });
+      if (!response.ok) break;
+      const blob = await response.blob();
+      const file = new File([blob], item.name, { type: blob.type || 'image/png' });
+      // ★ 复用标记：提交时靠它区分「服务端内部拷贝的图」和「本次新选的图」。
+      file._reuse = { sourceTaskId: Number(id), name: item.name };
+      loaded.push(file);
+    }
+    if (epoch !== state.epoch) { for (const file of loaded) dropThumb(file); return null; }
+    if (loaded.length !== items.length) {
+      // 少一张就整批作废：宁可让用户重选，也不能提交一组「少了一张」的参考图 ——
+      // 那种错误要等成片出来才看得出来。
+      for (const file of loaded) dropThumb(file);
+      clearRefFilesForRefill();
+      throw new Error(`原任务的参考图只取回 ${loaded.length}/${items.length} 张；为避免提交出错，参考图区已清空，请刷新后重试或手动重新上传`);
+    }
+
+    state.files = loaded;      // 复用图在前，用户之后新选的会追加在后面（顺序与服务端一致）
+    mentionLinks.clear();      // 上一条任务留下的 @ 绑定关系不能带到这批图上
+    renderFiles();
+    renderCapability();
+    renderTab('run');
+    $('prompt').focus();
+    showConnection(`已回填 #${id} 的参数（含 ${loaded.length} 张参考图，提交时不重传）—— 可改参数后点「加入任务」`, 'good');
+    return { reused: loaded.length, cleared: false };
+  }
+
   async function createTask() {
     const epoch = state.epoch;
     // 提交前再对齐一次（P3 兜底）：粘贴、套用素材等非键盘路径不经过 input 事件，
@@ -1752,18 +1858,31 @@
     const autoStart = $('autoStart').checked;
     const cost = Number(state.status?.points_per_task || 1);
     const balance = Number(state.status?.token?.points || 0);
+    // 参考图分成两类（「重新提交」回填来的图带 `_reuse` 标记）：
+    //   · 复用图：只把「哪条任务的哪几张」报给服务端，图由服务端从暂存目录内部拷贝；
+    //   · 新选图：照旧走 multipart 上传。
+    // 两者在界面上是同一个列表、可以混排，用户感觉不到区别。
+    const reuseFiles = state.files.filter((file) => file._reuse);
+    const freshFiles = state.files.filter((file) => !file._reuse);
+    const reuseSource = reuseFiles.length ? reuseFiles[0]._reuse.sourceTaskId : null;
     // ★ 用页面内确认框，不用 window.confirm：原生弹窗被浏览器静默拦掉时直接返回 false，
     //   按钮就成了"点了没反应、还不报错" —— 2026-09-28「加入任务」就是这个事故
     //   （约 10 次点击全部静默失败，任务没建、积分没动、界面零提示）。详见 askConfirm 注释。
     const okToCreate = await askConfirm({
-      title: autoStart ? '确认创建并立即提交上游' : '确认创建任务',
+      title: reuseFiles.length
+        ? (autoStart ? `确认重新提交（新建一单并立即提交上游）` : `确认重新提交（新建一单）`)
+        : (autoStart ? '确认创建并立即提交上游' : '确认创建任务'),
       body: [
         `时长：${seconds} 秒`,
         `积分：${autoStart ? '扣' : '冻结'} ${cost} 积分（令牌余额 ${balance}）`,
         autoStart
           ? '创建后立即提交上游，会消耗上游账号额度。'
           : '暂不提交上游，之后可在「任务列表」里手动提交。',
-        state.files.length ? `参考图：${state.files.length} 张，会随任务一起提交。` : '',
+        reuseFiles.length
+          ? `参考图：复用 #${reuseSource} 的 ${reuseFiles.length} 张`
+            + `${freshFiles.length ? ` + 本次新选 ${freshFiles.length} 张` : ''}（复用图由服务端拷贝，不重传）`
+          : (state.files.length ? `参考图：${state.files.length} 张，会随任务一起提交。` : ''),
+        reuseFiles.length ? `这是一次新的提交：会新建一单并扣 ${cost} 积分，原任务 #${reuseSource} 原样保留。` : '',
       ].filter(Boolean).join('\n'),
       confirmText: autoStart ? '确认并提交上游' : '确认创建',
     });
@@ -1787,16 +1906,26 @@
     await (async () => {
       try {
         let body;
-        if (state.files.length) {
+        // 只有**新选的**图走 multipart；复用的图只报「哪条任务的哪几张」，服务端自己拷。
+        // 复用的图若也塞进 FormData，等于又把几 MiB 传了一遍 —— 那正是这个功能要省掉的事。
+        if (freshFiles.length) {
           body = new FormData();
           body.append('model', model);
           body.append('prompt', prompt);
           body.append('seconds', String(seconds));
           body.append('size', $('ratio').value);
           body.append('auto_start', String(autoStart));
-          for (const file of state.files) body.append('input_reference', file, file.name);
+          for (const file of freshFiles) body.append('input_reference', file, file.name);
+          if (reuseSource) {
+            body.append('reference_source_task', String(reuseSource));
+            body.append('reference_source_keep', JSON.stringify(reuseFiles.map((file) => file._reuse.name)));
+          }
         } else {
           body = { model, prompt, seconds, size: $('ratio').value, auto_start: autoStart };
+          if (reuseSource) {
+            body.reference_source_task = reuseSource;
+            body.reference_source_keep = JSON.stringify(reuseFiles.map((file) => file._reuse.name));
+          }
         }
         const job = await requestJson('/v1/videos', { method: 'POST', body, timeoutMs: 150000 });
         if (epoch !== state.epoch) return;
@@ -2743,6 +2872,11 @@
         await cancelJob(id, { confirmText: `确认取消 #${id}？已提交到上游的任务无法退款。` });
       } else if (act === 'clear') {
         await clearJob(id, { confirmText: `确认清除 #${id}？排队中的会取消并退款，已在生成的不退款。` });
+      } else if (act === 'resubmit') {
+        // 回填动作本身**不花钱、不建任务**：只把原任务参数（和暂存的参考图）搬进新建表单。
+        // 真正的提交仍然要用户点「加入任务」并过确认框 —— 这是工单选的「稳」方案，
+        // 不做「一键直建」（那种点错一次就白扣积分）。
+        await refillFromJob(id);
       } else if (act === 'status') {
         state.currentId = String(id);
         renderTab('run');

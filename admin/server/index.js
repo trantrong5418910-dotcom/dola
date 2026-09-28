@@ -44,6 +44,7 @@ import metricsRoutes from './routes/metrics.js';
 import { recoverStaleJobs } from './jobs.js';
 import { recoverStaleVideoTasks } from './dola/generator.js';
 import { seedHistoricalGenerationGuards } from './dola/generation-guards.js';
+import { sweepOrphanReferenceImages } from './dola/reference-image-store.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(HERE, 'public');
@@ -85,6 +86,26 @@ if (stale) console.log(`[job] 已把 ${stale} 个中断的任务标记为 failed
 // 已有可靠回执的生成任务只恢复查询；未知提交保留待核对，不再统一标失败。
 const staleVideos = recoverStaleVideoTasks();
 if (staleVideos) console.log(`[gen] 已核对 ${staleVideos} 个中断任务：可靠回执恢复查询，未知提交保留待核对`);
+
+/**
+ * 参考图暂存目录回收。
+ *
+ * ★ 这是**保留期**模型，不是「终态即删」—— 失败任务的图必须活到用户能点「重新提交」
+ *   为止（默认 24h）。在途任务的目录永不回收。判据与理由见
+ *   dola/reference-image-store.js 的 sweepOrphanReferenceImages。
+ *
+ * 启动跑一次（补上进程停机期间该回收的），之后每小时一次。
+ * 回收失败绝不能影响服务可用性 —— 所以只记日志，等下个周期重试。
+ */
+const sweepReferenceImages = () => sweepOrphanReferenceImages(db)
+  .then(({ removed }) => {
+    if (removed) console.log(`[ref] 参考图回收：已删除 ${removed} 个超过保留期的暂存目录`);
+  })
+  .catch((e) => console.error('[ref] 参考图回收失败（下个周期重试）:', e.message));
+void sweepReferenceImages();
+const referenceSweepTimer = setInterval(sweepReferenceImages, 60 * 60 * 1000);
+// 不让它阻止进程退出（测试里会 import 这个模块）。
+referenceSweepTimer.unref?.();
 
 // 账号池自动维护：约 15 秒后首次巡检，之后按系统设置周期运行。
 // 只做健康/额度读取；明确失效的账号标记为 invalid，cookie 记录保留以便重新导入或人工恢复。

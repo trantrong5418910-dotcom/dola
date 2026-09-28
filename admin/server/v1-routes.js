@@ -32,6 +32,8 @@
  * 本文件自带 /v1 的 404 兜底，保证任何漏网路径都回 JSON。
  */
 import express from 'express';
+import fs from 'node:fs';
+import path from 'node:path';
 import { db, getSetting } from './db.js';
 import { audit } from './audit.js';
 import { signJwt, verifyJwt } from './auth.js';
@@ -44,6 +46,7 @@ import {
   referenceImagePoolStats, localFileOf,
 } from './dola/generator.js';
 import { IMAGE_MAX_COUNT, REQUEST_MAX_BYTES } from './dola/reference-images.js';
+import { listReferenceImageEntries, resolveReferenceImage } from './dola/reference-image-store.js';
 // 只取"是否开启"这个布尔：包装文案属于运营话术，不下发给调用方（见 prompt-wrap.js）。
 // 这里用 `promptWrapView` 拿三层视图（`enabled` / `scope_enabled` / `effective_enabled`），
 // 供 /v1/status 表达"开关开着、但实际没生效"。包装文案本身仍然不下发。
@@ -63,6 +66,11 @@ const SUPPORTED_SECONDS = [15, 30];
 
 /** 票据有效期。短到"链接被转发出去也没多大用"，长到"够下载完一个大文件"。 */
 const FILE_TICKET_HOURS = 10 / 60;
+/**
+ * 参考图票据有效期。和成片票据同口径（10 分钟）—— 参考图是给「重新提交」回填和
+ * 任务详情渲染用的，页面一刷新就重新签，没必要给长有效期。
+ */
+const REFERENCE_TICKET_HOURS = 10 / 60;
 /** multipart 解析的硬上限：合法请求最大 22 MiB（见 reference-images.js），留 2 MiB 给分隔符与其它字段。 */
 const MULTIPART_MAX_BYTES = REQUEST_MAX_BYTES + 2 * 1024 * 1024;
 const MULTIPART_MAX_PARTS = 24;
@@ -556,11 +564,18 @@ router.post('/videos', requireApiToken, async (req, res) => {
       accountId: integerOf(fields.account_id ?? fields.accountId, { name: 'account_id' }),
       strictAccount: String(fields.strict_account ?? fields.strictAccount ?? '').trim().toLowerCase() === 'true',
       autoStart,
+      // 复用某个已存在任务的参考图（失败任务「重新提交」）。
+      // 图在服务端暂存目录里，由服务端内部读出 → 复检 → 按新任务落盘，浏览器不必重传。
+      // 空值 = 不复用；原目录缺失时 submitGenerationTask 会直接报错，不会静默建无图任务。
+      referenceSourceTaskId: integerOf(fields.reference_source_task ?? fields.referenceSourceTask, { name: 'reference_source_task' }) ?? null,
+      referenceSourceKeep: fields.reference_source_keep ?? fields.referenceSourceKeep ?? null,
     });
 
     audit(req, 'v1.video.create', 'dola_video', String(result.taskId), {
       prompt: prompt.slice(0, 80), seconds, model, points: result.chargedPoints,
       autoStart, references: refFiles.length,
+      reusedReferences: result.reusedReferenceCount || 0,
+      referenceSourceTask: result.referenceSourceTaskId || null,
     }, actorOf(t));
 
     return ok(res, {
@@ -578,6 +593,9 @@ router.post('/videos', requireApiToken, async (req, res) => {
       charged_points: result.chargedPoints,
       balance: result.balance,
       charge_ref: result.chargeRef,
+      // 这次新建借用了哪条原任务的参考图、借了几张（0 = 没复用）。
+      reference_source_task: result.referenceSourceTaskId || null,
+      reused_reference_count: result.reusedReferenceCount || 0,
       created_at: new Date().toISOString(),
     }, 202);
   } catch (e) {
@@ -666,6 +684,100 @@ router.get('/files/:ticket', async (req, res) => {
     try { res.end(); } catch { /* 已经没得救了 */ }
     return undefined;
   }
+});
+
+// ---------------------------------------------------------------- 参考图
+
+/**
+ * GET /v1/videos/:id/reference-images —— 列出该任务暂存的参考图。
+ *
+ * 给两个场景用：
+ *   ① 失败任务的「重新提交」：把原任务的图回填到新建表单，顺手拿到票据地址直接显示缩略图；
+ *   ② 任务详情要说明「这条任务带了哪些参考图」。
+ *
+ * ⚠️ 图是**暂存**的：失败任务保留 24 小时，成功/取消的任务即时清掉（见
+ *    dola/reference-image-store.js 的保留期说明）。所以 `items` 为空是正常结果、不是错误，
+ *    调用方要按「已清理」处理，别把空列表当成「这个任务本来就没带图」。
+ */
+router.get('/videos/:id/reference-images', requireApiToken, async (req, res) => {
+  const row = ownedRow(req.params.id, req.apiToken);
+  if (!row) return taskNotFound(res);
+  let entries = [];
+  try {
+    entries = await listReferenceImageEntries(row.id);
+  } catch (e) {
+    return fail(res, 500, `读取参考图失败：${e.message}`, 'REFERENCE_IMAGE_READ_FAILED');
+  }
+  const expiresMinutes = Math.round(REFERENCE_TICKET_HOURS * 60);
+  return ok(res, {
+    task_id: row.id,
+    count: entries.length,
+    // 记录里说带过图、但暂存目录空了 → 就是「已被清理」。让调用方能明确区分
+    // 「没带图」和「图没了」，才能给出「请重新上传」而不是「无需上传」。
+    cleared: entries.length === 0 && Boolean(row.has_reference_images),
+    recorded_count: Number(row.reference_image_count || 0),
+    expires_in_minutes: expiresMinutes,
+    items: entries.map((entry) => ({
+      name: entry.name,
+      size: entry.size,
+      // 票据即鉴权（10 分钟），这样 <img src> 这种带不上 Authorization 的地方也能直接用。
+      url: absoluteUrl(req, `/v1/videos/${row.id}/reference-images/${encodeURIComponent(entry.name)}`
+        + `?ticket=${signJwt({ rt: row.id, rn: entry.name }, REFERENCE_TICKET_HOURS)}`),
+    })),
+  });
+});
+
+/**
+ * GET /v1/videos/:id/reference-images/:name —— 取一张参考图的字节。
+ *
+ * 两条鉴权路，二选一：
+ *   · `?ticket=`（上一条接口签发的 HMAC 票据，绑定 taskId + 文件名）—— 给 <img> / 下载器用；
+ *   · `Authorization: Bearer <令牌>` + 归属校验 —— 给脚本 / 后端调用用。
+ * 票据这条路与 /v1/files/:ticket 是同一个设计，理由也一样：`<img>` 带不上自定义头。
+ */
+router.get('/videos/:id/reference-images/:name', (req, res, next) => {
+  if (String(req.query.ticket || '')) return next();   // 票据即鉴权，不再要求 Bearer
+  return requireApiToken(req, res, next);
+}, async (req, res) => {
+  const taskId = Number(req.params.id);
+  if (!Number.isSafeInteger(taskId) || taskId <= 0) {
+    return fail(res, 400, '任务号不合法', 'INVALID_TASK_ID');
+  }
+  const name = String(req.params.name || '');
+  const ticket = String(req.query.ticket || '');
+  if (ticket) {
+    const payload = verifyJwt(ticket);
+    // 票据必须**同时**匹配任务号与文件名。只校验任务号的话，一张图的票据就能把同一
+    // 任务下其它参考图也读出来 —— 虽然都是同一个主人的图，但没有放宽的必要。
+    if (!payload || payload.rt !== taskId || payload.rn !== name) {
+      return fail(res, 401, '参考图地址无效或已过期，请重新获取', 'TICKET_INVALID');
+    }
+  } else if (!ownedRow(taskId, req.apiToken)) {
+    return taskNotFound(res);
+  }
+  // resolveReferenceImage 已经把路径穿越挡掉了（只认目录里真实枚举出来的条目）。
+  const file = await resolveReferenceImage(taskId, name);
+  if (!file) return fail(res, 404, '参考图不存在或已清理', 'REFERENCE_IMAGE_MISSING');
+  let stat;
+  try {
+    stat = await fs.promises.stat(file);
+  } catch {
+    return fail(res, 404, '参考图不存在或已清理', 'REFERENCE_IMAGE_MISSING');
+  }
+  const ext = path.extname(file).toLowerCase();
+  res.setHeader('Content-Type', ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
+    : ext === '.png' ? 'image/png' : 'application/octet-stream');
+  res.setHeader('Content-Length', String(stat.size));
+  res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(name)}"`);
+  // 票据只活 10 分钟；缓存压到 5 分钟，刷新页面拿新票据，旧地址过期前也不必反复回源。
+  res.setHeader('Cache-Control', 'private, max-age=300');
+  const stream = fs.createReadStream(file);
+  stream.on('error', () => {
+    if (!res.headersSent) fail(res, 502, '参考图读取失败，请重试', 'REFERENCE_IMAGE_READ_FAILED');
+    else { try { res.end(); } catch { /* 已经没得救了 */ } }
+  });
+  stream.pipe(res);
+  return undefined;
 });
 
 // ---------------------------------------------------------------- 生命周期

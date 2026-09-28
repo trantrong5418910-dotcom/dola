@@ -1171,7 +1171,12 @@ function fail(id, message, accountSnapshot = null) {
     //    message 原文留给 classifyFailure 分类（会话/能力/代理重罚，限流/网络/中断轻罚）。
     const scored = recordTaskFailure(db, row?.account_id, message);
     if (scored) console.warn(`[gen] #${id} 失败 → 账号 #${row?.account_id} 记失败分（${scored.code} +${scored.weight}，当前 ${scored.failScore}/${FAIL_SCORE_CAP}）`);
-    void cleanupReferenceImages(id).catch(() => {});
+    // ★ 2026-09-29：**失败不再删参考图**。
+    //   原先这里无条件 `cleanupReferenceImages(id)`，导致任务一落 failed，图当场消失 ——
+    //   而「重新提交失败任务」正需要复用 data/reference-uploads/<原taskId>/ 里的图
+    //   （用户不必重选 6 张图）。改为交给保留期模型回收：
+    //   sweepOrphanReferenceImages（终态 + 超过 REFERENCE_RETENTION_MS，见 index.js 的定时器）。
+    //   ⚠️ 成功 / 取消 / 清除 / 下架这些路径的即时清理行为**保持不变**，别顺手一起改掉。
   }
 }
 
@@ -2741,7 +2746,8 @@ export function resolvePendingSubmission(id, { resolution, note = '' } = {}) {
           '失败（人工核对：上游未产出）', now(), now(), taskId);
       refunded = settleFailedVideoRefund(db, getVideoTask(taskId))?.points || 0;
     });
-    void cleanupReferenceImages(taskId).catch(() => {});
+    // ★ 2026-09-29：与 fail() 同口径 —— 人工核对判「上游未产出」后任务落 failed，
+    //   参考图**保留**（交给保留期回收），这样用户仍能「重新提交」复用原图。
     return { resolution, refunded, taskStatus: 'failed' };
   }
 

@@ -23,6 +23,7 @@
  * 没有幂等键就会重复扣。所以 consume/refund 都按 `ref`（一般用 task_id）唯一。
  */
 import express from 'express';
+import path from 'node:path';
 import { db, getSetting } from '../db.js';
 import { audit } from '../audit.js';
 import { chargeVideoTask, settleFailedVideoRefund } from '../dola/generation-billing.js';
@@ -33,7 +34,7 @@ import {
   nativeThirtySecondPoolStats, referenceImagePoolStats, localFileOf,
 } from '../dola/generator.js';
 import { validateReferenceImages } from '../dola/reference-images.js';
-import { saveReferenceImages, cleanupReferenceImages } from '../dola/reference-image-store.js';
+import { saveReferenceImages, cleanupReferenceImages, listReferenceImages } from '../dola/reference-image-store.js';
 import { findUnsettledPrompt } from '../dola/submission-journal.js';
 import { sanitizePreflightDiagnostic } from '../dola/preflight-diagnostics.js';
 import { SUPPORTED_VIDEO_SECONDS, RETIRED_VIDEO_SECONDS } from '../dola/generation-policy.js';
@@ -506,6 +507,72 @@ export class GatewayTaskError extends Error {
 }
 
 /**
+ * 解析「复用某个已存在任务的参考图」这个请求，返回服务端本地的图片路径列表。
+ *
+ * 用途：失败任务的「重新提交」。用户不想为了重试再把 6 张图从浏览器重传一遍，
+ * 而图本来就躺在 `data/reference-uploads/<原taskId>/` 里（或曾经躺着）。
+ * 前端只报「复用哪个任务、保留哪几张」，真正的字节走服务端内部读取。
+ *
+ * 三道关：
+ *   ① **归属**：只能复用当前令牌自己创建的任务。任务不存在与不属于你回同一个错，
+ *      避免用错误码把「别人的任务号存在」透出去。
+ *   ② **存在**：原目录为空（被保留期回收 / 已被清理）时**明确报错**，
+ *      绝不静默降级成「建一条没有参考图的任务」—— 那会让用户以为带图提交了。
+ *   ③ **保留清单**：`keep` 里的名字必须在原目录里真实存在；一个都没匹配上同样报错。
+ *
+ * @param {object} args
+ * @param {number|string|null} args.sourceTaskId 原任务 id（空 = 不复用）
+ * @param {string|string[]|null} args.keep 要保留的原图文件名（空 = 全部保留）
+ * @param {number} args.ownerTokenId 请求方令牌 id
+ * @returns {Promise<{paths:string[], sourceTaskId:number|null}>}
+ */
+async function resolveReusedReferenceImages({ sourceTaskId, keep, ownerTokenId }) {
+  const raw = sourceTaskId === null || sourceTaskId === undefined ? '' : String(sourceTaskId).trim();
+  if (!raw) return { paths: [], sourceTaskId: null };
+  const id = Number(raw);
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    throw new GatewayTaskError({ status: 400, code: 'REFERENCE_SOURCE_INVALID', message: 'reference_source_task 必须是任务号' });
+  }
+  const row = db.prepare('SELECT id, owner_token_id FROM dola_videos WHERE id = ?').get(id);
+  if (!row || row.owner_token_id !== ownerTokenId) {
+    throw new GatewayTaskError({
+      status: 404, code: 'REFERENCE_SOURCE_NOT_FOUND',
+      message: `原任务 #${id} 不存在或不属于当前令牌；未创建任务、未扣积分`,
+    });
+  }
+  const all = await listReferenceImages(id);
+  if (!all.length) {
+    throw new GatewayTaskError({
+      status: 400, code: 'REFERENCE_SOURCE_MISSING',
+      message: `原任务 #${id} 的参考图已清理（暂存保留 24 小时），请重新上传后再提交；未创建任务、未扣积分`,
+    });
+  }
+  let keepList = null;
+  if (keep !== null && keep !== undefined && String(keep).trim() !== '') {
+    let parsed = keep;
+    if (typeof parsed === 'string') {
+      try {
+        parsed = JSON.parse(parsed);
+      } catch {
+        throw new GatewayTaskError({ status: 400, code: 'REFERENCE_SOURCE_INVALID', message: 'reference_source_keep 必须是 JSON 数组' });
+      }
+    }
+    if (!Array.isArray(parsed)) {
+      throw new GatewayTaskError({ status: 400, code: 'REFERENCE_SOURCE_INVALID', message: 'reference_source_keep 必须是数组' });
+    }
+    keepList = new Set(parsed.map((name) => path.basename(String(name ?? ''))));
+  }
+  const picked = keepList ? all.filter((p) => keepList.has(path.basename(p))) : all;
+  if (!picked.length) {
+    throw new GatewayTaskError({
+      status: 400, code: 'REFERENCE_SOURCE_MISSING',
+      message: `指定复用的参考图在 #${id} 里已不存在（可能已被清理），请重新上传后再提交；未创建任务、未扣积分`,
+    });
+  }
+  return { paths: picked, sourceTaskId: id };
+}
+
+/**
  * 提交一次生成（扣积分 + 建任务）：给 8787 工作台和后台批量创建共用的唯一入口。
  *
  * 链路顺序与原来 POST /api/gateway/gen 完全一致：
@@ -519,7 +586,11 @@ export class GatewayTaskError extends Error {
  * @param {number} [input.seconds=30] 15 或 30（10/20 已下线，会被 DURATION_RETIRED 拒绝）
  * @param {number|null} [input.forceSeconds=null] 同上白名单；不填则等于 seconds
  * @param {string} [input.ratio='16:9']
- * @param {Array} [input.images=[]] 参考图（base64 数组）
+ * @param {Array} [input.images=[]] 参考图（base64 数组 / {dataBase64,name} / Buffer / 本地路径）
+ * @param {number|string|null} [input.referenceSourceTaskId=null] 复用该**已有任务**暂存的参考图
+ *        （失败任务的「重新提交」用：图不必从浏览器重传，服务端内部读出再按新任务落盘）
+ * @param {string[]|string|null} [input.referenceSourceKeep=null] 只复用原目录里的这些文件名；
+ *        不传 = 原目录全部复用
  * @param {number|null} [input.accountId=null] 指定账号
  * @param {boolean} [input.strictAccount=false]
  * @param {number|null} [input.points=null] 每任务扣积分。**不传时按模型与秒数计价**
@@ -630,6 +701,29 @@ export async function submitGenerationTask(input = {}) {
     });
   }
 
+  // ── 复用原任务参考图（失败任务「重新提交」）─────────────────────────────
+  // 放在 reservePrompt **之前**：原图已被清理这类失败不该占用提示词冷却窗口。
+  // 否则用户点一次「重新提交」拿到「图已清理」，紧接着正确重传并提交时还会被冷却挡
+  // 120 秒 —— 两个错误叠在一起，排查成本很高。
+  let reusedReferencePaths = [];
+  let reusedReferenceSource = null;
+  try {
+    const reused = await resolveReusedReferenceImages({
+      sourceTaskId: input.referenceSourceTaskId,
+      keep: input.referenceSourceKeep,
+      ownerTokenId: t.id,
+    });
+    reusedReferencePaths = reused.paths;
+    reusedReferenceSource = reused.sourceTaskId;
+  } catch (error) {
+    if (error instanceof GatewayTaskError) throw error;
+    throw new GatewayTaskError({
+      status: error.status || 500,
+      code: error.code || 'REFERENCE_SOURCE_INVALID',
+      message: `读取原任务的参考图失败：${error.message}；未创建任务、未扣积分`,
+    });
+  }
+
   // 上游对短时间重复相同提示词会触发限流；先挡在账号体检和扣积分之前。
   const duplicate = reservePrompt(t.id, prompt);
   if (duplicate) {
@@ -649,7 +743,12 @@ export async function submitGenerationTask(input = {}) {
   // 也无法让 Dola 的本次页面回执给出最终结论。
   let inspectedImages = [];
   try {
-    inspectedImages = await validateReferenceImages(input.images, { prompt });
+    const fresh = input.images == null ? [] : (Array.isArray(input.images) ? input.images : [input.images]);
+    // 复用图排在前，与表单里的显示顺序一致（回填进来的在前，用户新追加的在后面）。
+    // 这些路径会当作普通参考图输入读盘并**重新复检格式/体积**，之后由
+    // saveReferenceImages() 按新 taskId 落盘 —— 对使用者就是一次「服务端内部拷贝」，
+    // 浏览器不必把这几 MiB 再传一遍。
+    inspectedImages = await validateReferenceImages([...reusedReferencePaths, ...fresh], { prompt });
   } catch (error) {
     releasePromptReservation(t.id, prompt);
     fail({ status: error.status || 400, code: error.code || 'REFERENCE_IMAGE_INVALID', message: error.message });
@@ -766,6 +865,9 @@ export async function submitGenerationTask(input = {}) {
     // 体检过程中被剔除的失效账号（有值说明账号池在损耗，值得关注）
     skippedAccounts,
     prompt, mode, requestedSeconds, tokenId: t.id, tokenPrefix: t.prefix,
+    // 参考图复用（失败任务「重新提交」）：调用方据此说明图是从哪来的、几张是复用的。
+    referenceSourceTaskId: reusedReferenceSource,
+    reusedReferenceCount: reusedReferencePaths.length,
     // 这一笔的价是怎么来的（source/key）+ 今天的额度状态。
     // 没有 source 的话，"价格不对"只能靠翻设置猜，没法定位到具体命中了哪一档。
     pricing: {
